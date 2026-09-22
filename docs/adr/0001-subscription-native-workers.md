@@ -1,0 +1,9 @@
+# Use native subscription commands
+
+The user has Claude and Codex subscriptions and requested that the factory use them, with the strongest available model coordinating and less costly workers completing bounded tasks. Native `codex exec` and `claude --print` replace the Pi-only runtime in the original design. This decision supersedes its runtime and model-default choices, while retaining independent review, candidate identity, finite execution limits and isolated application verification.
+
+Each command uses its own supported subscription login. The factory does not extract OAuth tokens, route them through Pi, or fall back to API keys. Dedicated worker homes must contain subscription credentials and no user plugins or project-independent configuration. Initial routing uses GPT-6 Astra for coordination, GPT-6 Sol for implementation and review, and GPT-6 Luna for inspection. Claude review is available once its subscription login and exact model access are configured. Models are pinned in each project profile, and a rate limit pauses work rather than switching accounts or billing methods.
+
+Subscriptions constrain usage rather than charging this runner a price for each token. Report provider token counts when available, keep an execution reserve for verification, and stop when usage is unknown or the configured allowance is exhausted. These local limits do not measure or guarantee remaining subscription quota. An API-equivalent cost field is not an invoice.
+
+Sources inspected on 2026-09-23: [Codex authentication](https://learn.chatgpt.com/docs/auth), [Codex models](https://learn.chatgpt.com/docs/models), [Claude programmatic commands](https://code.claude.com/docs/en/headless), and [Claude authentication boundaries](https://code.claude.com/docs/en/legal-and-compliance). Local commands report Codex 0.155.1 with ChatGPT login and Claude Code 2.1.267 without an active login. Model access still needs a live run in the configured worker environment.

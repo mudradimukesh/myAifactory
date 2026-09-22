@@ -1,0 +1,444 @@
+{
+  "schemaVersion": 1,
+  "skills": [
+    {
+      "name": "factory-discovery",
+      "path": "home/.agents/skills/factory-discovery/SKILL.md",
+      "sha256": "6f43108a8c7995b2f1c3488fd1b292efcdbcc46ecd2df8ee80ab9807245267c1",
+      "references": [],
+      "provenance": {
+        "kind": "original-local-instructions",
+        "design": {
+          "path": "agent-factory-design.md",
+          "sha256": "7ec9b209eddf44958b0b378fa51f1f98073665184aa829c996ea12706b196aa1",
+          "sections": [
+            "6",
+            "7.1"
+          ]
+        },
+        "upstreamDesignProvenance": [
+          {
+            "repository": "https://github.com/mattpocock/skills",
+            "commit": "c55ee46073ed923f86ce59a5eb3b6d895095d1b7",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/michael-denyer/pstack-claude",
+            "commit": "2fe2002190bff9257d3e27f84ba6818f2cfd7e32",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/tech-leads-club/agent-skills",
+            "commit": "120b67676388241b314699fa8fa9af25ada6d1d4",
+            "retrieved": false
+          }
+        ],
+        "sourcePaths": [],
+        "licenses": [],
+        "editorialNotes": [
+          "Authored from the local design; no upstream skill bodies fetched or copied.",
+          "Upstream pins are design provenance only; source contents and licenses have not been verified.",
+          "Only resolved local role instructions are runtime dependencies.",
+          "Subscription-native Claude/Codex role context is supported; execution authority and model choice stay with the approved runner profile."
+        ],
+        "inspectedLocalSources": [
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/handoff/SKILL.md",
+            "sha256": "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25",
+            "retrieved": true,
+            "adaptationNotes": "Adapted artifact-linking, next-task focus, and secret-free summaries; output stays in role-authorized artifacts rather than imposing an OS temporary directory or Skill-tool invocation."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-guard-the-context-window/SKILL.md",
+            "sha256": "9f60e2c79b35f865cb103462f9128c6760b70f603475d1e535e5930f61840f66",
+            "retrieved": true,
+            "adaptationNotes": "Adapted selective reads and compact scoped contracts; excluded automatic subagent fan-out and context-size claims."
+          }
+        ]
+      }
+    },
+    {
+      "name": "factory-design",
+      "path": "home/.agents/skills/factory-design/SKILL.md",
+      "sha256": "bddbee79f454dea1d18d80351c4928255edac7e557d277c3e08313dc4acf7b1a",
+      "references": [
+        {
+          "path": "home/.agents/skills/factory-design/references/architecture-improvement.md",
+          "sha256": "cd33c9da9a37d9e51a7a80ec94ff69cfdf3adcda719f2bafc5863c95ba58a5d1"
+        }
+      ],
+      "provenance": {
+        "kind": "original-local-instructions",
+        "design": {
+          "path": "agent-factory-design.md",
+          "sha256": "7ec9b209eddf44958b0b378fa51f1f98073665184aa829c996ea12706b196aa1",
+          "sections": [
+            "6",
+            "7.1"
+          ]
+        },
+        "upstreamDesignProvenance": [
+          {
+            "repository": "https://github.com/mattpocock/skills",
+            "commit": "c55ee46073ed923f86ce59a5eb3b6d895095d1b7",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/michael-denyer/pstack-claude",
+            "commit": "2fe2002190bff9257d3e27f84ba6818f2cfd7e32",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/tech-leads-club/agent-skills",
+            "commit": "120b67676388241b314699fa8fa9af25ada6d1d4",
+            "retrieved": false
+          }
+        ],
+        "sourcePaths": [
+          "skills/engineering/improve-codebase-architecture/SKILL.md"
+        ],
+        "licenses": [],
+        "editorialNotes": [
+          "Authored from the local design; no upstream skill bodies fetched or copied.",
+          "Upstream pins are design provenance only; source contents and licenses have not been verified.",
+          "Only resolved local role instructions are runtime dependencies.",
+          "Architecture criteria are restated from local design section 6.3.1; upstream path is an unfetched design citation.",
+          "Subscription-native Claude/Codex role context is supported; execution authority and model choice stay with the approved runner profile."
+        ],
+        "inspectedLocalSources": [
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/handoff/SKILL.md",
+            "sha256": "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25",
+            "retrieved": true,
+            "adaptationNotes": "Adapted artifact-linking, next-task focus, and secret-free summaries; output stays in role-authorized artifacts rather than imposing an OS temporary directory or Skill-tool invocation."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-guard-the-context-window/SKILL.md",
+            "sha256": "9f60e2c79b35f865cb103462f9128c6760b70f603475d1e535e5930f61840f66",
+            "retrieved": true,
+            "adaptationNotes": "Adapted selective reads and compact scoped contracts; excluded automatic subagent fan-out and context-size claims."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/agent-factory-review/SKILL.md",
+            "sha256": "8acdc3de89629e4548dd00c422458c401bd1978a6532b49b115fc34c19c39ee7",
+            "retrieved": true,
+            "adaptationNotes": "Adapted evidence levels, existing-design comparison, calibration and acceptance-based workflow evaluation; excluded external research dependencies from runtime."
+          }
+        ]
+      }
+    },
+    {
+      "name": "factory-tdd",
+      "path": "home/.agents/skills/factory-tdd/SKILL.md",
+      "sha256": "bf076eb85af1e732a679282d4d44e23d3706c046125e3e19dd6c5ffc2d43b188",
+      "references": [
+        {
+          "path": "home/.agents/skills/factory-tdd/references/testing-quality.md",
+          "sha256": "1a86b2f0228f30c0dc352ad8cf9c6b88b1d9c5158f32b0cc331c7c49210f03dc"
+        }
+      ],
+      "provenance": {
+        "kind": "original-local-instructions",
+        "design": {
+          "path": "agent-factory-design.md",
+          "sha256": "7ec9b209eddf44958b0b378fa51f1f98073665184aa829c996ea12706b196aa1",
+          "sections": [
+            "6",
+            "7.1"
+          ]
+        },
+        "upstreamDesignProvenance": [
+          {
+            "repository": "https://github.com/mattpocock/skills",
+            "commit": "c55ee46073ed923f86ce59a5eb3b6d895095d1b7",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/michael-denyer/pstack-claude",
+            "commit": "2fe2002190bff9257d3e27f84ba6818f2cfd7e32",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/tech-leads-club/agent-skills",
+            "commit": "120b67676388241b314699fa8fa9af25ada6d1d4",
+            "retrieved": false
+          }
+        ],
+        "sourcePaths": [],
+        "licenses": [],
+        "editorialNotes": [
+          "Authored from the local design; no upstream skill bodies fetched or copied.",
+          "Upstream pins are design provenance only; source contents and licenses have not been verified.",
+          "Only resolved local role instructions are runtime dependencies.",
+          "Subscription-native Claude/Codex role context is supported; execution authority and model choice stay with the approved runner profile."
+        ],
+        "inspectedLocalSources": [
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/handoff/SKILL.md",
+            "sha256": "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25",
+            "retrieved": true,
+            "adaptationNotes": "Adapted artifact-linking, next-task focus, and secret-free summaries; output stays in role-authorized artifacts rather than imposing an OS temporary directory or Skill-tool invocation."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-test-behavior-not-implementation/SKILL.md",
+            "sha256": "87e40efe4e486f7ea639d2ed1fc0abe6c93b8fd0e89a81218086909d2470a52e",
+            "retrieved": true,
+            "adaptationNotes": "Adapted observable outcomes and meaningful defect sensitivity; absence can be valid specified behavior and is not categorically forbidden."
+          }
+        ]
+      }
+    },
+    {
+      "name": "factory-review",
+      "path": "home/.agents/skills/factory-review/SKILL.md",
+      "sha256": "477fc6d96608298ed0c56d7abdd9463924f4ed4c383ebfd587fc5763fe619e54",
+      "references": [
+        {
+          "path": "home/.agents/skills/factory-tdd/references/testing-quality.md",
+          "sha256": "1a86b2f0228f30c0dc352ad8cf9c6b88b1d9c5158f32b0cc331c7c49210f03dc"
+        }
+      ],
+      "provenance": {
+        "kind": "original-local-instructions",
+        "design": {
+          "path": "agent-factory-design.md",
+          "sha256": "7ec9b209eddf44958b0b378fa51f1f98073665184aa829c996ea12706b196aa1",
+          "sections": [
+            "6",
+            "7.1"
+          ]
+        },
+        "upstreamDesignProvenance": [
+          {
+            "repository": "https://github.com/mattpocock/skills",
+            "commit": "c55ee46073ed923f86ce59a5eb3b6d895095d1b7",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/michael-denyer/pstack-claude",
+            "commit": "2fe2002190bff9257d3e27f84ba6818f2cfd7e32",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/tech-leads-club/agent-skills",
+            "commit": "120b67676388241b314699fa8fa9af25ada6d1d4",
+            "retrieved": false
+          }
+        ],
+        "sourcePaths": [],
+        "licenses": [],
+        "editorialNotes": [
+          "Authored from the local design; no upstream skill bodies fetched or copied.",
+          "Upstream pins are design provenance only; source contents and licenses have not been verified.",
+          "Only resolved local role instructions are runtime dependencies.",
+          "Subscription-native Claude/Codex role context is supported; execution authority and model choice stay with the approved runner profile."
+        ],
+        "inspectedLocalSources": [
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/handoff/SKILL.md",
+            "sha256": "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25",
+            "retrieved": true,
+            "adaptationNotes": "Adapted artifact-linking, next-task focus, and secret-free summaries; output stays in role-authorized artifacts rather than imposing an OS temporary directory or Skill-tool invocation."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/code-review/SKILL.md",
+            "sha256": "47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50",
+            "retrieved": true,
+            "adaptationNotes": "Adapted distinct specification and documented-standard review axes; excluded spawning, issue-tracker installation, assumed HEAD diff, and permission to skip a required specification."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-test-behavior-not-implementation/SKILL.md",
+            "sha256": "87e40efe4e486f7ea639d2ed1fc0abe6c93b8fd0e89a81218086909d2470a52e",
+            "retrieved": true,
+            "adaptationNotes": "Adapted observable outcomes and meaningful defect sensitivity; absence can be valid specified behavior and is not categorically forbidden."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/agent-factory-review/SKILL.md",
+            "sha256": "8acdc3de89629e4548dd00c422458c401bd1978a6532b49b115fc34c19c39ee7",
+            "retrieved": true,
+            "adaptationNotes": "Adapted evidence levels, existing-design comparison, calibration and acceptance-based workflow evaluation; excluded external research dependencies from runtime."
+          }
+        ]
+      }
+    },
+    {
+      "name": "factory-verify",
+      "path": "home/.agents/skills/factory-verify/SKILL.md",
+      "sha256": "a030594b39413fe58a4253ff3703f3d27222b4edf5152e6843c4955ad83b48c4",
+      "references": [
+        {
+          "path": "home/.agents/skills/factory-tdd/references/testing-quality.md",
+          "sha256": "1a86b2f0228f30c0dc352ad8cf9c6b88b1d9c5158f32b0cc331c7c49210f03dc"
+        }
+      ],
+      "provenance": {
+        "kind": "original-local-instructions",
+        "design": {
+          "path": "agent-factory-design.md",
+          "sha256": "7ec9b209eddf44958b0b378fa51f1f98073665184aa829c996ea12706b196aa1",
+          "sections": [
+            "6",
+            "7.1"
+          ]
+        },
+        "upstreamDesignProvenance": [
+          {
+            "repository": "https://github.com/mattpocock/skills",
+            "commit": "c55ee46073ed923f86ce59a5eb3b6d895095d1b7",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/michael-denyer/pstack-claude",
+            "commit": "2fe2002190bff9257d3e27f84ba6818f2cfd7e32",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/tech-leads-club/agent-skills",
+            "commit": "120b67676388241b314699fa8fa9af25ada6d1d4",
+            "retrieved": false
+          }
+        ],
+        "sourcePaths": [],
+        "licenses": [],
+        "editorialNotes": [
+          "Authored from the local design; no upstream skill bodies fetched or copied.",
+          "Upstream pins are design provenance only; source contents and licenses have not been verified.",
+          "Only resolved local role instructions are runtime dependencies.",
+          "Subscription-native Claude/Codex role context is supported; execution authority and model choice stay with the approved runner profile."
+        ],
+        "inspectedLocalSources": [
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/handoff/SKILL.md",
+            "sha256": "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25",
+            "retrieved": true,
+            "adaptationNotes": "Adapted artifact-linking, next-task focus, and secret-free summaries; output stays in role-authorized artifacts rather than imposing an OS temporary directory or Skill-tool invocation."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-test-behavior-not-implementation/SKILL.md",
+            "sha256": "87e40efe4e486f7ea639d2ed1fc0abe6c93b8fd0e89a81218086909d2470a52e",
+            "retrieved": true,
+            "adaptationNotes": "Adapted observable outcomes and meaningful defect sensitivity; absence can be valid specified behavior and is not categorically forbidden."
+          }
+        ]
+      }
+    },
+    {
+      "name": "factory-coordinate",
+      "path": "home/.agents/skills/factory-coordinate/SKILL.md",
+      "sha256": "cb90fd4bb94175e56b12fcd88ec36fb757e2ebec04f767d3fd20698a274fbb77",
+      "references": [],
+      "provenance": {
+        "kind": "original-local-instructions",
+        "design": {
+          "path": "agent-factory-design.md",
+          "sha256": "7ec9b209eddf44958b0b378fa51f1f98073665184aa829c996ea12706b196aa1",
+          "sections": [
+            "6",
+            "7.1"
+          ]
+        },
+        "upstreamDesignProvenance": [
+          {
+            "repository": "https://github.com/mattpocock/skills",
+            "commit": "c55ee46073ed923f86ce59a5eb3b6d895095d1b7",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/michael-denyer/pstack-claude",
+            "commit": "2fe2002190bff9257d3e27f84ba6818f2cfd7e32",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/tech-leads-club/agent-skills",
+            "commit": "120b67676388241b314699fa8fa9af25ada6d1d4",
+            "retrieved": false
+          }
+        ],
+        "sourcePaths": [],
+        "licenses": [],
+        "editorialNotes": [
+          "Authored from the local design; no upstream skill bodies fetched or copied.",
+          "Upstream pins are design provenance only; source contents and licenses have not been verified.",
+          "Only resolved local role instructions are runtime dependencies.",
+          "Subscription-native Claude/Codex role context is supported; execution authority and model choice stay with the approved runner profile."
+        ],
+        "inspectedLocalSources": [
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/handoff/SKILL.md",
+            "sha256": "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25",
+            "retrieved": true,
+            "adaptationNotes": "Adapted artifact-linking, next-task focus, and secret-free summaries; output stays in role-authorized artifacts rather than imposing an OS temporary directory or Skill-tool invocation."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-guard-the-context-window/SKILL.md",
+            "sha256": "9f60e2c79b35f865cb103462f9128c6760b70f603475d1e535e5930f61840f66",
+            "retrieved": true,
+            "adaptationNotes": "Adapted selective reads and compact scoped contracts; excluded automatic subagent fan-out and context-size claims."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/agent-factory-review/SKILL.md",
+            "sha256": "8acdc3de89629e4548dd00c422458c401bd1978a6532b49b115fc34c19c39ee7",
+            "retrieved": true,
+            "adaptationNotes": "Adapted evidence levels, existing-design comparison, calibration and acceptance-based workflow evaluation; excluded external research dependencies from runtime."
+          }
+        ]
+      }
+    },
+    {
+      "name": "factory-communicate",
+      "path": "home/.agents/skills/factory-communicate/SKILL.md",
+      "sha256": "79483de2a86e507f34c5d92b2913158400cbd44aec97cf9486f9dee2c761bec9",
+      "references": [],
+      "provenance": {
+        "kind": "original-local-instructions",
+        "design": {
+          "path": "agent-factory-design.md",
+          "sha256": "7ec9b209eddf44958b0b378fa51f1f98073665184aa829c996ea12706b196aa1",
+          "sections": [
+            "6",
+            "7.1"
+          ]
+        },
+        "upstreamDesignProvenance": [
+          {
+            "repository": "https://github.com/mattpocock/skills",
+            "commit": "c55ee46073ed923f86ce59a5eb3b6d895095d1b7",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/michael-denyer/pstack-claude",
+            "commit": "2fe2002190bff9257d3e27f84ba6818f2cfd7e32",
+            "retrieved": false
+          },
+          {
+            "repository": "https://github.com/tech-leads-club/agent-skills",
+            "commit": "120b67676388241b314699fa8fa9af25ada6d1d4",
+            "retrieved": false
+          }
+        ],
+        "sourcePaths": [],
+        "licenses": [],
+        "editorialNotes": [
+          "Authored from the local design; no upstream skill bodies fetched or copied.",
+          "Upstream pins are design provenance only; source contents and licenses have not been verified.",
+          "Only resolved local role instructions are runtime dependencies.",
+          "Subscription-native Claude/Codex role context is supported; execution authority and model choice stay with the approved runner profile."
+        ],
+        "inspectedLocalSources": [
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/handoff/SKILL.md",
+            "sha256": "7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25",
+            "retrieved": true,
+            "adaptationNotes": "Adapted artifact-linking, next-task focus, and secret-free summaries; output stays in role-authorized artifacts rather than imposing an OS temporary directory or Skill-tool invocation."
+          },
+          {
+            "path": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-guard-the-context-window/SKILL.md",
+            "sha256": "9f60e2c79b35f865cb103462f9128c6760b70f603475d1e535e5930f61840f66",
+            "retrieved": true,
+            "adaptationNotes": "Adapted selective reads and compact scoped contracts; excluded automatic subagent fan-out and context-size claims."
+          }
+        ]
+      }
+    }
+  ]
+}

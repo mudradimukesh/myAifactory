@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "roles": {
+    "developer": {
+      "skills": [
+        "factory-tdd"
+      ],
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit",
+        "bash"
+      ]
+    },
+    "reviewer": {
+      "skills": [
+        "factory-review"
+      ],
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ]
+    },
+    "tester": {
+      "skills": [
+        "factory-verify"
+      ],
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit",
+        "bash"
+      ]
+    },
+    "business": {
+      "skills": [
+        "factory-discovery"
+      ],
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit"
+      ]
+    },
+    "domain": {
+      "skills": [
+        "factory-discovery"
+      ],
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit"
+      ]
+    },
+    "architect": {
+      "skills": [
+        "factory-design"
+      ],
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit"
+      ]
+    },
+    "coordinator": {
+      "skills": [
+        "factory-coordinate",
+        "factory-communicate"
+      ],
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ]
+    }
+  }
+}
