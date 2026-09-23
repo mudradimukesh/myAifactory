@@ -10,7 +10,8 @@ export type WorkerOutput = {
     reason: string | null;
 };
 const writeRoles = new Set<Role>(['business', 'domain', 'architect', 'developer', 'tester']);
-const commandRoles = new Set<Role>(['developer', 'tester']);
+// Execute these commands only through LocalRuntime. Its outer macOS sandbox
+// owns filesystem permissions; macOS rejects a second nested Seatbelt sandbox.
 export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, prompt: string, policy: string): {
     executable: string;
     args: string[];
@@ -29,7 +30,6 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
     if (!policy.trim())
         throw new Error('Worker policy must be explicit');
     if (choice.provider === 'codex') {
-        const sandbox = commandRoles.has(role) ? 'workspace-write' : 'read-only';
         return {
             executable: 'codex',
             args: [
@@ -39,7 +39,7 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
                 '-c', `model_reasoning_effort="${choice.effort}"`,
                 '-c', 'approval_policy="never"',
                 '-c', 'project_doc_max_bytes=0',
-                '--sandbox', sandbox,
+                '--sandbox', 'danger-full-access',
                 '-C', cwd,
                 '-',
             ],

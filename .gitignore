@@ -2,3 +2,5 @@ node_modules/
 .state/
 .scratch/
 coverage/
+
+.factory/

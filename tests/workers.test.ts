@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseWorkerOutput, workerCommand } from '../src/workers.ts';
 
-test('Codex workers use explicit model, effort, policy, and role sandbox', () => {
+test('Codex workers use explicit policy and delegate filesystem isolation to LocalRuntime', () => {
   const developer = workerCommand(
     { provider: 'codex', model: 'gpt-5.4', effort: 'high' },
     'developer', '/tmp/project', 'Implement the change', 'Follow this policy',
@@ -16,7 +16,7 @@ test('Codex workers use explicit model, effort, policy, and role sandbox', () =>
   assert.ok(developer.args.includes('model_reasoning_effort="high"'));
   assert.ok(developer.args.includes('approval_policy="never"'));
   assert.ok(developer.args.includes('project_doc_max_bytes=0'));
-  assert.equal(developer.args[developer.args.indexOf('--sandbox') + 1], 'workspace-write');
+  assert.equal(developer.args[developer.args.indexOf('--sandbox') + 1], 'danger-full-access');
   assert.match(developer.stdin, /Worker policy:\nFollow this policy\n\nTask:\nImplement the change/);
   assert.deepEqual(developer.env, {});
 
@@ -24,7 +24,7 @@ test('Codex workers use explicit model, effort, policy, and role sandbox', () =>
     { provider: 'codex', model: 'gpt-5.4-mini', effort: 'medium' },
     'reviewer', '/tmp/project', 'Review', 'Review policy',
   );
-  assert.equal(reviewer.args[reviewer.args.indexOf('--sandbox') + 1], 'read-only');
+  assert.equal(reviewer.args[reviewer.args.indexOf('--sandbox') + 1], 'danger-full-access');
 });
 
 test('Claude workers have explicit model and restricted role tools', () => {

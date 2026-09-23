@@ -625,3 +625,193 @@ Section 6 now states only the adopted role behavior. Original workflow bodies an
 ### 13.7 Revision 5.3 architecture improvement capability
 
 Restored the architecture-analysis methods from [MP improve-codebase-architecture](https://github.com/mattpocock/skills/blob/c55ee46073ed923f86ce59a5eb3b6d895095d1b7/skills/engineering/improve-codebase-architecture/SKILL.md) as a conditional local reference for `factory-design`. Section 6.3.1 defines its triggers, bounded scope, evidence, and handoff. Coordinator owns prioritization, Developer owns implementation, and Tester owns independent verification. The local reference remains an implementation deliverable under the existing skill adaptation and validation requirements.
+
+## 14. Architecture and implementation review, 2026-09-23
+
+### 14.1 Verdict and scope
+
+[SOURCE] Reviewed commit `83351370f40583c641d3ed45da0d928d14d7372a`, initially clean, using `architect`, `agent-factory-review`, their tracing and design-comparison methods, the repository verification skill, and unslop. This section adds a review; sections 1-13 remain unchanged. The subscription ADR supersedes Pi and model defaults. This review does not reverse that decision or authorize implementation, provider spending, integration, or release.
+
+[DESIGN] Keep the local, file-based, single-writer architecture. Repair the candidate and evidence boundaries before building the coordinator. The review identified four P1 defects in those boundaries and one P2 direct-process lifetime defect. None requires a daemon, database, broker, extra permanent agent role, or new orchestration framework.
+
+[SOURCE] The intended delivery is a verified candidate and artifact handed to a named release owner, for Git-based software runnable in Linux containers. The current delivery is seven library modules and local tests. The README already states that the CLI, acceptance coordinator, prepared image, and live-provider validation are absent. Six responsibilities do not require six processes. Routine design can remain with the coordinator, with independent review required for implementation.
+
+[LOCAL-REPRO] Node `v24.19.0` passed typechecking and all 23 existing tests. All seven role bundles loaded with digest `9feaaf5bdb3783991ce1d5ecd44ca1ddfba4d3d630dab072e764eb77ff3f4fce`. These results establish only the checked library behaviors. The reproduced failures below cover paths omitted by that suite.
+
+### 14.2 Traced model and rationale constraints
+
+[TRACED] `Store` owns state-root execution reservation, per-run mutation locks, atomic state replacement, and event reconciliation. State is authoritative; recovery repairs a missing final event and rejects conflicting history. `contracts.ts` checks serialized shape and some consistency rules. Neither module establishes acceptance, and no production coordinator calls the library to bind checks, review, and artifacts into an accepted outcome.
+
+[TRACED] `git.ts` checks source cleanliness, creates an independent bare store, validates submissions in the developer repository, and fetches a candidate into `refs/candidates/<sha>`. `checkout` then attempts a normal clone and detached checkout. `bundle.ts` hashes selected instructions; `workers.ts` constructs native invocations and interprets completion events. `DockerRuntime.execute` builds container arguments and invokes `runProcess`, which captures output and supervises timeouts. Worker completion remains a claim.
+
+[TRACED] The diagram shows existing library relationships and the absent operational connection. It is not evidence of a completed factory journey.
+
+```mermaid
+flowchart LR
+  A[Developer clone] --> B[Import candidate]
+  B --> C[Runner Git store]
+  C --> D[Fresh verifier checkout]
+  E[Locked role instructions] --> F[Native worker command]
+  F --> G[DockerRuntime and runProcess]
+  G --> H[Captured output and parsed claims]
+  D -. coordinator absent .-> I[Independent acceptance and handoff]
+  H -. coordinator absent .-> I
+  I -. integration absent .-> J[Store state and events]
+```
+
+[SOURCE] Git history contains one initial commit; blame supplies no earlier implementation rationale. The design and ADR explicitly justify subscription-native workers, isolated clones, independent verification, and file-based state. Preserve those constraints. No issue, team-chat, infrastructure-observability, error-tracking, or analytics connector was available for this review. Local documents were inspected; external organizational documents were not searched. Implementation-time reasons for the defects remain unknown.
+
+### 14.3 Prioritized defects and repair acceptance
+
+#### F1. P1: submission validation can execute worker-configured code on the host
+
+[TRACED] `src/git.ts:39` runs `git status` inside the worker-owned repository through the helper at line 8. Disabling hooks, fsmonitor, and global configuration does not disable repository-local content filters. The developer can modify its Git configuration, while attributes select the filter. Submission validation therefore crosses the boundary in section 7.3 before it accepts or rejects a candidate.
+
+[LOCAL-REPRO] In a disposable repository, a harmless configured clean filter wrote a marker during `importCandidate` and the import then rejected the dirty worktree. The retained marker `/tmp/factory-repro-filter-prfbgf/HOST_FILTER_EXECUTED` contains `host-execution`. Rejection after the side effect does not protect the host. This was a local Git/library experiment, not a container escape experiment.
+
+[DESIGN] Status relative to specification: **contradictory implementation**, sections 7.2-7.3 already prohibit running untrusted project behavior on the host. Do not run host Git against worker-controlled repository configuration. Perform operations requiring that configuration inside the existing isolated runtime, transfer objects as untrusted data, and validate them in runner-owned storage. Prove worktree cleanliness independently of worker-authored claims. A few additional `-c` overrides are not a complete configuration boundary.
+
+[DESIGN] Acceptance: submission with a harmless executable filter must leave the host marker absent, whether import succeeds or rejects. A normal clean submission must still work. Include dirty tracked and untracked files, executable filters, and local configuration indirection. Keep this test at the public submission boundary.
+
+#### F2. P1: imported candidates are unavailable to fresh verifier clones
+
+[TRACED] `src/git.ts:56` publishes only `refs/candidates/<sha>`, but `checkout` at lines 31-33 uses a normal transport clone, which fetches branches and tags. A new candidate reachable only through the custom ref is absent from the verifier repository.
+
+[LOCAL-REPRO] The public sequence `createStore`, developer commit, `importCandidate`, then `checkout` imported candidate `a070969e0ff491595cb1a720688aa0508a6a52c1` successfully and failed checkout with `fatal: unable to read tree`. The main reviewer repeated the checkout independently. Evidence is `/tmp/my-aifactory-review-20260923/checkout.log`; the original fixture is `/tmp/factory-repro-checkout-mXl2LF`.
+
+[DESIGN] Status relative to specification: **contradictory implementation**, section 7.3 and section 11.3's fresh-verifier case already require the exact submitted candidate. Fetch that exact retained ref or object into a fresh verifier before removing transport configuration, detach at its identity, and verify HEAD. Do not depend on the store's default branch containing the candidate.
+
+[DESIGN] Acceptance: commit a change after creating the store, import it, materialize a new verifier, and assert both the exact HEAD and changed file contents. Repeat with two sequential candidates. The existing Git test reads the object directly from bare storage and misses this final step.
+
+#### F3. P1: candidate validation and import can inspect different trees
+
+[TRACED] The Git helper does not disable replacement objects. `importCandidate` validates ancestry, changed paths, and tree modes in the worker repository at `src/git.ts:44-55`, then fetches the original commit into runner storage at line 56. Worker-local replacement refs can change the tree seen during validation without changing the submitted commit ID.
+
+[LOCAL-REPRO] A disposable submission returned changed paths `['allowed']` and candidate `5367136e64cc3abc9a818ae4541e74724bffb7ef`. Reading the imported candidate's `protected` file from runner storage returned `UNAUTHORIZED`. The fixture remains at `/tmp/factory-repro-replace-C2c2tS`. This demonstrates an implemented allowed-path bypass; it does not depend on the future coordinator.
+
+[DESIGN] Status relative to specification: **contradictory implementation**, sections 7.3 and 9 already bind scope validation to the exact candidate. Disable replacement-object interpretation and validate original commit ancestry, changed paths, and tree modes in runner-owned quarantine before publishing the candidate ref. Treat the worker's changed-file list as a claim. The [Git documentation](https://git-scm.com/docs/git#Documentation/git.txt---no-replace-objects) identifies the replacement-disable control, but that control alone does not fix F1.
+
+[DESIGN] Acceptance: replacement metadata must not make a disallowed original tree pass. Assert rejection, no published candidate receipt, and unchanged permitted-path behavior for ordinary submissions and unusual filenames. Validate the imported tree, not merely equality of commit strings.
+
+#### F4. P1: workers can alter runner-captured logs
+
+[TRACED] `DockerRuntime.execute` writes stdout and stderr to `job.outputDir` at `src/runtime.ts:68`. `dockerCommand` mounts that same directory writable at `/output`, using the host UID/GID, at `src/process.ts:224-236`. Mode `0600` does not separate the worker from these files. A worker can alter captured bytes or write around the process output limit.
+
+[LOCAL-REPRO] An actual `runProcess` child wrote `FORGED EVIDENCE` directly into the configured stdout file without emitting stdout; the call reported completion. The retained file is `/tmp/factory-log-tamper-XgwQwX/stdout.log`. This proves same-user file tampering. [UNTESTED] The container mount exposure is source-traced; no live Docker run or accepted-handoff exploit was demonstrated.
+
+[DESIGN] Status relative to specification: **contradictory implementation**, sections 7.2 and 8 already separate worker proposals from runner-owned evidence. Give execution distinct proposal and capture directories. Mount only proposals and scratch; keep capture, invocation records, usage records, and results outside every worker-writable mount. Derive those paths under runner ownership so callers cannot accidentally alias them.
+
+[DESIGN] Acceptance: a real container can write its proposal but cannot read, replace, truncate, or symlink the runner capture files. The runner must retain exactly the emitted, redacted bytes and enforce the configured byte limit. A command-construction test is useful but cannot replace this live boundary check.
+
+#### F5. P2: normal process completion abandons descendants
+
+[TRACED] At `src/process.ts:156-174`, child close resolves supervision. Group termination runs only if a stop reason already exists; normal completion and ordinary nonzero exit assign their reason afterward and clear the timeout. Descendants that close inherited pipes can outlive the call.
+
+[LOCAL-REPRO] A child spawned an unreferenced same-group descendant with ignored stdio and exited successfully. `runProcess` reported completion with a 500 ms allowance; the descendant was still alive 700 ms later and the experiment explicitly terminated it. [UNTESTED] This is a direct-process-library defect, not evidence of a surviving Docker workload or a container escape.
+
+[DESIGN] Status relative to specification: **partial implementation**, sections 7.1 and 10 require bounded attempt lifetime, including subprocesses. Reconcile and stop owned descendants on all terminal paths before declaring supervision complete. Acceptance must cover successful and nonzero parent exit in addition to timeout and cancellation, without killing unrelated processes.
+
+### 14.4 Existing controls and remaining delivery gaps
+
+[SOURCE] The following distinguishes missing implementation from missing requirements. Repeating these controls under new names would not close the gaps.
+
+| Control | Specification coverage | Implementation and next acceptance evidence |
+|---|---|---|
+| Cumulative user outcomes and independent review | [SOURCE] Already covered, sections 5, 9, 11.3 | [TRACED] Missing coordinator. Prove a later slice breaking an earlier journey blocks final handoff; include worker-reported success with a failed mandatory check. |
+| Candidate, spec, check, environment, dependency and artifact identity | [SOURCE] Already covered, sections 8-9 | [TRACED] Partial. Result records lack explicit dependency-lock and sanitized-environment identities; no operational gate verifies the complete tuple or artifact hashes. |
+| Calibrated reviewer and held-out scenarios | [SOURCE] Already covered, sections 9 and 12 | [UNTESTED] No calibration or product trial. Include known-good cases and seeded functional defects, record misses and false alarms, and mark exposed cases before tuning. |
+| Resume context and uncertain actions | [SOURCE] Already covered, sections 8 and 10 | [TRACED] Partial. Local event repair exists; job reconciliation, validated restart handoff, and replay-safe dispatch remain unimplemented. |
+| Run budgets and concurrency | [SOURCE] Already covered, sections 2, 8 and 10 | [TRACED] Root reservation exists; dispatch, cumulative allowances, unknown-usage blocking, and verification reserve lack an operational caller. Limits are per state root, not machine-wide. |
+| Permissions and native subscriptions | [SOURCE] Covered by sections 6-7 and superseding ADR | [TRACED] Partial. Role tools and native permissions have separate definitions. Codex discovery/design uses read-only mode despite required scratch proposals. [UNTESTED] Live login, refresh, model access, and mount behavior remain unverified. |
+| Skill and model promotion | [SOURCE] Already covered, sections 6.4 and 12.3 | [TRACED] Hash checks exist. Upstream provenance/licenses and representative behavioral promotion evidence remain incomplete, as already documented. |
+| Additional specialists, multi-writer scheduling, alternate frameworks | [SOURCE] Intentionally deferred, sections 2, 10 and 12 | [DESIGN] Keep deferred. Fix the single-writer path and compare measured outcomes before adding any of these. |
+
+### 14.5 Design comparison and recommended shape
+
+[DESIGN] Two independent candidate sketches compared responsibility boundaries. Candidate A gives candidate submission/materialization and bounded attempt execution separate domain owners. Candidate B gives the future CLI complete operations through a `Runner`, keeping those owners internal. Both retain ordinary files and the selected native runtimes. The current direct-repair baseline remains viable and is the recommended immediate scope.
+
+| Option | Complexity hidden from the caller | Cost or risk accepted | Decision |
+|---|---|---|---|
+| Repair existing modules | [DESIGN] Fixes the specific Git and log boundaries inside their current functions | [DESIGN] Future callers still need to coordinate locks, budgets and acceptance | [DESIGN] Use now. No renames or wrapper files are needed to repair F1-F5. |
+| A: public candidate and attempt owners | [DESIGN] Hides Git materialization, container identity, capture layout and attempt recovery | [DESIGN] Caller still composes run-wide acceptance and persistence; overlapping public APIs can spread policy | [DESIGN] Keep its ownership rules, defer its public API. |
+| B: complete Runner operations | [DESIGN] Hides evidence collection, cumulative gates and stale-acceptance checks behind operator outcomes | [DESIGN] Requires the absent vertical workflow; adding an empty facade today would be a pass-through layer | [DESIGN] Preferred base for the future operator milestone, not a prerequisite for direct repairs. |
+
+[DESIGN] Proposed caller usage comes first. This is an illustrative future API, not an installed command or authorization to build it:
+
+```ts
+const runner = await Runner.open(stateRoot);
+const result = await runner.verify(runId);
+if (result.kind === 'accepted') {
+  const handoff = await runner.handoff(result.accepted);
+  console.log(handoff.manifestPath);
+}
+```
+
+[DESIGN] Derive the interface from those calls. `verify` owns fresh independent review, cumulative mandatory checks, exact identities, and remaining execution allowances. `handoff` rereads current state and validates artifact/evidence hashes, recipient, and operating instructions. Neither accepts a worker-supplied pass flag. An opaque type prevents accidental misuse, not malicious JavaScript or stale evidence.
+
+```ts
+declare const acceptedBrand: unique symbol;
+type RunId = string;
+type Accepted = Readonly<{ [acceptedBrand]: true }>;
+type Verification =
+  | Readonly<{ kind: 'accepted'; accepted: Accepted }>
+  | Readonly<{ kind: 'blocked'; reasons: readonly string[] }>;
+
+class Runner {
+  static async open(stateRoot: string): Promise<Runner> {
+    throw new Error('not implemented');
+  }
+  async verify(run: RunId): Promise<Verification> {
+    // Reconcile owned jobs and durable intent before any dispatch.
+    // Enforce remaining budgets; collect runner-owned evidence.
+    // Bind acceptance internally to run revision and all input identities.
+    throw new Error('not implemented');
+  }
+  async handoff(accepted: Accepted): Promise<{ manifestPath: string }> {
+    // Reject unknown or stale capabilities; recheck persisted evidence.
+    // Publish handoff_ready only after the complete current gate passes.
+    throw new Error('not implemented');
+  }
+}
+```
+
+[DESIGN] Keep the concrete ownership in existing files: `git.ts` owns trusted candidate import and exact materialization; `runtime.ts` and `process.ts` own workload lifetime and isolated capture; `workers.ts` parses provider events; `bundle.ts` verifies instructions; `store.ts` owns persistence. Add a runner operation only when it actually binds these responsibilities into a working user journey. Keep cancellation/control writes independent of the execution lock. Do not expose mutable State or raw Docker arguments as the operator API.
+
+[DESIGN] Synthesis uses B for the eventual operator boundary and incorporates A's explicit separation of immutable captured evidence from worker proposals and its recovery-before-relaunch rule. Reject A's extra public materialization/execution composition and reject an immediate full Runner build. The direct repair baseline is smaller without weakening the required boundaries. No temporal load/validate/save layers or forwarding classes are proposed.
+
+[SOURCE] The independent cross-judge agreed with that sequencing after comparing trust boundaries, identity binding, recovery ownership, interface depth, and single-writer compatibility. [DESIGN] Its preference is an assessment of the sketches, not proof of a safe implementation. In particular, safe Git transfer and independent cleanliness validation still require a concrete implementation and boundary tests.
+
+[DESIGN] First implementation step: extend the existing Git test to include imported-candidate checkout, then repair Git validation/transfer and isolate capture. Next demonstrate the failed-check-blocks-handoff vertical slice from section 11.2 before adding optional roles. Reconsider the sketch if these domain boundaries require callers to repeat identity or trust rules.
+
+### 14.6 Primary-source comparisons
+
+[SOURCE] Sources below were inspected on 2026-09-23. Dated reports are author accounts, not locally reproduced factory results. Documentation on moving branches is an inspected snapshot, not a pinned compatibility test.
+
+| Source and date | Relevant evidence | Comparison with this specification |
+|---|---|---|
+| [Anthropic application development](https://www.anthropic.com/engineering/harness-design-long-running-apps), 2026-03-24 | [SOURCE] Describes evaluator calibration, interaction with running applications, and removal of workflow stages after model changes | [DESIGN] Already covered in sections 9 and 12. Preserve independent verification; test optional stages one at a time. Different example scopes and budgets prevent a causal efficiency claim here. |
+| [Anthropic agent evaluations](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents), 2026-01-09 | [SOURCE] Separates deterministic, model and human grading; describes calibration and regression evaluation | [DESIGN] Already covered in sections 9 and 12. Turn those requirements into known-good and seeded-defect cases rather than adding another reviewer persona. |
+| [Anthropic context engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents), 2025-09-29 | [SOURCE] Treats available context as finite and discusses structured notes and context selection | [DESIGN] Already covered in sections 8 and 10. Test actual reconstruction after interruption; a handoff field alone is insufficient. |
+| [StrongDM principles](https://factory.strongdm.ai/principles), undated page | [SOURCE] Calls for end-to-end validation and sustained success on holdout scenarios | [DESIGN] Already covered in sections 9 and 12. It supplies no controlled evidence that this factory works or needs a service-replica platform. |
+| [Cursor swarm report](https://cursor.com/blog/agent-swarm-model-economics), 2026-07-20 | [SOURCE] Compares orchestration versions and model mixes on rebuilding SQLite; introduces coordination machinery for very high write concurrency | [DESIGN] Additional concurrency remains intentionally deferred. Its workload and scale do not justify replacing Git or adding recursive delegation here. |
+| [Anthropic C compiler experiment](https://www.anthropic.com/engineering/building-c-compiler), 2026-02-05 | [SOURCE] Emphasizes test-oracle quality and records regressions and limits even after substantial parallel work | [DESIGN] Supports enforcing the existing cumulative checks. Compiler results do not establish usable web-product delivery or subscription efficiency. |
+| [Scaling agent systems, v3](https://arxiv.org/abs/2512.08296v3), 2026-04-08 | [SOURCE] Reports task-dependent gains and losses across 260 configurations and six benchmarks | [DESIGN] Supports the existing workload-specific evaluation plan. It does not choose this factory's model mix or establish a universal agent count. |
+| [OpenHands SDK README](https://github.com/OpenHands/software-agent-sdk/blob/main/README.md), moving source | [SOURCE] Documents local and ephemeral container workspaces and a separate agent server | [DESIGN] Isolation is already required. No observed blocker justifies replacing the subscription-native runner with an SDK/server stack. |
+| [SWE-agent CLI documentation](https://swe-agent.com/latest/usage/cli/), moving documentation | [SOURCE] Exposes retained-trajectory inspection/replay and identifies SWE-agent as maintenance-only, superseded by mini-swe-agent | [DESIGN] Retain inspectable evidence under section 8. Debug replay is not safe retry of an uncertain external action; keep reconciliation separate. |
+
+[DESIGN] For the first comparative pilot, keep the approved tasks, starting commits, environments, budgets, and mandatory checks fixed. Compare coordinator-led design plus one developer and independent verification against one optional change. Record all attempts, failures, interventions, accepted-task rate, elapsed time, human minutes, and total resources per accepted task. The operator selects the finite sample and budget; this review schedules no paid trials. With zero product trials here, no quality-rate or efficiency estimate is justified.
+
+### 14.7 Verification record and limits
+
+[LOCAL-REPRO] Existing verification used the repository-prescribed Node executable, `node_modules/typescript/bin/tsc --noEmit`, `bundle()`, and `node --test tests/*.test.ts`. Typecheck exit was 0; tests were 23 passed, 0 failed, 0 skipped. Git was `2.50.1 (Apple Git-155)`. The temporary evidence directory is `/tmp/my-aifactory-review-20260923`, containing the test log, exit record, Node version, typecheck record, and repeated-checkout result. Individual defect experiments were small deterministic counterexamples, not statistical evaluations.
+
+[SOURCE] Two bounded explorers traced the library; two candidate sketches and an independent cross-judge compared the designs. The configured Claude and Grok runners were unavailable, so this used the available inherited model. It is not cross-model validation. Candidate artifacts are `/tmp/factory-design-a.md` and `/tmp/factory-design-b.md`; the traced explanation is `/tmp/factory-how.md`. Prose received an explicit unslop pass; raw evidence was not rewritten.
+
+[UNTESTED] Docker was unavailable on PATH. No container image, subscription call, native permission boundary, credential refresh, end-to-end application journey, crash/power-loss matrix, independent clean setup, reviewer calibration, or product comparison ran. Temporary evidence paths are local audit aids, not portable release artifacts. The repository remains non-operational after this documentation-only review.
+
+
+## 15. Native macOS runtime override
+
+[DESIGN] The user subsequently authorized removal of Docker. [ADR 0002](docs/adr/0002-native-macos-runtime.md) supersedes earlier container/image/resource assumptions with fail-closed native macOS `LocalRuntime`, project schema version 2, separate capture/proposal/scratch directories and attempt-local provider credentials. Native execution does not provide container-equivalent CPU, memory or PID quotas; process-group cleanup does not establish containment of deliberately detached descendants. ADR 0001's subscription-only billing and the design's candidate/evidence/acceptance requirements remain.
+
+[SOURCE] Section 14 records the earlier reviewed revision and its reproductions. It remains historical evidence, not a claim that the native migration has passed validation. See [review status](docs/review-status.md) for current verification and unresolved operational gates.

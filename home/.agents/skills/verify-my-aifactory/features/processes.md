@@ -1,25 +1,27 @@
 # Process execution
 
-A coordinator launches a bounded process, receives its outcome, and keeps captured evidence. Container management must refuse unrelated containers.
+A coordinator launches a bounded process and keeps captured evidence. `LocalRuntime` restricts native workers with a deny-default macOS sandbox. It must fail closed when required capabilities are unavailable.
 
 ## Sub-features
 
-- Direct argv execution excludes inherited secrets.
-- Logs persist while a worker runs and redact split credentials.
-- Cancellation and timeouts stop the process group, including descendants with closed output pipes.
-- Output limits bound stored evidence.
-- Docker ownership checks use an inspected immutable container ID.
+- Direct argv execution excludes inherited secrets; logs persist and redact split credentials.
+- Timeout, cancellation, failure and normal completion clean up the supervised process group.
+- Output limits bound runner-captured evidence.
+- Canonical workspace, policy, proposal, capture and scratch directories are disjoint.
+- Reviewer source and policy are read-only; proposals and scratch are writable; runner capture is inaccessible.
+- A fresh HOME receives only the validated dedicated credential file in its provider home, allowing attempt-local refresh.
+- Network policy distinguishes `none`, `loopback` and `outbound`.
 
 ## How to get to it (user POV)
 
-The mapped recipe drives `runProcess` and `DockerRuntime.stop/remove`. `DockerRuntime.preflight/execute` and `validateAuthHome` also exist, but this recipe does not cover their diagnostics, credential validation, or full launch behavior. No operator CLI exposes these entries yet.
+The callable entries are `runProcess`, `LocalRuntime.preflight/execute` and `validateAuthHome`. No operator CLI exposes them yet. Project schema version 2 selects `runtime.kind: 'macos-sandbox'`; old Docker profiles are not valid native profiles.
 
 ## Driving it with Node tests
 
-Preconditions: complete the parent skill's doctor checks.
+Complete the parent skill's doctor checks. Run `"$FACTORY_NODE" --test tests/process.test.ts tests/runtime.test.ts`, capturing output and exit status under `FACTORY_EVIDENCE`. Require a successful exit and inspect any skipped tests. The process harness uses real local child processes; native boundary tests require macOS and working `sandbox-exec`.
 
-Run `"$FACTORY_NODE" --test tests/process.test.ts tests/runtime.test.ts`, capturing output and exit status under `FACTORY_EVIDENCE`. Require a successful exit. The harness launches real child processes and checks persisted bytes and descendant liveness. The runtime test uses a disposable executable named `docker`, checks refusal of foreign containers, and records the addressed container ID.
+Keep evidence of attempted capture/state reads and writes, reviewer writes, allowed proposal/scratch writes, symlink traversal, child-process inheritance, credential-copy boundaries and network modes. Exercise success and timeout with descendants that close or retain their pipes. Missing tests remain gaps even when the suite passes; consult `docs/review-status.md` for demonstrated coverage.
 
 ## Gotchas
 
-The Docker executable is a fixture. Its passing test does not prove real container stdin delivery, mounts, credential refresh, sandbox behavior, or isolation. Do not launch subscription workers from this recipe.
+Process groups do not contain deliberately detached sessions. Native runtime provides no hard CPU, memory or PID quotas and no pinned container image. A passing sandbox fixture does not prove installed provider compatibility, subscription access, credential-refresh behavior or full recovery after runner termination. Refreshed credentials stay in the attempt home and do not update the dedicated source login. Do not launch subscription workers from this recipe or copy credentials into evidence.

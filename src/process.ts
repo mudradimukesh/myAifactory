@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import { open } from 'node:fs/promises';
 import { fsyncSync, writeSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
 export interface ProcessSpec {
     argv: string[];
     cwd: string;
@@ -17,7 +16,7 @@ export interface ProcessSpec {
 export interface ProcessResult {
     exitCode: number | null;
     signal: string | null;
-    reason: 'completed' | 'exit_error' | 'timeout' | 'cancelled' | 'spawn_error' | 'output_limit';
+    reason: 'completed' | 'exit_error' | 'timeout' | 'cancelled' | 'spawn_error' | 'output_limit' | 'capture_error';
     startedAt: string;
     endedAt: string;
 }
@@ -92,6 +91,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
     let exitSignal: string | null = null;
     let timeout: NodeJS.Timeout | undefined;
     let forceKill: NodeJS.Timeout | undefined;
+    let cleanup: (() => void) | undefined;
     try {
         if (spec.signal?.aborted) {
             reason = 'cancelled';
@@ -132,20 +132,39 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                 }, 1000);
             };
             const onAbort = () => stop('cancelled');
+            cleanup = () => {
+                spec.signal?.removeEventListener('abort', onAbort);
+                kill('SIGKILL');
+            };
+            let captureFailed = false;
+            const captureError = () => {
+                captureFailed = true;
+                stop('capture_error');
+            };
             const collect = (target: typeof stdout, chunk: Buffer) => {
+                if (captureFailed)
+                    return;
                 if (bytes >= spec.maxLogBytes) {
                     stop('output_limit');
                     return;
                 }
                 const remaining = spec.maxLogBytes - bytes;
                 target.pending = Buffer.concat([target.pending, chunk.subarray(0, remaining)]);
-                flush(target);
+                try {
+                    flush(target);
+                }
+                catch {
+                    captureError();
+                    return;
+                }
                 bytes += Math.min(chunk.length, remaining);
                 if (chunk.length > remaining)
                     stop('output_limit');
             };
             child.stdout.on('data', (chunk: Buffer) => collect(stdout, chunk));
             child.stderr.on('data', (chunk: Buffer) => collect(stderr, chunk));
+            child.stdout.on('error', captureError);
+            child.stderr.on('error', captureError);
             child.stdin.on('error', () => { });
             if (spec.stdin !== undefined)
                 child.stdin.end(spec.stdin);
@@ -153,6 +172,9 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                 child.stdin.end();
             await new Promise<void>((resolve) => {
                 child.once('error', () => { reason ??= 'spawn_error'; });
+                // The direct process can exit while descendants retain pipes or
+                // keep running without them. Neither extends this invocation.
+                child.once('exit', () => kill('SIGKILL'));
                 child.once('close', (code, signal) => {
                     exitCode = code;
                     exitSignal = signal;
@@ -164,8 +186,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                     onAbort();
             });
             spec.signal?.removeEventListener('abort', onAbort);
-            if (reason && reason !== 'spawn_error')
-                kill('SIGKILL');
+            kill('SIGKILL');
             if (timeout)
                 clearTimeout(timeout);
             if (forceKill)
@@ -175,74 +196,22 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
         }
         // Incomplete secrets stay withheld when execution is interrupted or truncated.
         if (reason === 'completed' || reason === 'exit_error') {
-            flush(stdout, true);
-            flush(stderr, true);
+            try {
+                flush(stdout, true);
+                flush(stderr, true);
+            }
+            catch {
+                reason = 'capture_error';
+            }
         }
         return { exitCode, signal: exitSignal, reason: reason!, startedAt, endedAt: new Date().toISOString() };
     }
     finally {
+        cleanup?.();
         if (timeout)
             clearTimeout(timeout);
         if (forceKill)
             clearTimeout(forceKill);
         await Promise.all([stdoutFile.close(), stderrFile.close()]);
     }
-}
-export interface DockerSpec {
-    name: string;
-    owner: string;
-    image: string;
-    workspace: string;
-    policyDir: string;
-    outputDir: string;
-    authDir?: string;
-    provider?: 'codex' | 'claude';
-    readOnlySource: boolean;
-    network: 'none' | 'bridge';
-    cpus: number;
-    memoryMb: number;
-    pids: number;
-    argv: string[];
-    env?: Record<string, string>;
-}
-export function dockerCommand(spec: DockerSpec): string[] {
-    if (!/^[a-z0-9][a-z0-9_.-]{0,127}$/.test(spec.name) ||
-        !/^[a-f0-9]{64}$/.test(spec.owner) ||
-        !/^[^\s@]+@sha256:[a-f0-9]{64}$/.test(spec.image) ||
-        !spec.argv.length || !spec.argv[0] ||
-        !Number.isFinite(spec.cpus) || spec.cpus <= 0 ||
-        !Number.isSafeInteger(spec.memoryMb) || spec.memoryMb <= 0 ||
-        !Number.isSafeInteger(spec.pids) || spec.pids <= 0 ||
-        !['none', 'bridge'].includes(spec.network) ||
-        (spec.authDir !== undefined && !spec.provider)) {
-        throw new Error('Invalid Docker specification');
-    }
-    for (const path of [spec.workspace, spec.policyDir, spec.outputDir, spec.authDir].filter((value): value is string => value !== undefined)) {
-        if (!isAbsolute(path) || /[,\r\n\0]/.test(path))
-            throw new Error('Docker mount paths must be absolute and cannot contain commas or control characters');
-    }
-    const uid = process.getuid?.() ?? 1000;
-    const gid = process.getgid?.() ?? 1000;
-    const command = [
-        'docker', 'run', '--name', spec.name, '--label', `dev.agent-factory.owner=${spec.owner}`, '--interactive', '--init', '--read-only',
-        '--user', `${uid}:${gid}`, '--workdir', '/workspace',
-        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-        '--network', spec.network, '--cpus', String(spec.cpus),
-        '--memory', `${spec.memoryMb}m`, '--pids-limit', String(spec.pids),
-        '--tmpfs', '/tmp:rw,nosuid,nodev',
-        '--tmpfs', `/home/worker:rw,nosuid,nodev,uid=${uid},gid=${gid},mode=0700`,
-        '--mount', `type=bind,source=${spec.workspace},target=/workspace${spec.readOnlySource ? ',readonly' : ''}`,
-        '--mount', `type=bind,source=${spec.policyDir},target=/policy,readonly`,
-        '--mount', `type=bind,source=${spec.outputDir},target=/output`,
-    ];
-    if (spec.authDir)
-        command.push('--mount', `type=bind,source=${spec.authDir},target=/home/worker/.${spec.provider},readonly`);
-    command.push('--env', 'HOME=/home/worker');
-    for (const [key, value] of Object.entries(spec.env ?? {})) {
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || key === 'HOME' || value.includes('\0')) {
-            throw new Error(`Invalid Docker environment variable: ${key}`);
-        }
-        command.push('--env', `${key}=${value}`);
-    }
-    return [...command, spec.image, ...spec.argv];
 }

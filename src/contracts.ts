@@ -9,12 +9,12 @@ export const check = z.object({
     requirements: z.array(id).min(1), outputPaths: z.array(z.string()).default([]),
 }).strict();
 export const projectSchema = z.object({
-    schemaVersion: z.literal(1), name: id, repository: z.string().min(1), base: commit,
+    schemaVersion: z.literal(2), name: id, repository: z.string().min(1), base: commit,
     recipient: z.string().min(1), brief: z.string().min(1), policies: z.array(z.string()).min(1),
     requirements: z.array(id).min(1), checks: z.array(check).min(1),
     artifact: z.string().min(1), artifactCheck: check,
     allowedPaths: z.array(z.string()).min(1),
-    runtime: z.object({ image: z.string().nullable(), cpus: z.number().positive().max(16), memoryMb: z.number().int().min(256), pids: z.number().int().min(32).max(1024), network: z.literal('bridge'), authHomes: z.object({ codex: z.string().nullable(), claude: z.string().nullable() }).strict() }).strict(),
+    runtime: z.object({ kind: z.literal('macos-sandbox'), toolPaths: z.array(z.string().min(1)).min(1), network: z.enum(['none', 'loopback', 'outbound']), authHomes: z.object({ codex: z.string().nullable(), claude: z.string().nullable() }).strict() }).strict(),
     models: z.object({ coordinator: choice, developer: choice, reviewer: choice, inspector: choice }).strict(),
     limits: z.object({ maxAttempts: z.number().int().min(1).max(100), maxReworks: z.number().int().min(0).max(10), attemptTimeoutMs: z.number().int().positive().max(1800000), maxWallMs: z.number().int().positive(), maxReportedTokens: z.number().int().positive(), verificationReserveAttempts: z.number().int().min(1), maxLogBytes: z.number().int().min(1024).max(100000000) }).strict(),
     billing: z.literal('subscription-only'), retentionDays: z.number().int().min(30),
@@ -80,7 +80,7 @@ export const stateSchema = z.object({
     review: z.object({ attemptId: id, record: reviewSchema, file: fileRecord }).strict().optional(),
     artifact: fileRecord.optional(), handoff: fileRecord.optional(), reworks: count, reportedTokens: count,
     unknownUsage: z.boolean(), elapsedMs: count, control: z.enum(['cancel', 'suspend']).optional(), suspended: z.boolean(),
-    activeJob: z.object({ id, container: z.string().min(1), kind: z.string().min(1), startedAt: timestamp }).strict().optional(),
+    activeJob: z.object({ id, runtime: z.literal('macos-sandbox'), kind: z.string().min(1), startedAt: timestamp }).strict().optional(),
     lastEvent: eventSchema, history: z.array(eventSchema).min(1),
 }).strict().superRefine((v, c) => {
     if (v.history.length !== v.revision || v.history.some((e, i) => e.sequence !== i + 1) || JSON.stringify(v.lastEvent) !== JSON.stringify(v.history.at(-1)))

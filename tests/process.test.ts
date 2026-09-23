@@ -3,7 +3,9 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { dockerCommand, runProcess } from '../src/process.ts';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { runProcess } from '../src/process.ts';
 
 async function withLogs(run: (paths: { stdoutPath: string; stderrPath: string }) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'factory-process-'));
@@ -100,6 +102,62 @@ test('redacts the complete secret when configured secrets share a prefix across 
   });
 });
 
+for (const exitCode of [0, 7]) {
+  test(`parent exit ${exitCode} stops descendants and preserves captured output`, async () => {
+    await withLogs(async paths => {
+      let pid: number | undefined;
+      try {
+        const descendant = "process.on('SIGTERM',()=>{});process.send('ready');setInterval(()=>{},1000)";
+        const parent = `const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:['ignore','ignore','ignore','ipc']});child.on('message',()=>{process.stdout.write(String(child.pid));process.stderr.write('retained');process.exitCode=${exitCode};child.disconnect();child.unref()})`;
+        const result = await runProcess({ argv: [process.execPath, '-e', parent], cwd: process.cwd(), ...paths, timeoutMs: 5000, maxLogBytes: 4096 });
+        pid = Number(await readFile(paths.stdoutPath, 'utf8'));
+        assert.ok(Number.isInteger(pid) && pid > 0);
+        assert.equal(result.reason, exitCode === 0 ? 'completed' : 'exit_error');
+        assert.equal(result.exitCode, exitCode);
+        assert.equal(await readFile(paths.stderrPath, 'utf8'), 'retained');
+        const deadline = Date.now() + 1500;
+        let alive = true;
+        while (Date.now() < deadline) {
+          try { process.kill(pid, 0); } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+            alive = false; break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        assert.equal(alive, false);
+      } finally { if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} } }
+    });
+  });
+}
+
+test('parent exit closes inherited descendant pipes without waiting for timeout', async () => {
+  await withLogs(async paths => {
+    const descendant = "process.send('ready');setInterval(()=>{},1000)";
+    const parent = `const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:['ignore','inherit','inherit','ipc']});child.on('message',()=>{process.stdout.write('done');child.disconnect();child.unref()})`;
+    const result = await runProcess({ argv: [process.execPath, '-e', parent], cwd: process.cwd(), ...paths, timeoutMs: 1000, maxLogBytes: 4096 });
+    assert.equal(result.reason, 'completed');
+    assert.equal(await readFile(paths.stdoutPath, 'utf8'), 'done');
+  });
+});
+
+for (const finalFlush of [false, true]) {
+  test(`capture failure during ${finalFlush ? 'final flush' : 'execution'} returns a failed result`, async t => {
+    await withLogs(async paths => {
+      const original = fs.fsyncSync;
+      t.mock.method(fs, 'fsyncSync', () => { throw new Error('simulated capture failure'); });
+      syncBuiltinESMExports();
+      try {
+        const code = finalFlush ? "process.stdout.write('sec')" : "process.stdout.write('capture');setInterval(()=>{},1000)";
+        const result = await runProcess({ argv: [process.execPath, '-e', code], cwd: process.cwd(), ...paths, timeoutMs: 1000, maxLogBytes: 4096, redact: ['secret'] });
+        assert.equal(result.reason, 'capture_error');
+      } finally {
+        fs.fsyncSync = original;
+        syncBuiltinESMExports();
+      }
+    });
+  });
+}
+
 test('stops a cancelled process and reports an output limit', async () => {
   await withLogs(async (paths) => {
     const controller = new AbortController();
@@ -154,32 +212,4 @@ test('persists output while the worker is still running', async () => {
       await pending;
     }
   });
-});
-
-test('Docker command pins the image and confines mounts and resources', () => {
-  const image = `registry.example/worker@sha256:${'a'.repeat(64)}`;
-  const spec = {
-    name: 'factory-job', owner: 'a'.repeat(64), image, workspace: '/src', policyDir: '/policy', outputDir: '/out',
-    authDir: '/auth', provider: 'codex' as const, readOnlySource: true, network: 'none' as const,
-    cpus: 2, memoryMb: 512, pids: 64, argv: ['codex', 'exec'], env: { TASK: 'review' },
-  };
-  const cmd = dockerCommand(spec);
-  assert.deepEqual(cmd.slice(0, 4), ['docker', 'run', '--name', 'factory-job']);
-  assert.ok(cmd.includes('--read-only'));
-  assert.ok(cmd.includes('ALL'));
-  assert.ok(cmd.includes('no-new-privileges'));
-  assert.ok(cmd.includes('/tmp:rw,nosuid,nodev'));
-  assert.ok(cmd.includes(`/home/worker:rw,nosuid,nodev,uid=${process.getuid?.() ?? 1000},gid=${process.getgid?.() ?? 1000},mode=0700`));
-  assert.ok(cmd.includes(`dev.agent-factory.owner=${spec.owner}`));
-  assert.ok(cmd.includes('type=bind,source=/src,target=/workspace,readonly'));
-  assert.ok(cmd.includes('type=bind,source=/policy,target=/policy,readonly'));
-  assert.ok(cmd.includes('type=bind,source=/out,target=/output'));
-  assert.ok(cmd.includes('type=bind,source=/auth,target=/home/worker/.codex,readonly'));
-  assert.deepEqual(cmd.slice(-3), [image, 'codex', 'exec']);
-  assert.ok(!cmd.includes('--privileged'));
-  assert.ok(!cmd.includes('--rm'));
-  assert.ok(!cmd.join(' ').includes('docker.sock'));
-  assert.throws(() => dockerCommand({ ...spec, image: 'worker:latest' }), /Invalid Docker specification/);
-  assert.throws(() => dockerCommand({ ...spec, workspace: '/src,ro=false' }), /Docker mount paths/);
-  assert.throws(() => dockerCommand({ ...spec, env: { HOME: '/root' } }), /Invalid Docker environment/);
 });

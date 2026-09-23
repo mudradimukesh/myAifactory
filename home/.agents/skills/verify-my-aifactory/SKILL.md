@@ -1,11 +1,11 @@
 ---
 name: verify-my-aifactory
-description: Verify myAifactory's implemented process, candidate, state, and worker library interfaces using Node behavioral tests, while tracking the missing operator CLI and live integrations separately.
+description: Verify myAifactory's local operator dashboard and execution libraries, while tracking the missing coordinator and live integrations separately.
 ---
 
 # Verify myAifactory
 
-The current callable interface is a TypeScript library used by the future coordinator. There is no operator CLI yet. These recipes verify the real library through its public functions. They cannot establish a working factory, container isolation, subscription access, or product acceptance.
+The callable interfaces are a local HTTP dashboard and a TypeScript library used by the future coordinator. These recipes verify public interfaces and distinguish recorded requests from execution. Native runtime uses macOS `sandbox-exec`; sandbox fixtures cannot establish subscription access or product acceptance.
 
 Read [the feature index](features/README.md) before selecting a recipe.
 
@@ -18,7 +18,7 @@ FACTORY_NODE="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/nod
 FACTORY_EVIDENCE=$(mktemp -d "${TMPDIR:-/tmp}/my-aifactory-verification.XXXXXX")
 ```
 
-On another machine, set `FACTORY_NODE` to its Node 24.19.x executable. There is no server or shared port. Each test invocation owns its temporary directories and child processes.
+On another machine, set `FACTORY_NODE` to its Node 24.19.x executable. Native runtime tests require macOS and working `sandbox-exec`; record blocked or skipped tests rather than claiming coverage. Dashboard HTTP tests bind an ephemeral loopback port. Each test invocation owns its temporary directories and child processes. Use the dashboard feature recipe for interactive browser checks.
 
 ## Doctor
 
@@ -44,11 +44,11 @@ cat "$FACTORY_EVIDENCE/modules.log"
 test "$FACTORY_EXIT" -eq 0
 ```
 
-Do not substitute these tests for the unimplemented CLI journey listed in the feature index.
+Use [the dashboard recipe](features/dashboard.md) for browser verification. Library and HTTP tests do not establish the unimplemented coordinator journey listed in the feature index.
 
 ## Evidence
 
-Capture the exact command, Node version, stdout, stderr, and exit code under `FACTORY_EVIDENCE`. Record the checked Git revision and whether the checkout was dirty. Retain failed runs alongside subsequent results. Docker fixture evidence must retain its fixture label.
+Capture the exact command, Node and macOS versions, stdout, stderr, and exit code under `FACTORY_EVIDENCE`. Record the checked Git revision and whether the checkout was dirty. Retain failed runs alongside subsequent results. Label subprocess fixtures, real local sandbox checks and live subscription calls separately. Never include credential files in evidence.
 
 ## Cleanup
 

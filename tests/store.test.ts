@@ -14,10 +14,10 @@ function initial(): State {
   return {
     schemaVersion: 1, id: 'fixture', revision: 1, status: 'draft',
     project: {
-      schemaVersion: 1, name: 'fixture', repository: '/fixture', base: 'a'.repeat(40),
+      schemaVersion: 2, name: 'fixture', repository: '/fixture', base: 'a'.repeat(40),
       recipient: 'test operator', brief: 'fixture only', policies: ['fixture policy'], requirements: ['behavior'],
       checks: [check], artifact: 'build/result.txt', artifactCheck: { ...check, id: 'artifact' }, allowedPaths: ['.'],
-      runtime: { image: null, cpus: 1, memoryMb: 256, pids: 32, network: 'bridge', authHomes: { codex: null, claude: null } },
+      runtime: { kind: 'macos-sandbox', toolPaths: ['/usr/bin'], network: 'none', authHomes: { codex: null, claude: null } },
       models: { coordinator: model, developer: model, reviewer: model, inspector: model },
       limits: { maxAttempts: 4, maxReworks: 1, attemptTimeoutMs: 1000, maxWallMs: 10000, maxReportedTokens: 10000, verificationReserveAttempts: 2, maxLogBytes: 4096 },
       billing: 'subscription-only', retentionDays: 30,
