@@ -17,12 +17,22 @@ const exec = promisify(execFile);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const model = { provider: 'codex' as const, model: 'fixture-model', effort: 'low' as const };
 
+// The deadline runs as a real timer racing the poll loop, so a single slow or blocked
+// read (lock contention, a stalled `ps` call) still fails at `ms` instead of hanging.
 async function until<T>(read: () => Promise<T>, done: (value: T) => boolean, ms = 10000): Promise<T> {
-  const deadline = Date.now() + ms;
-  let value = await read();
-  while (!done(value) && Date.now() < deadline) { await sleep(50); value = await read(); }
-  assert.ok(done(value), `condition not reached: ${JSON.stringify(value)}`);
-  return value;
+  let value: T | undefined;
+  let expired = false;
+  let timer!: NodeJS.Timeout;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => { expired = true; reject(new Error(`condition not reached within ${ms}ms: ${JSON.stringify(value)}`)); }, ms);
+  });
+  const poll = (async () => {
+    value = await read();
+    while (!done(value) && !expired) { await sleep(50); value = await read(); }
+    return value;
+  })();
+  try { return await Promise.race([poll, deadline]); }
+  finally { clearTimeout(timer); }
 }
 function gone(pid: number) {
   try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
