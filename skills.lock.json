@@ -332,7 +332,9 @@
         "decision": "docs/adr/0004-bounded-worker-proposals.md",
         "sourcePaths": [],
         "licenses": [],
-        "editorialNotes": ["Only the Coordinator runner admits a proposed task; worker-loaded instructions grant no direct spawning authority."]
+        "editorialNotes": [
+          "Only the Coordinator runner admits a proposed task; worker-loaded instructions grant no direct spawning authority."
+        ]
       }
     },
     {
@@ -518,6 +520,70 @@
           "Copied unchanged from the operator's local dotfiles as a shared worker skill for every role.",
           "The frontmatter sets disable-model-invocation: true. The factory ignores frontmatter and loads the text through roles.json.",
           "Workers still stop through the Coordinator question path. The skill does not authorize irreversible actions or bypass runner acceptance."
+        ]
+      }
+    },
+    {
+      "name": "principle-experience-first",
+      "path": "home/.agents/skills/principle-experience-first/SKILL.md",
+      "sha256": "58903529d733b1c1a7c9ccf127d45ef3c7d0d9f0b81164a4dc6b80efe6f2912b",
+      "references": [],
+      "provenance": {
+        "kind": "copied-local-skill",
+        "sourcePath": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-experience-first/SKILL.md",
+        "sourceSha256": "58903529d733b1c1a7c9ccf127d45ef3c7d0d9f0b81164a4dc6b80efe6f2912b",
+        "licenses": [],
+        "editorialNotes": [
+          "Copied unchanged from the operator dotfiles for the floor-plan design, experience and accuracy run.",
+          "The factory ignores frontmatter and loads the text through roles.json."
+        ]
+      }
+    },
+    {
+      "name": "principle-fix-root-causes",
+      "path": "home/.agents/skills/principle-fix-root-causes/SKILL.md",
+      "sha256": "ba4cd38da1dcc8fe5432feb64457cba95594736a9b21b2ebf8f8c52aee068707",
+      "references": [],
+      "provenance": {
+        "kind": "copied-local-skill",
+        "sourcePath": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-fix-root-causes/SKILL.md",
+        "sourceSha256": "ba4cd38da1dcc8fe5432feb64457cba95594736a9b21b2ebf8f8c52aee068707",
+        "licenses": [],
+        "editorialNotes": [
+          "Copied unchanged from the operator dotfiles for the floor-plan design, experience and accuracy run.",
+          "The factory ignores frontmatter and loads the text through roles.json."
+        ]
+      }
+    },
+    {
+      "name": "principle-prove-it-works",
+      "path": "home/.agents/skills/principle-prove-it-works/SKILL.md",
+      "sha256": "ae13d287984a5864312b6286899d4ee2b60f8272b5e5e8fcc586a7c3ea51020b",
+      "references": [],
+      "provenance": {
+        "kind": "copied-local-skill",
+        "sourcePath": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-prove-it-works/SKILL.md",
+        "sourceSha256": "ae13d287984a5864312b6286899d4ee2b60f8272b5e5e8fcc586a7c3ea51020b",
+        "licenses": [],
+        "editorialNotes": [
+          "Copied unchanged from the operator dotfiles for the floor-plan design, experience and accuracy run.",
+          "The factory ignores frontmatter and loads the text through roles.json."
+        ]
+      }
+    },
+    {
+      "name": "principle-test-behavior-not-implementation",
+      "path": "home/.agents/skills/principle-test-behavior-not-implementation/SKILL.md",
+      "sha256": "87e40efe4e486f7ea639d2ed1fc0abe6c93b8fd0e89a81218086909d2470a52e",
+      "references": [],
+      "provenance": {
+        "kind": "copied-local-skill",
+        "sourcePath": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-test-behavior-not-implementation/SKILL.md",
+        "sourceSha256": "87e40efe4e486f7ea639d2ed1fc0abe6c93b8fd0e89a81218086909d2470a52e",
+        "licenses": [],
+        "editorialNotes": [
+          "Copied unchanged from the operator dotfiles for the floor-plan design, experience and accuracy run.",
+          "The factory ignores frontmatter and loads the text through roles.json."
         ]
       }
     }

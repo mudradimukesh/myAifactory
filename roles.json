@@ -4,6 +4,8 @@
     "developer": {
       "skills": [
         "factory-tdd",
+        "principle-fix-root-causes",
+        "principle-test-behavior-not-implementation",
         "unslop",
         "bro",
         "principle-guard-the-context-window",
@@ -22,6 +24,8 @@
     "reviewer": {
       "skills": [
         "factory-review",
+        "principle-experience-first",
+        "principle-prove-it-works",
         "unslop",
         "bro",
         "principle-guard-the-context-window",
@@ -38,6 +42,8 @@
       "skills": [
         "factory-verify",
         "factory-swarm",
+        "principle-prove-it-works",
+        "principle-test-behavior-not-implementation",
         "unslop",
         "bro",
         "principle-guard-the-context-window",
@@ -56,6 +62,7 @@
     "business": {
       "skills": [
         "factory-discovery",
+        "principle-experience-first",
         "unslop",
         "bro",
         "principle-guard-the-context-window",
@@ -73,6 +80,7 @@
     "domain": {
       "skills": [
         "factory-discovery",
+        "principle-experience-first",
         "unslop",
         "bro",
         "principle-guard-the-context-window",
@@ -91,6 +99,8 @@
       "skills": [
         "factory-design",
         "factory-swarm",
+        "principle-experience-first",
+        "principle-fix-root-causes",
         "unslop",
         "bro",
         "principle-guard-the-context-window",
@@ -109,6 +119,7 @@
       "skills": [
         "factory-coordinate",
         "factory-communicate",
+        "principle-prove-it-works",
         "unslop",
         "bro",
         "principle-guard-the-context-window",
