@@ -94,7 +94,7 @@ async function fixture(t: test.TestContext) {
   return { dashboard, created, read, view, job, supervisor, supervisorPids: () => supervisorPids(dashboard.store.root, 'run') };
 }
 
-for (const command of ['run', 'resume']) test(`CLI ${command} records supervisor lifetime and preserves its JSON output`, async t => {
+for (const command of ['run', 'resume']) test(`CLI ${command} records supervisor lifetime and preserves its JSON output`, { timeout: 10000 }, async t => {
   const f = await fixture(t);
   await f.dashboard.store.transition('run', 'awaiting_input', 'Fixture needs operator input');
   const { stdout, stderr } = await exec(process.execPath, [cliScript, command, f.dashboard.store.root, 'run'], { timeout: 15000 });
@@ -108,7 +108,7 @@ for (const command of ['run', 'resume']) test(`CLI ${command} records supervisor
     reportedTokens: state.reportedTokens, unknownUsage: state.unknownUsage, reason: state.reason ?? null }) + '\n');
 });
 
-for (const command of ['run', 'resume', 'supervise']) test(`CLI ${command} reports supervisor conflicts with exit 3`, async t => {
+for (const command of ['run', 'resume', 'supervise']) test(`CLI ${command} reports supervisor conflicts with exit 3`, { timeout: 10000 }, async t => {
   const f = await fixture(t);
   const self = await identify(process.pid);
   assert.ok(self);

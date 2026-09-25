@@ -181,7 +181,7 @@ test('stops a cancelled process and reports an output limit', async () => {
   });
 });
 
-test('a limit signal stops the process quickly with its reason', async () => {
+test('a limit signal stops the process quickly with its reason', { timeout: 10000 }, async () => {
   await withLogs(async (paths) => {
     const controller = new AbortController();
     const pending = runProcess({
@@ -196,7 +196,7 @@ test('a limit signal stops the process quickly with its reason', async () => {
   });
 });
 
-for (const reason of ['stall_start', 'stall_idle'] as const) test(`a ${reason} signal preserves its reason`, async () => {
+for (const reason of ['stall_start', 'stall_idle'] as const) test(`a ${reason} signal preserves its reason`, { timeout: 10000 }, async () => {
   await withLogs(async (paths) => {
     const controller = new AbortController();
     const pending = runProcess({ argv: [process.execPath, '-e', 'setInterval(()=>{},1000)'], cwd: process.cwd(), ...paths,

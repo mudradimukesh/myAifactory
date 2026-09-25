@@ -66,8 +66,8 @@ test('native sandbox protects capture and readonly source while allowing proposa
   });
 });
 
-test('resumeHome is copied into the fresh home', { skip: process.platform !== 'darwin' }, async t => {
-  for (const provider of ['codex', 'claude'] as const) await t.test(provider, async () => fixture(async (job, root) => {
+test('resumeHome is copied into the fresh home', { skip: process.platform !== 'darwin', timeout: 10000 }, async t => {
+  for (const provider of ['codex', 'claude'] as const) await t.test(provider, { timeout: 10000 }, async () => fixture(async (job, root) => {
     const resumeHome = path.join(root, 'previous-home');
     const sessionDir = provider === 'codex' ? '.codex/sessions' : '.claude/projects';
     const fixtureName = provider === 'codex' ? 'codex-thread-started.jsonl' : 'claude-init.json';

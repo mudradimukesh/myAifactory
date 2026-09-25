@@ -47,6 +47,23 @@ const choiceFor = (s: State, role: Role): WorkerChoice => role === 'developer' ?
 const visualBatchId = (candidate: string) => `visual-${candidate.slice(0, 12)}`;
 const visualQuestionId = 'approve-renders';
 
+async function nextAttemptId(store: Store, s: State, base: string): Promise<string> {
+    const recorded = new Set(s.attempts.map(attempt => attempt.id));
+    for (let suffix = 1; ; suffix++) {
+        const candidate = suffix === 1 ? base : `${base}-${suffix}`;
+        if (recorded.has(candidate)) continue;
+        try { await stat(evidenceDir(store, s.id, candidate)); }
+        catch (error) {
+            if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return candidate;
+            throw error;
+        }
+    }
+}
+
+function successfulPlanner(s: State, role: 'architect' | 'tester') {
+    return s.attempts.some(attempt => attempt.role === role && attempt.status === 'completed' && attempt.admitted === true);
+}
+
 export async function registerVisualReview(store: Store, run: string, sourceRoot: string, value: unknown): Promise<State> {
     const s = await store.read(run);
     if (!s.project.visualReview || !s.candidate || !(['verified', 'awaiting_input'] as string[]).includes(s.status) ||
@@ -150,7 +167,7 @@ function admitProposal(value: unknown, s: State, source: 'architect' | 'tester')
 }
 
 async function loadedProposal(store: Store, s: State, source: 'architect' | 'tester'): Promise<Proposal> {
-    const attempt = s.attempts.find(a => a.role === source && a.status === 'completed');
+    const attempt = s.attempts.find(a => a.role === source && a.status === 'completed' && a.admitted === true);
     if (!attempt?.handoff) throw Error(`Missing ${source} proposal`);
     return admitProposal(parseJsonText(await readFile(await within(store.dir(s.id), attempt.handoff.path), 'utf8')), s, source);
 }
@@ -236,23 +253,24 @@ async function runSegment(store: Store, s: State, runtime: LocalRuntime, role: R
         if (!activityMeter) activityMeter = new UsageMeter(provider, activityPath);
         activityMeter.read();
         const activity = activityMeter.activity();
-        const nowMs = Date.now();
         let stderrBytes = 0;
         try { stderrBytes = (await stat(path.join(job.captureDir, 'stderr.log'))).size; } catch { /* capture may not exist yet */ }
-        const rolloutBytes = meter?.activity().bytes ?? 0;
-        const totalActivityBytes = activity.bytes + stderrBytes + rolloutBytes;
-        if (totalActivityBytes > activityBytes) { activityBytes = totalActivityBytes; lastActivityMs = runningNow(); lastActivityAt = now(); }
-        if (activity.started && providerStartedAt === null) { providerStartedAt = now(); lastActivityMs = runningNow(); }
-        if (enforcing && pausedAtMs === null && spawnedAtMs !== null) {
-            const elapsed = runningNow();
-            if (!providerStartedAt && elapsed >= startLimit) controller.abort('stall_start');
-            else if (providerStartedAt && elapsed - lastActivityMs >= idleLimit) controller.abort('stall_idle');
-        }
+        const recordActivity = (rolloutBytes: number) => {
+            const totalActivityBytes = activity.bytes + stderrBytes + rolloutBytes;
+            if (totalActivityBytes > activityBytes) { activityBytes = totalActivityBytes; lastActivityMs = runningNow(); lastActivityAt = now(); }
+            if (activity.started && providerStartedAt === null) { providerStartedAt = now(); lastActivityMs = runningNow(); }
+            if (enforcing && pausedAtMs === null && spawnedAtMs !== null) {
+                const elapsed = runningNow();
+                if (!providerStartedAt && elapsed >= startLimit) controller.abort('stall_start');
+                else if (providerStartedAt && elapsed - lastActivityMs >= idleLimit) controller.abort('stall_idle');
+            }
+        };
         if (!meter) {
             const src = resumeCursor && job.resumeHome
                 ? path.join(workerHome(job.scratchDir), path.relative(job.resumeHome, resumeCursor.path))
                 : await meterSourcePath(provider, workerHome(job.scratchDir), job.captureDir);
             if (!src) {
+                recordActivity(0);
                 const empty = { segment: index, kind, model, raw: null, usage: null, metered: null, spentBefore, allowance: maxTokens,
                     contextTokens: null, peakContext: null, contextMax: provider === 'claude' ? modelWindow : null, trigger: null,
                     at: now(), source: 'meter', providerStartedAt, lastActivityAt, ...(controller.signal.aborted ? { reason: controller.signal.reason } : {}) };
@@ -261,13 +279,14 @@ async function runSegment(store: Store, s: State, runtime: LocalRuntime, role: R
             }
             if (resumeCursor) {
                 try { await stat(src); } catch (error) {
-                    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
+                    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') { recordActivity(0); return; }
                     throw error;
                 }
             }
             meter = new UsageMeter(provider, src, resumeCursor);
         }
         const reading = meter.read();
+        recordActivity(meter.activity().bytes);
         if (!reading) {
             const empty = { segment: index, kind, model, raw: null, usage: null, metered: null, spentBefore, allowance: maxTokens,
                 contextTokens: null, peakContext: null, contextMax: provider === 'claude' ? modelWindow : null, trigger: null,
@@ -327,7 +346,7 @@ async function runSegment(store: Store, s: State, runtime: LocalRuntime, role: R
         contextMax: contextMaxValue, peakContext, trigger, at: now(), source, providerStartedAt, lastActivityAt,
         ...(completed.reason === 'stall_start' || completed.reason === 'stall_idle' ? { reason: completed.reason } : {}) };
     await durable(meterFile, json(meterReadingSchema.parse(final)));
-    const reason = completed.reason === 'stall_start' || completed.reason === 'stall_idle' ? completed.reason
+    const reason = completed.reason !== 'completed' ? completed.reason
         : metered !== null && spentBefore + metered > maxTokens ? 'token_limit'
         : tracked.lastReading?.compacted ? 'compacted'
         : kind === 'work' && peakContext !== null && trigger !== null && peakContext >= trigger ? 'context_limit'
@@ -568,28 +587,42 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
     const errors = await runtime.preflight(s.project);
     if (errors.length) throw Error(errors.join('; '));
     if (s.status === 'ready') {
-        if (!s.attempts.some(a => a.role === 'architect')) {
+        if (!successfulPlanner(s, 'architect')) {
             const objective = plannerPrompt(s, 'developer');
-            const outcome = await roleJob(store, s, runtime, 'architect', 'plan-architect', objective, s.sourceBase, true, undefined, control, proposalSchema);
+            const outcome = await roleJob(store, s, runtime, 'architect', await nextAttemptId(store, s, 'plan-architect'), objective, s.sourceBase, true, undefined, control, proposalSchema);
             if (!outcome.passed) return store.transition(run, 'awaiting_input', outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : 'Architect plan failed or usage unknown');
             s = await store.read(run);
-            try { admitProposal(parseJsonText(outcome.text), s, 'architect'); }
+            try {
+                admitProposal(parseJsonText(outcome.text), s, 'architect');
+                await store.update(run, 'proposal_admitted', { jobId: outcome.attempt.id, role: 'architect' }, state => {
+                    const attempt = state.attempts.find(item => item.id === outcome.attempt.id)!;
+                    attempt.admitted = true;
+                });
+            }
             catch (error) { return store.transition(run, 'awaiting_input', `Architect proposal rejected: ${String(error)}`); }
             return s;
         }
-        if (!s.attempts.some(a => a.role === 'tester')) {
+        if (!successfulPlanner(s, 'tester')) {
             const objective = plannerPrompt(s, 'reviewer');
-            const outcome = await roleJob(store, s, runtime, 'tester', 'plan-tester', objective, s.sourceBase, true, undefined, control, proposalSchema);
+            const outcome = await roleJob(store, s, runtime, 'tester', await nextAttemptId(store, s, 'plan-tester'), objective, s.sourceBase, true, undefined, control, proposalSchema);
             if (!outcome.passed) return store.transition(run, 'awaiting_input', outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : 'Test plan failed or usage unknown');
             s = await store.read(run);
-            try { admitProposal(parseJsonText(outcome.text), s, 'tester'); }
+            try {
+                admitProposal(parseJsonText(outcome.text), s, 'tester');
+                await store.update(run, 'proposal_admitted', { jobId: outcome.attempt.id, role: 'tester' }, state => {
+                    const attempt = state.attempts.find(item => item.id === outcome.attempt.id)!;
+                    attempt.admitted = true;
+                });
+            }
             catch (error) { return store.transition(run, 'awaiting_input', `Test planner proposal rejected: ${String(error)}`); }
             return s;
         }
         const task = (await loadedProposal(store, s, 'architect')).tasks[0];
+        if (s.attempts.filter(attempt => attempt.role === 'developer').length >= s.project.limits.maxReworks + 1)
+            return store.transition(run, 'awaiting_input', 'Implementation attempt ceiling exhausted');
         await store.transition(run, 'running', 'Approved developer task dispatched');
         s = await store.read(run);
-        const outcome = await roleJob(store, s, runtime, 'developer', 'developer-' + (s.reworks + 1), `${task.objective}\nDone when: ${task.doneWhen.join('; ')}\nCommit your changes and leave the checkout clean.`, s.candidate ?? s.sourceBase, false, task.limits, control);
+        const outcome = await roleJob(store, s, runtime, 'developer', await nextAttemptId(store, s, 'developer-' + (s.reworks + 1)), `${task.objective}\nDone when: ${task.doneWhen.join('; ')}\nCommit your changes and leave the checkout clean.`, s.candidate ?? s.sourceBase, false, task.limits, control);
         if (!outcome.passed) return store.transition(run, outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? 'awaiting_input' : 'changes_requested',
             outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `Developer attempt failed: ${outcome.reason}`);
         let imported;
@@ -602,7 +635,7 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
         if (!s.candidate) throw Error('Missing candidate');
         if (!s.review) {
             const task = (await loadedProposal(store, s, 'tester')).tasks[0];
-            const outcome = await roleJob(store, s, runtime, 'reviewer', 'review-' + (s.reworks + 1),
+            const outcome = await roleJob(store, s, runtime, 'reviewer', await nextAttemptId(store, s, 'review-' + (s.reworks + 1)),
                 `${task.objective}\nDone when: ${task.doneWhen.join('; ')}\nReturn only JSON: {"schemaVersion":1,"candidate":"${s.candidate}","specDigest":"${s.specDigest}","requirements":${JSON.stringify(s.project.requirements)},"verdict":"pass|changes_requested","findings":[]}.`, s.candidate, true, task.limits, control, reviewSchema);
             if (!outcome.passed) return store.transition(run, outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? 'awaiting_input' : 'changes_requested',
                 outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `Independent review failed: ${outcome.reason}`);
@@ -615,7 +648,7 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
         }
         const definition = [...s.project.checks, s.project.artifactCheck].find(c => !s.checks.some(r => r.id === c.id && r.candidate === s.candidate));
         if (definition) {
-            const result = await checkJob(store, s, runtime, checkSchema.parse(definition), `check-${definition.id}-${s.reworks + 1}`, control);
+            const result = await checkJob(store, s, runtime, checkSchema.parse(definition), await nextAttemptId(store, s, `check-${definition.id}-${s.reworks + 1}`), control);
             if (!result.passed) return store.transition(run, 'changes_requested', `Mandatory check ${definition.id} failed`);
             return store.read(run);
         }

@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { choice, id, ticketProgress, meterReadingSchema } from './contracts.ts';
 import type { OwnedProcess, State, Segment, MeterReading } from './contracts.ts';
 import { groupAlive, groupMembers, isOwnedAlive, terminateOwned } from './process.ts';
-import { Store, move } from './store.ts';
+import { Store, move, reset, resettable } from './store.ts';
 import { validateAuthHome } from './runtime.ts';
 
 const finite = z.number().finite().nonnegative();
@@ -69,11 +69,14 @@ export type FactoryState = 'idle' | 'running' | 'pausing' | 'paused' | 'resuming
 export type FactoryView = {
   state: FactoryState; supervisor: { pid: number; launchedAt: string } | null;
   activeJob: { id: string; kind: string; startedAt: string; frozen: boolean } | null;
-  canStart: boolean; canPause: boolean; canStop: boolean; startLabel: 'Start' | 'Resume';
+  canStart: boolean; canPause: boolean; canStop: boolean; canReset: boolean; startLabel: 'Start' | 'Resume';
   reason: string | null; orphans: number[];
 };
 const factoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const terminal = (status: State['status']) => status === 'failed' || status === 'cancelled' || status === 'handoff_ready';
+const roles = ['business', 'domain', 'architect', 'developer', 'reviewer', 'tester', 'coordinator'] as const;
+const choiceFor = (state: State, role: typeof roles[number]) => role === 'developer' ? state.project.models.developer
+  : role === 'reviewer' ? state.project.models.reviewer : role === 'coordinator' ? state.project.models.coordinator : state.project.models.inspector;
 const exitDetail = z.object({ outcome: z.enum(['waiting', 'finished', 'cancelled', 'error']), message: z.string() }).passthrough();
 
 /** Derives operator controls from stored facts plus a live ownership check of the recorded supervisor. */
@@ -103,6 +106,7 @@ export async function factoryView(state: State, redact: (value: string) => strin
     canStart: startable && !state.unknownUsage,
     canPause: factory === 'running' || factory === 'resuming' || ((factory === 'idle' || factory === 'exited') && state.control !== 'suspend'),
     canStop: factory !== 'terminal' || live || jobLive || orphans.length > 0 || supervisorOrphans.length > 0,
+    canReset: resettable(state) && !state.activeJob && !live && !jobLive && !state.control && orphans.length === 0 && supervisorOrphans.length === 0,
     startLabel: state.control === 'suspend' || state.suspended ? 'Resume' : 'Start',
     reason, orphans,
   };
@@ -209,6 +213,7 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
     id: state.id, status: state.status, revision: state.revision, updatedAt: state.updatedAt,
     repository: redact(state.project.repository), brief: redact(state.project.brief),
     coordinator: { ...state.project.models.coordinator, model: redact(state.project.models.coordinator.model) },
+    roles: roles.map(role => ({ role, provider: choiceFor(state, role).provider, model: redact(choiceFor(state, role).model) })),
     reportedTokens: state.reportedTokens, unknownUsage, elapsedMs: state.elapsedMs,
     usageByRole, usageTotal: runUsage.total, usageLowerBound: runUsage.lowerBound,
     limits: { maxReportedTokens: state.project.limits.maxReportedTokens, maxAttempts: state.project.limits.maxAttempts,
@@ -443,8 +448,24 @@ export class Dashboard {
       z.object({ action: z.literal('start'), expectedRevision: positive }).strict(),
       z.object({ action: z.literal('pause') }).strict(),
       z.object({ action: z.literal('stop') }).strict(),
+      z.object({ action: z.literal('reset') }).strict(),
     ]).parse(value);
     const done = async (changed: boolean, message: string) => ({ factory: await factoryView(await this.store.read(run)), changed, message });
+    if (input.action === 'reset') return this.store.lock(`launch-${run}`, async () => {
+      const state = await this.store.read(run);
+      if (!resettable(state)) throw new FactoryConflict('Only failed, cancelled, or execution-stage awaiting runs can be reset.');
+      const liveSupervisor = state.supervisor?.process && await isOwnedAlive(state.supervisor.process);
+      const liveJob = state.activeJob?.process && await isOwnedAlive(state.activeJob.process);
+      const supervisorOrphans = state.supervisor && !liveSupervisor ? await groupMembers(state.supervisor.process.pgid) : [];
+      const workerOrphans = state.activeJob?.process && !liveJob ? await groupMembers(state.activeJob.process.pgid) : [];
+      if (liveSupervisor || liveJob || state.activeJob || state.control || supervisorOrphans.length || workerOrphans.length)
+        throw new FactoryConflict('Reset requires a quiescent run with no live or unconfirmed processes.');
+      await this.store.update(run, 'factory_reset', { from: state.status }, current => {
+        reset(current, 'Operator reset the run');
+        current.activeJob = undefined; current.supervisor = undefined; current.control = undefined; current.suspended = false; current.priorStatus = undefined;
+      });
+      return done(true, 'The run was reset and is ready to start.');
+    });
     if (input.action === 'pause') {
       let changed = false;
       let supervised = false;

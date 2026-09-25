@@ -63,7 +63,7 @@ export const transitions: Record<Status, Status[]> = {
     candidate: ['verifying', 'changes_requested', 'awaiting_input', 'cancelled'], verifying: ['verified', 'changes_requested', 'awaiting_input', 'failed', 'cancelled'],
     verified: ['handoff_ready', 'changes_requested', 'awaiting_input', 'cancelled'], changes_requested: ['ready', 'awaiting_input', 'failed', 'cancelled'],
     awaiting_input: ['draft', 'ready', 'running', 'candidate', 'verifying', 'verified', 'changes_requested', 'handoff_ready', 'cancelled'],
-    handoff_ready: ['changes_requested', 'awaiting_input', 'cancelled'], failed: [], cancelled: [],
+    handoff_ready: ['changes_requested', 'awaiting_input', 'cancelled'], failed: ['ready'], cancelled: ['ready'],
 };
 export const reviewSchema = z.object({ schemaVersion: z.literal(1), candidate: commit, specDigest: digest, requirements: z.array(id), verdict: z.enum(['pass', 'changes_requested']), findings: z.array(z.object({ severity: z.enum(['blocking', 'minor']), requirement: id, message: z.string().min(1), evidence: z.string().min(1) }).strict()) }).strict();
 export type Review = z.infer<typeof reviewSchema>;
@@ -111,6 +111,7 @@ export const handoffSchema = z.object({
 const attemptSchema = z.object({
     id, role, startedAt: timestamp, endedAt: timestamp.optional(), model: choice, candidate: commit,
     status: z.enum(['running', 'completed', 'failed', 'interrupted']), result: resultSchema.optional(),
+    admitted: z.boolean().optional(),
     inputTokens: count.nullable().optional(), outputTokens: count.nullable().optional(), cachedInputTokens: count.nullable().optional(), handoff: fileRecord.optional(),
     segments: z.array(segmentSchema).optional(),
 }).strict();

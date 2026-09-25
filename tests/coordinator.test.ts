@@ -12,7 +12,7 @@ import { LocalRuntime, workerHome } from '../src/runtime.ts';
 import type { Job } from '../src/runtime.ts';
 import { Store, json, sha } from '../src/store.ts';
 import { PauseGate } from '../src/process.ts';
-import { projectRun } from '../src/dashboard.ts';
+import { Dashboard, projectRun } from '../src/dashboard.ts';
 
 const handoffClaim = { schemaVersion: 1, goal: 'Fix the behavior', done: ['Created src/app.txt'],
     remaining: ['Finish and commit'], evidence: ['src/app.txt'], risks: [] };
@@ -43,8 +43,8 @@ class FakeRuntime extends LocalRuntime {
         }
         const start = new Date().toISOString();
         let text = '';
-        if (job.id === 'plan-architect') text = proposal('developer', job.project.models.developer);
-        else if (job.id === 'plan-tester') text = proposal('reviewer', this.proposedReviewerModel ?? job.project.models.reviewer);
+        if (job.id.startsWith('plan-architect')) text = proposal('developer', job.project.models.developer);
+        else if (job.id.startsWith('plan-tester')) text = proposal('reviewer', this.proposedReviewerModel ?? job.project.models.reviewer);
         else if (job.id.startsWith('developer-')) {
             await mkdir(path.join(job.workspace, 'src'));
             await writeFile(path.join(job.workspace, 'src', 'app.txt'), 'fixed\n');
@@ -67,6 +67,9 @@ class StallFixtureRuntime extends FakeRuntime {
     readonly growth: 'none' | 'stdout' | 'stderr' | 'rollout';
     readonly ready: Promise<void>;
     readonly aborted: Promise<void>;
+    limit?: AbortSignal;
+    job?: Job;
+    settled = false;
     private resolveReady!: () => void;
     private resolveAborted!: () => void;
     constructor(startEvent: boolean, provider: 'codex' | 'claude' = 'codex', growth: 'none' | 'stdout' | 'stderr' | 'rollout' = 'none') {
@@ -74,8 +77,9 @@ class StallFixtureRuntime extends FakeRuntime {
         this.ready = new Promise(resolve => { this.resolveReady = resolve; });
         this.aborted = new Promise(resolve => { this.resolveAborted = resolve; });
     }
-    override async execute(job: Job) {
+    override async execute(job: Job): Promise<Awaited<ReturnType<LocalRuntime['execute']>>> {
         this.calls.push(job.id);
+        this.limit = job.limit; this.job = job;
         try { await job.onSpawn?.(999999); } catch (error) { assert.ok((error as NodeJS.ErrnoException).code === 'EPERM' || (error as NodeJS.ErrnoException).code === undefined); }
         const start = this.provider === 'codex' ? await readFile(new URL('./fixtures/codex-thread-started.jsonl', import.meta.url), 'utf8') : await readFile(new URL('./fixtures/claude-init.json', import.meta.url), 'utf8');
         await writeFile(path.join(job.captureDir, 'stdout.log'), this.startEvent ? start : 'waiting for additional input\n');
@@ -83,7 +87,7 @@ class StallFixtureRuntime extends FakeRuntime {
         if (this.growth === 'rollout') await writeRollout(job, await readFile(new URL('./fixtures/codex-token-count.jsonl', import.meta.url), 'utf8'));
         const stopped = new Promise<void>(resolve => { job.limit?.addEventListener('abort', () => resolve(), { once: true }); job.signal.addEventListener('abort', () => resolve(), { once: true }); });
         this.resolveReady();
-        await stopped; this.resolveAborted();
+        await stopped; this.resolveAborted(); this.settled = true;
         const reason = job.limit?.reason === 'stall_start' || job.limit?.reason === 'stall_idle' ? job.limit.reason : 'cancelled';
         return { exitCode: null, signal: 'SIGTERM', reason, startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), pausedMs: 0 };
     }
@@ -93,7 +97,8 @@ class HandoffRuntime extends FakeRuntime {
     readonly jobs: Job[] = [];
     readonly tick: () => void;
     readonly resumeExit: number;
-    constructor(tick: () => void, resumeExit = 0) { super(); this.tick = tick; this.resumeExit = resumeExit; }
+    readonly stallHandoff: boolean;
+    constructor(tick: () => void, resumeExit = 0, stallHandoff = false) { super(); this.tick = tick; this.resumeExit = resumeExit; this.stallHandoff = stallHandoff; }
     override async execute(job: Job): Promise<Awaited<ReturnType<LocalRuntime['execute']>>> {
         if (!job.id.startsWith('developer-')) {
             const result = await super.execute(job);
@@ -128,6 +133,12 @@ class HandoffRuntime extends FakeRuntime {
             next.payload.info.total_token_usage.total_tokens += 20;
             await appendFile(path.join(workerHome(job.scratchDir), '.codex/sessions/rollout-test.jsonl'), JSON.stringify(next) + '\n');
             await writeFile(path.join(job.captureDir, 'stdout.log'), codexOutput(JSON.stringify(handoffClaim)));
+            if (this.stallHandoff) {
+                try { await job.onSpawn?.(999999); } catch (error) { assert.ok((error as NodeJS.ErrnoException).code === 'EPERM' || (error as NodeJS.ErrnoException).code === undefined); }
+                if (!job.limit?.aborted) await new Promise<void>(resolve => job.limit?.addEventListener('abort', () => resolve(), { once: true }));
+                return { exitCode: null, signal: 'SIGTERM', reason: job.limit?.reason === 'stall_start' || job.limit?.reason === 'stall_idle' ? job.limit.reason : 'cancelled',
+                    startedAt, endedAt: new Date().toISOString(), pausedMs: 0 };
+            }
             this.tick();
             return { exitCode: this.resumeExit, signal: null, reason: this.resumeExit ? 'exit_error' : 'completed',
                 startedAt, endedAt: new Date().toISOString(), pausedMs: 0 };
@@ -180,18 +191,213 @@ async function runStall(t: { mock: { timers: { enable: Function; tick: Function;
     return { f, state: await pending };
 }
 
-async function waitForMeter(f: Awaited<ReturnType<typeof fixture>>, predicate: (meter: { providerStartedAt?: string | null; at?: string }) => boolean) {
+async function waitForMeter(f: Awaited<ReturnType<typeof fixture>>, predicate: (meter: { providerStartedAt?: string | null; at?: string }) => boolean, timeoutMs = 1000) {
     const file = path.join(f.store.dir('run'), 'attempts', 'plan-architect', 'segment-1', 'meter.json');
-    const deadline = performance.now() + 1000;
+    const deadline = performance.now() + timeoutMs;
     for (;;) {
         try {
             const meter = JSON.parse(await readFile(file, 'utf8')) as { providerStartedAt?: string | null; at?: string };
-            if (predicate(meter)) return meter;
+            // The poll clears its in-flight flag after the write; drain it so the next tick is not skipped.
+            if (predicate(meter)) { await settle(); return meter; }
         } catch { /* poll has not written the sidecar yet */ }
         if (performance.now() >= deadline) throw Error(`meter state wait timed out: ${await readFile(file, 'utf8').catch(() => 'no meter')}`);
         await new Promise(resolve => setImmediate(resolve));
     }
 }
+
+// The poll is async and skips an interval while the previous poll is in flight, so give it real time to finish after each tick.
+const settle = () => new Promise(resolve => setTimeout(resolve, 100));
+
+async function tickUntilAborted(t: { mock: { timers: { tick: Function } } }, runtime: StallFixtureRuntime) {
+    let aborted = false;
+    void runtime.aborted.then(() => { aborted = true; });
+    const deadline = performance.now() + 5000;
+    while (!aborted && performance.now() < deadline) {
+        t.mock.timers.tick(2000);
+        await Promise.race([runtime.aborted, settle()]);
+    }
+    assert.ok(aborted, 'fixture runtime did not abort');
+}
+
+class GrowingStallRuntime extends StallFixtureRuntime {
+    async grow() {
+        const job = this.job!;
+        if (this.growth === 'stdout') await appendFile(path.join(job.captureDir, 'stdout.log'), 'activity\n');
+        if (this.growth === 'stderr') await appendFile(path.join(job.captureDir, 'stderr.log'), 'activity\n');
+        if (this.growth === 'rollout') await appendFile(path.join(workerHome(job.scratchDir), '.codex/sessions/rollout-test.jsonl'), '{"type":"event_msg","payload":{"type":"agent_reasoning"}}\n');
+    }
+}
+
+class FinalSampleStallRuntime extends StallFixtureRuntime {
+    private readonly finalReason: 'context_limit' | 'token_limit' | 'compacted';
+    constructor(finalReason: 'context_limit' | 'token_limit' | 'compacted') { super(true); this.finalReason = finalReason; }
+    override async execute(job: Job) {
+        const result = await super.execute(job);
+        if (this.finalReason === 'context_limit') await writeRollout(job, rolloutLine(160000));
+        if (this.finalReason === 'compacted') await writeRollout(job, rolloutLine(100) + '{"type":"compacted"}\n');
+        if (this.finalReason === 'token_limit') await writeFile(path.join(job.captureDir, 'stdout.log'), codexOutput('waiting', { input_tokens: 100000, output_tokens: 1, cached_input_tokens: 0 }));
+        return result;
+    }
+}
+
+class FinalSampleExitRuntime extends FinalSampleStallRuntime {
+    private readonly exitReason: 'cancelled' | 'timeout';
+    constructor(finalReason: 'context_limit' | 'token_limit' | 'compacted', exitReason: 'cancelled' | 'timeout') {
+        super(finalReason); this.exitReason = exitReason;
+    }
+    override async execute(job: Job) {
+        const result = await super.execute(job);
+        return { ...result, exitCode: null, reason: this.exitReason };
+    }
+}
+
+for (const growth of ['stdout', 'stderr', 'rollout'] as const)
+test(`stall_idle is postponed by ${growth} growth`, { timeout: 10000 }, async t => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
+    const f = await fixture();
+    try {
+        // The seeded rollout reports about 630K metered tokens; keep it under the attempt allowance so only idle time can stop the worker.
+        f.project.limits.workerIdleTimeoutMs = 2000; f.project.limits.maxReportedTokens = 6000000;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new GrowingStallRuntime(true, 'codex', growth);
+        const pending = stepRun(f.store, 'run', runtime);
+        await runtime.ready;
+        await new Promise(resolve => setImmediate(resolve));
+        for (let step = 0; step < 4; step++) {
+            await runtime.grow(); t.mock.timers.tick(2000);
+            const expectedAt = new Date().toISOString();
+            await waitForMeter(f, meter => meter.at === expectedAt);
+            assert.equal(runtime.limit?.aborted, false, `growth must remain below the idle boundary at tick ${step + 1}`);
+        }
+        assert.equal(runtime.settled, false, 'growth must postpone stall_idle past the 2000 ms idle limit');
+        await tickUntilAborted(t, runtime);
+        const state = await pending;
+        assert.equal(state.attempts[0].segments?.[0].reason, 'stall_idle');
+        assert.equal(runtime.calls.length, 1);
+    } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('rollout-only non-token bytes count as activity and cross the idle boundary only afterward', { timeout: 10000 }, async t => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
+    const f = await fixture();
+    try {
+        // The seeded rollout reports about 630K metered tokens; keep it under the attempt allowance so only idle time can stop the worker.
+        f.project.limits.workerIdleTimeoutMs = 2000; f.project.limits.maxReportedTokens = 6000000;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new GrowingStallRuntime(true, 'codex', 'rollout');
+        const pending = stepRun(f.store, 'run', runtime);
+        await runtime.ready;
+        await new Promise(resolve => setImmediate(resolve));
+        await runtime.grow(); t.mock.timers.tick(2000); await waitForMeter(f, () => true);
+        assert.equal(runtime.limit?.aborted, false);
+        await tickUntilAborted(t, runtime);
+        const state = await pending;
+        assert.equal(state.attempts[0].segments?.[0].reason, 'stall_idle');
+    } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('a stalled hand-off ends after exactly two invocations', { timeout: 10000 }, async t => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
+    const f = await fixture();
+    try {
+        f.project.limits.maxReportedTokens = 6000000; f.project.limits.handoffContextRatio = 0.4;
+        f.project.limits.workerStartTimeoutMs = 2000; f.project.limits.workerIdleTimeoutMs = 2000;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new HandoffRuntime(() => t.mock.timers.tick(2000), 0, true);
+        await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
+        const pending = stepRun(f.store, 'run', runtime);
+        let done = false;
+        void pending.then(() => { done = true; }, () => { done = true; });
+        const deadline = performance.now() + 5000;
+        while (!done && performance.now() < deadline) { t.mock.timers.tick(2000); await settle(); }
+        const state = await pending;
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('developer-')), ['developer-1', 'developer-1']);
+        assert.deepEqual(state.attempts[2].segments?.map(segment => [segment.kind, segment.reason]), [['work', 'context_limit'], ['handoff', 'stall_start']]);
+        assert.equal(state.status, 'awaiting_input');
+    } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('known final usage does not rework a stalled developer', { timeout: 10000 }, async t => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
+    const f = await fixture();
+    try {
+        f.project.limits.maxReportedTokens = 6000000;
+        f.project.limits.workerStartTimeoutMs = 2000; f.project.limits.workerIdleTimeoutMs = 2000;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const planner = new HandoffRuntime(() => {});
+        const runtime = new StallFixtureRuntime(true);
+        const stall = runtime.execute.bind(runtime);
+        runtime.execute = async (job: Job) => {
+            if (!job.id.startsWith('developer-')) return planner.execute(job);
+            const result = await stall(job);
+            await writeFile(path.join(job.captureDir, 'stdout.log'), codexOutput('waiting'));
+            return result;
+        };
+        await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
+        const pending = stepRun(f.store, 'run', runtime); await runtime.ready; await tickUntilAborted(t, runtime);
+        const state = await pending;
+        assert.deepEqual(runtime.calls, ['developer-1']); assert.equal(state.status, 'awaiting_input'); assert.equal(state.reworks, 0);
+        assert.equal(state.attempts.at(-1)?.segments?.[0].reason, 'stall_idle');
+    } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+for (const finalReason of ['context_limit', 'token_limit', 'compacted'] as const)
+test(`final sampling preserves stall_idle over ${finalReason}`, { timeout: 10000 }, async t => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
+    const f = await fixture();
+    try {
+        f.project.limits.workerStartTimeoutMs = 2000; f.project.limits.workerIdleTimeoutMs = 2000;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FinalSampleStallRuntime(finalReason);
+        const pending = stepRun(f.store, 'run', runtime); await runtime.ready; await tickUntilAborted(t, runtime);
+        const state = await pending;
+        assert.equal(runtime.calls.length, 1); assert.equal(state.attempts[0].segments?.[0].reason, 'stall_idle');
+        assert.equal(state.attempts[0].result?.reason, 'stall_idle');
+        const segment = state.attempts[0].segments![0];
+        if (finalReason === 'context_limit') assert.ok((segment.peakContext ?? 0) >= 160000);
+        if (finalReason === 'token_limit') assert.ok((segment.metered ?? 0) > 100000);
+        if (finalReason === 'compacted') {
+            const rollout = await readFile(path.join(workerHome(runtime.job!.scratchDir), '.codex/sessions/rollout-test.jsonl'), 'utf8');
+            assert.match(rollout, /compacted/);
+        }
+    } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+for (const exitReason of ['cancelled', 'timeout'] as const)
+test(`final sampling preserves measured limits after ${exitReason}`, { timeout: 10000 }, async t => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
+    const f = await fixture();
+    try {
+        f.project.limits.workerStartTimeoutMs = 2000; f.project.limits.workerIdleTimeoutMs = 2000;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FinalSampleExitRuntime('context_limit', exitReason);
+        const pending = stepRun(f.store, 'run', runtime); await runtime.ready; await tickUntilAborted(t, runtime);
+        const state = await pending;
+        const segment = state.attempts[0].segments![0];
+        assert.ok((segment.peakContext ?? 0) >= 160000);
+        assert.equal(segment.reason, exitReason);
+        assert.equal(segment.source, 'meter');
+    } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('a start event on the threshold poll beats stall_start', { timeout: 10000 }, async t => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
+    const f = await fixture();
+    try {
+        f.project.limits.workerStartTimeoutMs = 2000; f.project.limits.workerIdleTimeoutMs = 2000;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new StallFixtureRuntime(false);
+        const pending = stepRun(f.store, 'run', runtime); await runtime.ready;
+        const job = path.join(runtime.job!.captureDir, 'stdout.log');
+        await writeFile(job, await readFile(new URL('./fixtures/codex-thread-started.jsonl', import.meta.url), 'utf8'));
+        t.mock.timers.tick(2000); await new Promise(resolve => setImmediate(resolve));
+        const meter = await waitForMeter(f, value => value.providerStartedAt !== null);
+        assert.ok(meter.providerStartedAt !== null);
+        await tickUntilAborted(t, runtime);
+        const state = await pending;
+        assert.equal(state.attempts[0].segments?.[0].reason, 'stall_idle'); assert.equal(runtime.calls.length, 1);
+    } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
+});
 
 test('stall_start rejects non-start capture growth and accepts a start on the threshold poll', { timeout: 10000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
@@ -240,17 +446,39 @@ test('pause before start and after start consumes no stall allowance', { timeout
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
         const abort = new AbortController(); const runtime = new StallFixtureRuntime(true);
         const pending = stepRun(f.store, 'run', runtime, { signal: abort.signal, pause: gate });
-        await runtime.ready; t.mock.timers.tick(10000); await new Promise(resolve => setImmediate(resolve));
-        assert.equal(abort.signal.aborted, false);
+        await runtime.ready; t.mock.timers.tick(10000); const pausedAt = new Date().toISOString(); await waitForMeter(f, meter => meter.at === pausedAt);
+        assert.equal(runtime.limit?.aborted, false);
+        assert.equal(runtime.settled, false);
         gate.resume();
-        t.mock.timers.tick(2000); await new Promise(resolve => setImmediate(resolve));
-        gate.pause(); t.mock.timers.tick(10000); await new Promise(resolve => setImmediate(resolve));
-        assert.equal(abort.signal.aborted, false);
-        gate.resume(); abort.abort(); const state = await pending;
+        await settle(); t.mock.timers.tick(1000); await settle();
+        gate.pause(); t.mock.timers.tick(10000); const repausedAt = new Date().toISOString(); await waitForMeter(f, meter => meter.at === repausedAt);
+        assert.equal(runtime.limit?.aborted, false);
+        assert.equal(runtime.settled, false);
+        abort.abort(); const state = await pending;
         assert.equal(state.attempts[0].segments?.[0].reason, 'cancelled');
         assert.equal(state.attempts[0].result?.reason, 'cancelled');
         await rm(f.root, { recursive: true, force: true });
     } finally { t.mock.timers.reset(); }
+});
+
+test('resume keeps only the idle allowance left before the pause', { timeout: 10000 }, async t => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
+    const f = await fixture();
+    try {
+        f.project.limits.workerStartTimeoutMs = 60000; f.project.limits.workerIdleTimeoutMs = 6000;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const gate = new PauseGate(); const runtime = new StallFixtureRuntime(true);
+        const pending = stepRun(f.store, 'run', runtime, { signal: new AbortController().signal, pause: gate });
+        await runtime.ready;
+        const poll = async (ms = 2000) => { t.mock.timers.tick(ms); const at = new Date().toISOString(); await waitForMeter(f, meter => meter.at === at); };
+        // The first poll sees the start event; the second leaves 2000 ms of the 6000 ms idle allowance used.
+        await poll(); await poll();
+        gate.pause(); await poll(10000); gate.resume();
+        await poll(); assert.equal(runtime.limit?.aborted, false, 'pause time must not count as idle time');
+        await poll(); assert.equal(runtime.limit?.reason, 'stall_idle', 'resume must not refill the idle allowance');
+        const state = await pending;
+        assert.equal(state.attempts[0].segments?.[0].reason, 'stall_idle');
+    } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
 test('stall reason persists through meter, history, result, segment and reopened dashboard row', { timeout: 10000 }, async t => {
@@ -269,7 +497,7 @@ test('stall reason persists through meter, history, result, segment and reopened
     } finally { t.mock.timers.reset(); }
 });
 
-for (const claudePlanner of [false, true]) test(`an older run without Headroom cannot admit Codex with ${claudePlanner ? 'a Claude planner' : 'all Codex roles'}`, async () => {
+for (const claudePlanner of [false, true]) test(`an older run without Headroom cannot admit Codex with ${claudePlanner ? 'a Claude planner' : 'all Codex roles'}`, { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -287,7 +515,7 @@ for (const claudePlanner of [false, true]) test(`an older run without Headroom c
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('dispatches bounded planner tasks and accepts only candidate-bound runner checks', async () => {
+test('dispatches bounded planner tasks and accepts only candidate-bound runner checks', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         const created = await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -308,7 +536,79 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('requires exact visual evidence and an explicit owner answer before handoff', async () => {
+test('reset retries a failed planner with fresh evidence and dispatches the fixture workflow', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        class FailingPlanner extends FakeRuntime {
+            failed = false;
+            override async execute(job: Job) {
+                const result = await super.execute(job);
+                if (job.id === 'plan-architect' && !this.failed) {
+                    this.failed = true;
+                    return { ...result, exitCode: 1, reason: 'exit_error' as const };
+                }
+                return result;
+            }
+        }
+        const first = new FailingPlanner();
+        const waiting = await stepRun(f.store, 'run', first);
+        assert.equal(waiting.status, 'awaiting_input');
+        await writeFile(path.join(f.store.dir('run'), 'attempts', 'plan-architect', 'sentinel.txt'), 'old evidence');
+        const dashboard = new Dashboard(path.join(f.root, 'state'));
+        await dashboard.control('run', { action: 'reset' });
+        const runtime = new FakeRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'handoff_ready');
+        assert.deepEqual(runtime.calls, ['plan-architect-2', 'plan-tester', 'developer-1', 'review-1', 'check-unit-1', 'check-artifact-1']);
+        assert.equal(await readFile(path.join(f.store.dir('run'), 'attempts', 'plan-architect', 'sentinel.txt'), 'utf8'), 'old evidence');
+        assert.notEqual(final.attempts.find(attempt => attempt.id === 'plan-architect-2')?.id, 'plan-architect');
+        assert.equal(final.reworks, 0);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('reset retries a planner whose proposal was rejected', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const first = new FakeRuntime();
+        first.proposedReviewerModel = { ...f.project.models.reviewer, model: 'not-approved' };
+        assert.equal((await stepRun(f.store, 'run', first)).status, 'ready');
+        const rejected = await stepRun(f.store, 'run', first);
+        assert.equal(rejected.status, 'awaiting_input');
+        assert.equal(rejected.attempts.find(attempt => attempt.id === 'plan-tester')?.admitted, undefined);
+        await new Dashboard(path.join(f.root, 'state')).control('run', { action: 'reset' });
+        const runtime = new FakeRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'handoff_ready');
+        assert.equal(runtime.calls[0], 'plan-tester-2');
+        assert.equal(final.attempts.find(attempt => attempt.id === 'plan-tester-2')?.admitted, true);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('reset cannot bypass a zero-rework implementation ceiling', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        f.project.limits.maxReworks = 0;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        class FailedDeveloper extends FakeRuntime {
+            override async execute(job: Job) {
+                const result = await super.execute(job);
+                return job.id.startsWith('developer-') ? { ...result, exitCode: 1, reason: 'exit_error' as const } : result;
+            }
+        }
+        const first = await runRun(f.store, 'run', new FailedDeveloper());
+        assert.equal(first.status, 'failed');
+        await new Dashboard(path.join(f.root, 'state')).control('run', { action: 'reset' });
+        const runtime = new FakeRuntime();
+        const afterReset = await runRun(f.store, 'run', runtime);
+        assert.equal(afterReset.status, 'awaiting_input');
+        assert.equal(runtime.calls.some(id => id.startsWith('developer-')), false);
+        assert.equal(afterReset.attempts.filter(attempt => attempt.role === 'developer').length, 1);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('requires exact visual evidence and an explicit owner answer before handoff', { timeout: 10000 }, async () => {
     const f = await fixture(true);
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -336,7 +636,7 @@ test('requires exact visual evidence and an explicit owner answer before handoff
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('unknown worker usage persists as a failed attempt and stops dispatch', async () => {
+test('unknown worker usage persists as a failed attempt and stops dispatch', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -364,7 +664,7 @@ test('unknown worker usage persists as a failed attempt and stops dispatch', asy
 });
 
 for (const proposed of ['configured', 'provider', 'model', 'effort'] as const) {
-    test(`planner admission preserves configured Claude choice: ${proposed}`, async () => {
+    test(`planner admission preserves configured Claude choice: ${proposed}`, { timeout: 10000 }, async () => {
         const f = await fixture();
         try {
             const selected: WorkerChoice = { provider: 'claude', model: 'sonnet', effort: 'medium' };
@@ -384,7 +684,7 @@ for (const proposed of ['configured', 'provider', 'model', 'effort'] as const) {
     });
 }
 
-test('createRun rejects a Claude developer', async () => {
+test('createRun rejects a Claude developer', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         f.project.models.developer = { provider: 'claude', model: 'sonnet', effort: 'medium' };
@@ -393,7 +693,7 @@ test('createRun rejects a Claude developer', async () => {
 });
 
 for (const inputTokens of [150000, 350000]) {
-    test(`developer allocation meters ${inputTokens} cached input tokens against the reserved share`, async () => {
+    test(`developer allocation meters ${inputTokens} cached input tokens against the reserved share`, { timeout: 10000 }, async () => {
         const f = await fixture();
         try {
             f.project.limits.maxReportedTokens = 900000;
@@ -431,7 +731,7 @@ for (const inputTokens of [150000, 350000]) {
     });
 }
 
-test('an uncached developer overrun is metered gross and fails with token_limit', async () => {
+test('an uncached developer overrun is metered gross and fails with token_limit', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxReportedTokens = 900000;
@@ -463,7 +763,7 @@ test('an uncached developer overrun is metered gross and fails with token_limit'
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('planner usage is metered with cache reads at one tenth', async () => {
+test('planner usage is metered with cache reads at one tenth', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxReportedTokens = 3000;
@@ -484,7 +784,7 @@ test('planner usage is metered with cache reads at one tenth', async () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('planner usage over its metered share fails', async () => {
+test('planner usage over its metered share fails', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxReportedTokens = 3000;
@@ -506,7 +806,7 @@ test('planner usage over its metered share fails', async () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a normal completion still writes a final meter.json with source final', async () => {
+test('a normal completion still writes a final meter.json with source final', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -525,7 +825,7 @@ test('a normal completion still writes a final meter.json with source final', as
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a developer over its token allowance is stopped with token_limit and the meter file matches the segment', async () => {
+test('a developer over its token allowance is stopped with token_limit and the meter file matches the segment', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxReportedTokens = 900000;
@@ -598,7 +898,7 @@ async function writeRollout(job: Job, text: string) {
     await writeFile(path.join(dir, 'rollout-test.jsonl'), text);
 }
 
-test('a context_limit crossing produces one attempt with three segments and a stored handoff', async t => {
+test('a context_limit crossing produces one attempt with three segments and a stored handoff', { timeout: 10000 }, async t => {
     const f = await fixture();
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
@@ -642,7 +942,7 @@ test('a context_limit crossing produces one attempt with three segments and a st
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a non-zero resume exit fails the attempt with handoff_failed', async t => {
+test('a non-zero resume exit fails the attempt with handoff_failed', { timeout: 10000 }, async t => {
     const f = await fixture();
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
@@ -663,7 +963,7 @@ test('a non-zero resume exit fails the attempt with handoff_failed', async t => 
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('Claude contextWindowMismatch is set only when the reported window differs', async () => {
+test('Claude contextWindowMismatch is set only when the reported window differs', { timeout: 10000 }, async () => {
     for (const window of [200000, 250000]) {
         const f = await fixture();
         try {
@@ -687,7 +987,7 @@ test('Claude contextWindowMismatch is set only when the reported window differs'
 });
 
 for (const failure of ['invalid', 'absent', 'token_limit', 'compacted', 'timeout'] as const)
-test(`a handoff ${failure} stops the chain before fresh work`, async t => {
+test(`a handoff ${failure} stops the chain before fresh work`, { timeout: 10000 }, async t => {
     const f = await fixture();
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
@@ -719,7 +1019,7 @@ test(`a handoff ${failure} stops the chain before fresh work`, async t => {
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-for (const reason of ['timeout', 'cancelled'] as const) test(`${reason} without final usage preserves an unknown lower bound`, async () => {
+for (const reason of ['timeout', 'cancelled'] as const) test(`${reason} without final usage preserves an unknown lower bound`, { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -743,7 +1043,7 @@ for (const reason of ['timeout', 'cancelled'] as const) test(`${reason} without 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-for (const reason of ['compacted', 'context_limit', 'token_limit'] as const) test(`final polling preserves ${reason} on the segment`, async () => {
+for (const reason of ['compacted', 'context_limit', 'token_limit'] as const) test(`final polling preserves ${reason} on the segment`, { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -772,10 +1072,12 @@ for (const reason of ['compacted', 'context_limit', 'token_limit'] as const) tes
             assert.equal(meter.contextTokens, 1000);
             assert.equal(meter.peakContext, 160000);
         }
+        if (reason === 'token_limit') assert.ok((attempt.segments?.[0].metered ?? 0) > 1000);
+        if (reason === 'compacted') assert.equal(attempt.segments?.[0].reason, 'compacted');
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('unknown Claude model is refused before recording or executing an attempt', async () => {
+test('unknown Claude model is refused before recording or executing an attempt', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         f.project.models.inspector = { provider: 'claude', model: 'claude-unknown-test', effort: 'low' };
@@ -787,7 +1089,7 @@ test('unknown Claude model is refused before recording or executing an attempt',
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('Claude context crossing stops a live segment and retains its limit reason', async () => {
+test('Claude context crossing stops a live segment and retains its limit reason', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
         f.project.models.inspector = { provider: 'claude', model: 'claude-sonnet-5', effort: 'low' };
@@ -817,7 +1119,7 @@ test('Claude context crossing stops a live segment and retains its limit reason'
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('runSegment waits for an in-flight poll before finalizing the sidecar', async t => {
+test('runSegment waits for an in-flight poll before finalizing the sidecar', { timeout: 10000 }, async t => {
     const f = await fixture();
     const originalOpen = fsPromises.open;
     let release!: () => void, entered!: () => void;
@@ -870,7 +1172,7 @@ test('runSegment waits for an in-flight poll before finalizing the sidecar', asy
     }
 });
 
-for (const failure of ['write', 'usage'] as const) test(`a meter ${failure} failure cancels the worker and blocks dispatch`, async t => {
+for (const failure of ['write', 'usage'] as const) test(`a meter ${failure} failure cancels the worker and blocks dispatch`, { timeout: 10000 }, async t => {
     const f = await fixture();
     const originalOpen = fsPromises.open;
     if (failure === 'write') t.mock.method(fsPromises, 'open', async (...args: Parameters<typeof originalOpen>) => {

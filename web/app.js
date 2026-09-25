@@ -7,10 +7,10 @@ import { openClaudeLogin } from './claude-login.js';
   const content = $('#page-content');
   const pageNames = { overview: 'Overview', project: 'Project setup', connections: 'Connections', budgets: 'Budgets' };
   const roles = [
-    ['coordinator', 'Coordinator', 'Plans work and keeps the handoff moving', 'Astra'],
-    ['developer', 'Developer', 'Implements changes in an isolated attempt', 'Sol'],
-    ['reviewer', 'Reviewer', 'Checks the candidate against the brief', 'Sol'],
-    ['inspector', 'Inspector', 'Runs independent checks and records evidence', 'Luna'],
+    ['business', 'Business', 'Owns approved business requirements', 'inspector'], ['domain', 'Domain', 'Owns domain rules', 'inspector'],
+    ['architect', 'Architect', 'Owns ticket progress', 'inspector'], ['developer', 'Developer', 'Implements isolated changes', 'developer'],
+    ['reviewer', 'Reviewer', 'Checks the candidate', 'reviewer'], ['tester', 'Tester', 'Plans independent checks', 'inspector'],
+    ['coordinator', 'Coordinator', 'Plans work and manages handoffs', 'coordinator'],
   ];
   const state = { csrf: '', data: null, page: 'overview', selectedRun: null, refreshing: false, controlBusy: null };
   const answerDrafts = new Map();
@@ -217,16 +217,19 @@ import { openClaudeLogin } from './claude-login.js';
     append(item, node('span', 'metric-icon', icon), node('span', 'metric-label', label), node('strong', 'metric-value', value), node('span', 'metric-detail', detail));
     return item;
   }
-  function roleNode([key, name, detail, defaultModel], data, index) {
-    const configured = data.settings?.models?.[key] || {};
-    const model = configured.model || defaultModel;
-    const provider = configured.provider || 'codex';
+  function roleNode([key, name, detail, slot], data, index) {
+    const selected = (data.runs || []).find(run => run.id === state.selectedRun);
+    const selectedRole = selected?.roles?.find(role => role.role === key);
+    const configured = data.settings?.models?.[slot] || {};
+    const model = selected ? selectedRole?.model || 'Model unavailable' : configured.model || slot;
+    const provider = selected ? selectedRole?.provider || 'Provider unavailable' : configured.provider || 'codex';
     const person = node('div', `role-card role-${key}`);
-    const avatar = node('span', `role-avatar ${key}`, key === 'coordinator' ? 'C' : key === 'developer' ? 'D' : key === 'reviewer' ? 'R' : 'I');
+    const avatar = node('span', `role-avatar ${key}`, { business: 'B', domain: 'Dm', architect: 'A', developer: 'D', reviewer: 'R', tester: 'T', coordinator: 'C' }[key]);
     const info = node('div', 'role-info');
     append(info, node('strong', '', name), node('span', '', detail));
     const tag = node('span', 'model-tag', `${provider} · ${model}`);
-    append(person, avatar, info, tag);
+    const live = Boolean(selected?.factory?.supervisor && selected.factory.state === 'running' && (selected.attempts || []).some(attempt => attempt.role === key && attempt.status === 'running'));
+    append(person, avatar, info, node('span', `badge role-status ${live ? 'running' : ''}`, live ? 'Live' : 'Idle'), tag);
     if (index > 0) person.dataset.indented = 'true';
     return person;
   }
@@ -240,6 +243,8 @@ import { openClaudeLogin } from './claude-login.js';
     for (const issue of (Array.isArray(data.issues) ? data.issues : [])) issuesByKey.set(`${issue.code || issue.message}:${issue.runId || ''}`, issue);
     for (const run of runs) for (const issue of (Array.isArray(run.issues) ? run.issues : [])) issuesByKey.set(`${issue.code || issue.message}:${issue.runId || run.id}`, { ...issue, runId: issue.runId || run.id });
     const issues = [...issuesByKey.values()];
+    const selectedRun = runs.find(run => run.id === state.selectedRun) || runs[0];
+    if (selectedRun) issues.sort((left, right) => Number(right.runId === selectedRun.id) - Number(left.runId === selectedRun.id));
     const totalAttempts = runs.reduce((sum, run) => sum + (Array.isArray(run.attempts) ? run.attempts.length : Number(run.attemptCount) || 0), 0);
     const tokens = runs.reduce((sum, run) => sum + (Number(run.reportedTokens) || 0), 0);
     const overview = node('div', 'overview-page');
@@ -267,11 +272,11 @@ import { openClaudeLogin } from './claude-login.js';
       activity.append(runDetail(selected));
     }
     const rail = node('div', 'overview-rail');
-    const org = card('Your team', 'Configured for future runs. Saved runs may use different models.', 'team-panel');
+    const org = card('Your team', selectedRun ? 'Models and live status for the selected run.' : 'Configured for future runs. Saved runs may use different models.', 'team-panel');
     const teamList = node('div', 'team-list');
     roles.forEach((role, index) => teamList.append(roleNode(role, data, index)));
     org.append(teamList);
-    org.append(node('p', 'panel-note', 'Business Analyst and Domain Architect responsibilities cover approved requirements and domain rules. The coordinator may perform these roles. The Technical Architect owns ticket progress against worker evidence.'));
+    org.append(node('p', 'panel-note', 'Business, domain, architect, and tester cards use the configured Inspector model slot.'));
     const caveat = node('p', 'panel-note', 'These roles describe the workflow. The control bar of the selected run shows whether its supervisor and worker are running.');
     org.append(caveat);
     rail.append(org);
@@ -515,20 +520,24 @@ import { openClaudeLogin } from './claude-login.js';
     const panel = node('section', 'token-panel');
     panel.setAttribute('aria-label', 'Token usage');
     panel.append(node('h3', '', 'Token usage'));
-    const totalText = (value, lower) => value == null ? `Unknown (at least ${number(lower)})` : number(value);
+    const totalText = (value, lower) => value == null ? lower > 0 ? `≥ ${number(lower)}` : 'Unknown' : number(value);
+    const totalMetric = (label, value, lower, className = 'token-total-item') => {
+      const item = node('span', className);
+      append(item, node('span', 'token-total-label', label), node('span', 'token-total-value', totalText(value, lower)));
+      return item;
+    };
     for (const group of run.usageByRole || []) {
       const role = group.role.charAt(0).toUpperCase() + group.role.slice(1).replaceAll('_', ' ');
       const total = node('div', 'token-row token-total');
       const summary = node('span', 'token-summary');
       for (const [key, label] of [['input', 'Input'], ['cached', 'Cached'], ['output', 'Output']])
-        summary.append(node('span', '', `${label} ${totalText(group.total[key], group.lowerBound[key])}`));
-      append(total, node('strong', '', `${role} total`), summary,
-        node('strong', 'token-metered', `Metered (budget) ${totalText(group.total.metered, group.lowerBound.metered)}`));
+        summary.append(totalMetric(label, group.total[key], group.lowerBound[key]));
+      append(total, node('strong', '', `${role} total`), summary, totalMetric('Metered (budget)', group.total.metered, group.lowerBound.metered, 'token-metered'));
       panel.append(total);
       for (const agent of group.agents) {
         const row = node('div', 'token-row');
         const label = node('div', 'token-agent');
-        append(label, node('strong', '', agent.segment == null ? 'Segment unavailable' : `Segment ${agent.segment} - ${agent.kind === 'handoff' ? 'hand-off' : 'work'}`),
+        append(label, node('strong', '', agent.segment == null ? 'No segment usage recorded' : `Segment ${agent.segment} - ${agent.kind === 'handoff' ? 'hand-off' : 'work'}`),
           node('small', '', agent.attemptId), node('small', '', `Model ${agent.model}`), badge(agent.status));
         if (agent.reason && agent.reason !== agent.status) label.append(node('small', '', agent.reason));
         if (agent.lastActivityAt) label.append(node('small', '', `Last activity ${duration(Math.max(0, Date.now() - Date.parse(agent.lastActivityAt)))} ago`));
@@ -612,6 +621,9 @@ import { openClaudeLogin } from './claude-login.js';
     const factory = run.factory;
     const busy = state.controlBusy?.run === run.id ? state.controlBusy.state : null;
     const current = busy || factory.state;
+    const workRunning = current === 'running' && Boolean(factory.activeJob || factory.supervisor);
+    const operatorState = run.status === 'awaiting_input' ? 'awaiting_input' : run.status === 'failed' ? 'failed' : current;
+    const stall = (run.issues || []).find(issue => issue.code === 'stall_start' || issue.code === 'stall_idle');
     const job = factory.activeJob;
     const bar = node('div', 'factory-bar');
     bar.tabIndex = -1;
@@ -619,7 +631,7 @@ import { openClaudeLogin } from './claude-login.js';
     bar.setAttribute('aria-busy', String(Boolean(busy)));
     const status = node('div', 'factory-status');
     status.setAttribute('role', 'status');
-    const text = current === 'running' ? (job ? `Running the ${job.kind} job since ${escDate(job.startedAt)}.` : 'The supervisor is running. No worker job is active.')
+    const text = run.status === 'awaiting_input' ? `Awaiting input${stall ? ` after ${stall.code}.` : '.'}` : run.status === 'failed' ? `${String(stall?.code || 'Failed').replaceAll('_', ' ')}.` : current === 'running' ? (job ? `Running the ${job.kind} job since ${escDate(job.startedAt)}.` : 'The supervisor is running. No worker job is active.')
       : current === 'exited' ? factory.reason || 'The supervisor exited.'
       : current === 'terminal' ? `This run is ${String(run.status).replaceAll('_', ' ')}.`
       : factoryText[current];
@@ -628,21 +640,32 @@ import { openClaudeLogin } from './claude-login.js';
       current !== 'running' && job && `${job.kind} job since ${escDate(job.startedAt)}${job.frozen ? ', frozen' : ''}`,
       current !== 'exited' && factory.reason,
     ].filter(Boolean).join(' · ');
-    append(status, badge(current === 'terminal' ? 'Finished' : current), node('span', 'factory-text', text), meta ? node('span', 'factory-meta', meta) : null);
+    append(status, badge(operatorState === 'terminal' ? 'Finished' : operatorState), node('span', 'factory-text', text), meta ? node('span', 'factory-meta', meta) : null);
     if (factory.orphans.length) status.append(node('span', 'factory-warning', `Processes ${factory.orphans.join(', ')} outlived their job leader. The factory cannot prove it owns them, so it does not signal them. Inspect them with ps.`));
     const actions = node('div', 'factory-actions');
     append(actions,
       controlButton(run, 'start', factory.startLabel, 'primary', factory.canStart && !busy),
-      controlButton(run, 'pause', 'Pause', 'secondary', factory.canPause && !busy),
+      controlButton(run, 'pause', 'Pause', 'secondary', factory.canPause && workRunning && !busy),
+      controlButton(run, 'reset', 'Reset', 'secondary', factory.canReset && !busy),
       controlButton(run, 'stop', 'Stop', 'secondary stop', factory.canStop && !busy));
     append(bar, status, actions);
     return bar;
   }
   function controlButton(run, action, label, kind, enabled) {
-    const el = button(label, kind, () => action === 'stop' ? confirmStop(run) : controlRun(run, action));
+    const el = button(label, kind, () => action === 'stop' ? confirmStop(run) : action === 'reset' ? confirmReset(run) : controlRun(run, action));
     el.dataset.focusKey = `${action}:${run.id}`;
     el.disabled = !enabled;
     return el;
+  }
+  function confirmReset(run) {
+    const dialog = node('dialog', 'modal');
+    const title = node('h2', '', `Reset ${run.id}?`); title.id = 'reset-title'; dialog.setAttribute('aria-labelledby', 'reset-title');
+    const body = node('div', 'modal-body');
+    const keep = button('Keep run', 'secondary', () => dialog.close()); keep.autofocus = true;
+    const reset = button('Reset run', 'danger', () => { dialog.close(); controlRun(run, 'reset'); });
+    append(body, title, node('p', '', 'Reset clears live execution records and returns this run to Ready. Attempts and history remain.'), node('div', 'modal-actions'));
+    append(body.lastChild, keep, reset); dialog.append(body);
+    dialog.addEventListener('close', () => { dialog.remove(); refocus(`reset:${run.id}`); }); document.body.append(dialog); dialog.showModal();
   }
   function confirmStop(run) {
     const dialog = node('dialog', 'modal');
@@ -664,7 +687,7 @@ import { openClaudeLogin } from './claude-login.js';
   }
   async function controlRun(run, action) {
     const focusKey = `${action}:${run.id}`;
-    const busyState = { start: run.factory.startLabel === 'Resume' ? 'resuming' : 'starting', pause: 'pausing', stop: 'stopping' }[action];
+    const busyState = { start: run.factory.startLabel === 'Resume' ? 'resuming' : 'starting', pause: 'pausing', reset: 'starting', stop: 'stopping' }[action];
     state.controlBusy = { run: run.id, state: busyState };
     renderOverview();
     refocus(focusKey);

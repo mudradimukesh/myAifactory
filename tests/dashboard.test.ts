@@ -7,7 +7,7 @@ import { request } from 'node:http';
 import { createDashboardServer } from '../src/dashboard-server.ts';
 import type { State } from '../src/contracts.ts';
 import { Store, sha } from '../src/store.ts';
-import { Dashboard, projectRun } from '../src/dashboard.ts';
+import { Dashboard, FactoryConflict, projectRun } from '../src/dashboard.ts';
 import { meterReadingSchema, type Segment } from '../src/contracts.ts';
 import { identify } from '../src/process.ts';
 
@@ -24,6 +24,7 @@ test('segment projection preserves counters and sums role and run usage', () => 
   state.attempts.push({ ...attempt, id: 'review-one', role: 'reviewer', segments: [{ ...segment, contextWindowMismatch: true }] });
   state.reportedTokens = 480;
   const view = projectRun(state);
+  assert.deepEqual(view.roles.map(role => role.role), ['business', 'domain', 'architect', 'developer', 'reviewer', 'tester', 'coordinator']);
   for (const group of view.usageByRole) {
     const source = state.attempts.find(a => a.role === group.role)!;
     assert.deepEqual(group.agents.map(({ raw, input, cached, output, metered }) => ({ raw, input, cached, output, metered })),
@@ -72,7 +73,7 @@ test('context recommendation uses live occupancy instead of cumulative input', (
   assert.match(warning([{ ...meter, contextTokens: null }])!.recommendation, /occupancy is unknown/);
 });
 
-test('snapshot reads active segment meters with current context and preserves unknown usage', async () => {
+test('snapshot reads active segment meters with current context and preserves unknown usage', { timeout: 10000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'factory-meter-')); roots.push(root);
   const dashboard = new Dashboard(root), state = runState();
   state.activeJob!.id = state.attempts[0]!.id; state.activeJob!.kind = 'developer';
@@ -241,7 +242,7 @@ async function session(base: string) {
   });
 }
 
-test('pause refuses a live unsupervised job without changing state', async () => {
+test('pause refuses a live unsupervised job without changing state', { timeout: 10000 }, async () => {
   const app = await openDashboard();
   try {
     const store = new Store(app.root), state = runState();
@@ -259,7 +260,7 @@ test('pause refuses a live unsupervised job without changing state', async () =>
   } finally { await app.close(); }
 });
 
-test('idle pause says nothing was running', async () => {
+test('idle pause says nothing was running', { timeout: 10000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'factory-idle-pause-')); roots.push(root);
   const dashboard = new Dashboard(root), state = runState();
   state.activeJob = undefined;
@@ -270,7 +271,7 @@ test('idle pause says nothing was running', async () => {
   assert.equal((await dashboard.store.read(state.id)).control, 'suspend');
 });
 
-test('control takes the start, pause and stop body and projects a factory view', async () => {
+test('control takes the start, pause and stop body and projects a factory view', { timeout: 10000 }, async () => {
   const app = await openDashboard();
   try {
     const store = new Store(app.root);
@@ -282,7 +283,7 @@ test('control takes the start, pause and stop body and projects a factory view',
     const initial = (await (await fetch(`${app.base}/api/dashboard`)).json()).runs[0];
     assert.equal('controlPending' in initial, false);
     assert.deepEqual(initial.factory, { state: 'idle', supervisor: null, activeJob: { id: 'job-one', kind: 'worker', startedAt: '2026-09-23T00:00:00.000Z', frozen: false },
-      canStart: true, canPause: true, canStop: true, startLabel: 'Start', reason: null, orphans: [] });
+      canStart: true, canPause: true, canStop: true, canReset: false, startLabel: 'Start', reason: null, orphans: [] });
     const paused = await control({ action: 'pause' });
     assert.equal(paused.status, 200);
     const pausedBody = await paused.json();
@@ -316,7 +317,52 @@ test('control takes the start, pause and stop body and projects a factory view',
   } finally { await app.close(); }
 });
 
-test('start rejects a stale revision without launching or writing', async () => {
+test('reset returns a quiescent failed run to ready and preserves history and attempts', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-reset-')); roots.push(root);
+  const dashboard = new Dashboard(root); const state = runState(); state.status = 'failed'; delete state.activeJob;
+  await dashboard.store.create(state);
+  const result = await dashboard.control(state.id, { action: 'reset' });
+  assert.equal(result.changed, true);
+  assert.equal(result.factory.canStart, true);
+  const reset = await dashboard.store.read(state.id);
+  assert.equal(reset.status, 'ready');
+  assert.equal(reset.attempts.length, state.attempts.length);
+  assert.equal(reset.history.at(-1)?.type, 'factory_reset');
+  assert.equal(reset.activeJob, undefined);
+  assert.equal(reset.supervisor, undefined);
+});
+
+test('reset rejects running and control-pending runs', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-reset-reject-')); roots.push(root);
+  const dashboard = new Dashboard(root); const running = runState(); await dashboard.store.create(running);
+  await assert.rejects(() => dashboard.control(running.id, { action: 'reset' }), FactoryConflict);
+  const pending = runState(); pending.id = 'run-pending'; pending.status = 'failed'; delete pending.activeJob; pending.control = 'suspend';
+  await dashboard.store.create(pending);
+  await assert.rejects(() => dashboard.control(pending.id, { action: 'reset' }), FactoryConflict);
+});
+
+test('reset is disabled and rejected during a visual-review wait', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-reset-visual-')); roots.push(root);
+  const dashboard = new Dashboard(root); const state = runState();
+  state.status = 'awaiting_input'; state.priorStatus = 'verified'; delete state.activeJob;
+  await dashboard.store.create(state);
+  assert.equal((await dashboard.snapshot()).runs[0]!.factory?.canReset, false);
+  await assert.rejects(() => dashboard.control(state.id, { action: 'reset' }), FactoryConflict);
+  assert.equal((await dashboard.store.read(state.id)).status, 'awaiting_input');
+});
+
+for (const priorStatus of ['running', 'verifying'] as const)
+test(`reset accepts a stalled ${priorStatus} execution`, { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), `factory-reset-${priorStatus}-`)); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  state.status = 'awaiting_input'; state.priorStatus = priorStatus; delete state.activeJob;
+  await dashboard.store.create(state);
+  const result = await dashboard.control(state.id, { action: 'reset' });
+  assert.equal(result.changed, true);
+  assert.equal((await dashboard.store.read(state.id)).status, 'ready');
+});
+
+test('start rejects a stale revision without launching or writing', { timeout: 10000 }, async () => {
   const app = await openDashboard();
   try {
     const store = new Store(app.root);
