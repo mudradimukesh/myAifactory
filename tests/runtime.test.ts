@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile, symlink, realpath } from 'node
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { LocalRuntime, validateAuthHome } from '../src/runtime.ts';
+import { LocalRuntime, validateAuthHome, workerHome } from '../src/runtime.ts';
 import type { Job } from '../src/runtime.ts';
 import { projectSchema } from '../src/contracts.ts';
 
@@ -60,10 +60,33 @@ test('native sandbox protects capture and readonly source while allowing proposa
     assert.equal(output.descendant, 0);
     assert.equal(output.signalDenied, true);
     assert.equal(output.input, 'task input');
-    assert.equal(output.home, path.join(job.scratchDir, 'home'));
+    assert.equal(output.home, workerHome(job.scratchDir));
     assert.equal(await readFile(path.join(job.workspace, 'source.txt'), 'utf8'), 'original');
     assert.equal(await readFile(path.join(job.outputDir, 'proposal.txt'), 'utf8'), 'proposal');
   });
+});
+
+test('resumeHome is copied into the fresh home', { skip: process.platform !== 'darwin' }, async t => {
+  for (const provider of ['codex', 'claude'] as const) await t.test(provider, async () => fixture(async (job, root) => {
+    const resumeHome = path.join(root, 'previous-home');
+    const sessionDir = provider === 'codex' ? '.codex/sessions' : '.claude/projects';
+    const fixtureName = provider === 'codex' ? 'codex-thread-started.jsonl' : 'claude-init.json';
+    const text = await readFile(new URL(`./fixtures/${fixtureName}`, import.meta.url), 'utf8');
+    await mkdir(path.join(resumeHome, sessionDir, 'nested'), { recursive: true });
+    await writeFile(path.join(resumeHome, sessionDir, 'nested', 'session.jsonl'), text);
+    await writeFile(path.join(resumeHome, `.${provider}`, 'settings.json'), 'must not copy');
+    const auth = path.join(root, 'auth');
+    await mkdir(auth);
+    await writeFile(path.join(auth, provider === 'codex' ? 'auth.json' : '.credentials.json'),
+      JSON.stringify(provider === 'codex' ? { auth_mode: 'chatgpt' } : { claudeAiOauth: { fixture: true } }));
+    job.project.runtime.authHomes[provider] = auth;
+    const script = `const fs=require('fs');console.log(fs.readFileSync(process.env.HOME+'/'+${JSON.stringify(sessionDir)}+'/nested/session.jsonl','utf8'));`;
+    const result = await new LocalRuntime().execute({ ...job, provider, resumeHome, argv: [process.execPath, '-e', script] });
+    assert.equal(await readFile(path.join(workerHome(job.scratchDir), sessionDir, 'nested/session.jsonl'), 'utf8'), text);
+    await assert.rejects(readFile(path.join(workerHome(job.scratchDir), `.${provider}`, 'settings.json')), { code: 'ENOENT' });
+    assert.equal(result.reason, 'completed', await readFile(path.join(job.captureDir, 'stderr.log'), 'utf8'));
+    assert.equal((await readFile(path.join(job.captureDir, 'stdout.log'), 'utf8')).trim(), text.trim());
+  }));
 });
 
 test('native developer can write only its workspace and network policy is enforced', { skip: process.platform !== 'darwin' }, async () => {

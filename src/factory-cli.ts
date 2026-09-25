@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { SupervisorConflict, createRun, liveSupervisor, registerVisualReview, resumeRun, runRun, stepRun, superviseRun } from './coordinator.ts';
+import { SupervisorConflict, createRun, liveSupervisor, registerVisualReview, stepRun, superviseRun } from './coordinator.ts';
 import { PauseGate } from './process.ts';
 import { LocalRuntime } from './runtime.ts';
 import { Store } from './store.ts';
@@ -10,7 +11,7 @@ export async function main(args: string[]): Promise<void> {
     if (!root || !run) throw Error('Usage: factory-cli <init|step|run|resume|supervise|visual-register|status> <state-root> <run-id> [arguments]');
     const store = new Store(root);
     let state;
-    if ((command === 'step' || command === 'run' || command === 'resume') && await liveSupervisor(await store.read(run)))
+    if (command === 'step' && await liveSupervisor(await store.read(run)))
         throw Error('A factory supervisor is running this run; use the dashboard controls');
     switch (command) {
         case 'init': {
@@ -20,20 +21,24 @@ export async function main(args: string[]): Promise<void> {
             break;
         }
         case 'step': state = await stepRun(store, run); break;
-        case 'run': state = await runRun(store, run); break;
-        case 'resume': state = await resumeRun(store, run); break;
+        case 'run':
+        case 'resume':
         case 'supervise': {
-            const [launchId] = rest;
+            const launchId = command === 'supervise' ? rest[0] : `cli-${randomUUID()}`;
             if (!launchId) throw Error('supervise requires a launch id');
             const abort = new AbortController();
-            process.once('SIGTERM', () => abort.abort());
-            process.once('SIGINT', () => abort.abort());
+            const onSignal = () => abort.abort();
+            process.once('SIGTERM', onSignal);
+            process.once('SIGINT', onSignal);
             try { state = await superviseRun(store, run, launchId, new LocalRuntime(), { signal: abort.signal, pause: new PauseGate() }); }
             catch (error) {
                 if (!(error instanceof SupervisorConflict)) throw error;
                 process.stderr.write(error.message + '\n');
                 process.exitCode = 3;
                 return;
+            } finally {
+                process.removeListener('SIGTERM', onSignal);
+                process.removeListener('SIGINT', onSignal);
             }
             break;
         }

@@ -1,5 +1,7 @@
 # Operator dashboard
 
+Running segment rows show last activity age. Recorded worker stalls show their reason and a next action to inspect the provider or capture and reconcile usage before retrying.
+
 Run the HTTP behavioral suite with the Node executable selected in the parent skill:
 
 ```sh
@@ -27,3 +29,7 @@ Open the printed URL and verify these public workflows:
 
 
 Retain the commands, API responses without secrets, and browser screenshots. HTTP fixtures establish local request behavior. The Claude sign-in dialog and native login integration are deferred and must not be marked verified. GitHub access, provider quota, model access, and automatic continuation remain separate unverified integrations.
+
+For token usage, compare each segment's raw and normalized counters against the saved segment or active attempt meter. Check role totals, hand-off rows, unknown totals with known lower bounds, and current versus peak context. Update the disposable meter and confirm the existing one-second poll refreshes the progress bar. Check desktop and narrow layouts. The projection tests can run without loopback using `--test-name-pattern="segment projection|snapshot reads active" tests/dashboard.test.ts`. Browser assertions and screenshots require loopback and Chrome; projection tests alone do not establish visual acceptance.
+
+Run `tests/supervisor.test.ts` alongside `tests/dashboard.test.ts` to check CLI run/resume supervisor events, exact JSON output formatting, conflict exit code 3, and dashboard process-group pause/resume. Pause must return HTTP 409 for a live unsupervised worker without changing state. Idle pause must report "Paused. Nothing was running." The CLI fixtures stop at awaiting_input and do not invoke a provider.

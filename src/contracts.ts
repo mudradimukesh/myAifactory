@@ -15,6 +15,14 @@ export const headroomSchema = z.object({
     }, 'Headroom must use an explicit loopback port and a /v1 endpoint'),
 }).strict();
 export type Headroom = z.infer<typeof headroomSchema>;
+// handoffContextRatio is optional; callers default to 0.6 of the effective max context where they read it.
+export const limitsSchema = z.object({
+    maxAttempts: z.number().int().min(1).max(100), maxReworks: z.number().int().min(0).max(10),
+    attemptTimeoutMs: z.number().int().positive().max(1800000), maxWallMs: z.number().int().positive(),
+    maxReportedTokens: z.number().int().positive(), verificationReserveAttempts: z.number().int().min(1),
+    maxLogBytes: z.number().int().min(1024).max(100000000), handoffContextRatio: z.number().gt(0).max(0.95).optional(),
+    workerStartTimeoutMs: z.number().int().positive().max(1800000).optional(), workerIdleTimeoutMs: z.number().int().positive().max(1800000).optional(),
+}).strict();
 export const projectSchema = z.object({
     schemaVersion: z.literal(2), name: id, repository: z.string().min(1), base: commit,
     recipient: z.string().min(1), brief: z.string().min(1), policies: z.array(z.string()).min(1),
@@ -24,7 +32,7 @@ export const projectSchema = z.object({
     allowedPaths: z.array(z.string()).min(1),
     runtime: z.object({ kind: z.literal('macos-sandbox'), toolPaths: z.array(z.string().min(1)).min(1), network: z.enum(['none', 'loopback', 'outbound']), authHomes: z.object({ codex: z.string().nullable(), claude: z.string().nullable() }).strict() }).strict(),
     models: z.object({ coordinator: choice, developer: choice, reviewer: choice, inspector: choice }).strict(),
-    limits: z.object({ maxAttempts: z.number().int().min(1).max(100), maxReworks: z.number().int().min(0).max(10), attemptTimeoutMs: z.number().int().positive().max(1800000), maxWallMs: z.number().int().positive(), maxReportedTokens: z.number().int().positive(), verificationReserveAttempts: z.number().int().min(1), maxLogBytes: z.number().int().min(1024).max(100000000) }).strict(),
+    limits: limitsSchema,
     headroom: headroomSchema.optional(),
     billing: z.literal('subscription-only'), retentionDays: z.number().int().min(30),
 }).strict().superRefine((v, c) => {
@@ -77,10 +85,34 @@ const resultSchema = z.object({
     if (Date.parse(v.endedAt) < Date.parse(v.startedAt))
         c.addIssue({ code: 'custom', message: 'Result ends before it starts' });
 });
+export const usageSchema = z.object({ input: count.safe(), cached: count.safe(), output: count.safe() }).strict()
+    .refine(usage => usage.cached <= usage.input, 'Cached input exceeds gross input');
+// Written to attempts/<job>/segment-<n>/meter.json on every poll, and once more with the
+// final numbers when the segment ends. The dashboard reads the same shape the enforcer compares.
+export const meterReadingSchema = z.object({
+    segment: z.number().int().positive(), kind: z.enum(['work', 'handoff']), model: z.string().min(1),
+    raw: z.record(count.safe()).nullable(), usage: usageSchema.nullable(), metered: count.safe().nullable(), spentBefore: count,
+    allowance: z.number().int().positive(), contextTokens: count.nullable(), peakContext: count.nullable(), contextMax: count.nullable(),
+    trigger: count.nullable(), at: timestamp, source: z.enum(['final', 'meter']), providerStartedAt: timestamp.nullable().optional(), lastActivityAt: timestamp.nullable().optional(), reason: z.string().optional(),
+}).strict();
+export type MeterReading = z.infer<typeof meterReadingSchema>;
+export const segmentSchema = z.object({
+    index: z.number().int().positive(), kind: z.enum(['work', 'handoff']), model: z.string().min(1),
+    startedAt: timestamp, endedAt: timestamp.optional(), reason: z.string().optional(),
+    raw: z.record(z.number()).nullable(), input: count.nullable(), cached: count.nullable(), output: count.nullable(),
+    metered: count.nullable(), contextMax: count.nullable(), trigger: count.nullable(), peakContext: count.nullable(),
+    source: z.enum(['final', 'meter']), contextWindowMismatch: z.boolean().optional(), providerStartedAt: timestamp.nullable().optional(), lastActivityAt: timestamp.nullable().optional(),
+}).strict();
+export type Segment = z.infer<typeof segmentSchema>;
+export const handoffSchema = z.object({
+    schemaVersion: z.literal(1), goal: z.string().min(1), done: z.array(z.string()),
+    remaining: z.array(z.string()), evidence: z.array(z.string()), risks: z.array(z.string()),
+}).strict();
 const attemptSchema = z.object({
     id, role, startedAt: timestamp, endedAt: timestamp.optional(), model: choice, candidate: commit,
     status: z.enum(['running', 'completed', 'failed', 'interrupted']), result: resultSchema.optional(),
     inputTokens: count.nullable().optional(), outputTokens: count.nullable().optional(), cachedInputTokens: count.nullable().optional(), handoff: fileRecord.optional(),
+    segments: z.array(segmentSchema).optional(),
 }).strict();
 export const specificationSchema = z.object({
     id, kind: z.enum(['business', 'domain']), title: z.string().min(1), revision: z.number().int().positive(),

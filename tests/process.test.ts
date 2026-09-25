@@ -181,6 +181,31 @@ test('stops a cancelled process and reports an output limit', async () => {
   });
 });
 
+test('a limit signal stops the process quickly with its reason', async () => {
+  await withLogs(async (paths) => {
+    const controller = new AbortController();
+    const pending = runProcess({
+      argv: [process.execPath, '-e', 'setInterval(()=>{},1000)'], cwd: process.cwd(), ...paths,
+      timeoutMs: 30000, maxLogBytes: 4096, limit: controller.signal,
+    });
+    const started = Date.now();
+    setTimeout(() => controller.abort('token_limit'), 50);
+    const result = await pending;
+    assert.equal(result.reason, 'token_limit');
+    assert.ok(Date.now() - started < 5000);
+  });
+});
+
+for (const reason of ['stall_start', 'stall_idle'] as const) test(`a ${reason} signal preserves its reason`, async () => {
+  await withLogs(async (paths) => {
+    const controller = new AbortController();
+    const pending = runProcess({ argv: [process.execPath, '-e', 'setInterval(()=>{},1000)'], cwd: process.cwd(), ...paths,
+      timeoutMs: 30000, maxLogBytes: 4096, limit: controller.signal });
+    setTimeout(() => controller.abort(reason), 25);
+    assert.equal((await pending).reason, reason);
+  });
+});
+
 test('reports spawn failures and retains empty logs', async () => {
   await withLogs(async (paths) => {
     const result = await runProcess({

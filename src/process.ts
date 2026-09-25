@@ -20,6 +20,8 @@ export interface ProcessSpec {
     timeoutMs: number;
     maxLogBytes: number;
     signal?: AbortSignal;
+    /** Aborted with a usage or context reason to stop the process before the timeout. */
+    limit?: AbortSignal;
     redact?: string[];
     pause?: PauseGate;
     /** Awaited before the timeout is armed. A rejection kills the group and yields spawn_error. */
@@ -28,7 +30,8 @@ export interface ProcessSpec {
 export interface ProcessResult {
     exitCode: number | null;
     signal: string | null;
-    reason: 'completed' | 'exit_error' | 'timeout' | 'cancelled' | 'spawn_error' | 'output_limit' | 'capture_error';
+    reason: 'completed' | 'exit_error' | 'timeout' | 'cancelled' | 'spawn_error' | 'output_limit' | 'capture_error'
+        | 'token_limit' | 'context_limit' | 'compacted' | 'stall_start' | 'stall_idle';
     startedAt: string;
     endedAt: string;
     pausedMs: number;
@@ -148,6 +151,11 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                 }, 1000);
             };
             const onAbort = () => stop('cancelled');
+            const limitReasons = new Set<ProcessResult['reason']>(['token_limit', 'context_limit', 'compacted', 'stall_start', 'stall_idle']);
+            const onLimit = () => {
+                const reason = spec.limit?.reason;
+                stop(typeof reason === 'string' && limitReasons.has(reason as ProcessResult['reason']) ? reason as ProcessResult['reason'] : 'token_limit');
+            };
             // The timeout counts running time only. A pause keeps the unused remainder.
             let remaining = spec.timeoutMs;
             let armedAt = 0;
@@ -178,6 +186,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
             };
             cleanup = () => {
                 spec.signal?.removeEventListener('abort', onAbort);
+                spec.limit?.removeEventListener('abort', onLimit);
                 spec.pause?.removeEventListener('pause', freeze);
                 spec.pause?.removeEventListener('resume', thaw);
                 if (pausedAt !== null) {
@@ -249,6 +258,9 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                 spec.signal?.addEventListener('abort', onAbort, { once: true });
                 if (spec.signal?.aborted)
                     onAbort();
+                spec.limit?.addEventListener('abort', onLimit, { once: true });
+                if (spec.limit?.aborted)
+                    onLimit();
             }
             await closed;
             cleanup();

@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile, readdir, lstat, realpath, mkdir, copyFile, chmod, writeFile, access, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, readdir, lstat, realpath, mkdir, copyFile, cp, chmod, writeFile, access, mkdtemp, rm } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir, release } from 'node:os';
 import path from 'node:path';
@@ -14,6 +14,7 @@ import { durable, exists, json, sha } from './store.ts';
 const exec = promisify(execFile);
 const sandbox = '/usr/bin/sandbox-exec';
 const systemRoots = ['/usr/bin', '/usr/sbin', '/usr/lib', '/usr/share', '/bin', '/sbin', '/System/Library', '/System/Cryptexes', '/System/Volumes/Preboot/Cryptexes', '/Library/Apple', '/Library/Developer', '/private/etc', '/private/var/db/dyld', '/private/var/db/timezone'];
+export const workerHome = (scratch: string) => path.join(scratch, 'home');
 const contains = (root: string, value: string) => root === path.sep || value === root || value.startsWith(root + path.sep);
 const overlaps = (a: string, b: string) => contains(a, b) || contains(b, a);
 
@@ -25,6 +26,7 @@ export interface Job {
     outputDir: string;
     captureDir: string;
     scratchDir: string;
+    resumeHome?: string;
     argv: string[];
     stdin?: string;
     env?: Record<string, string>;
@@ -35,6 +37,7 @@ export interface Job {
     timeoutMs: number;
     maxLogBytes: number;
     signal: AbortSignal;
+    limit?: ProcessSpec['limit'];
     pause?: ProcessSpec['pause'];
     onSpawn?: ProcessSpec['onSpawn'];
 }
@@ -140,7 +143,7 @@ export class LocalRuntime {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || /^(HOME|TMPDIR|CLAUDE_CODE_TMPDIR|PATH|CODEX_HOME|CLAUDE_CONFIG_DIR|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)$/.test(key) || value.includes('\0'))
                 throw Error(`Reserved or invalid worker environment variable: ${key}`);
         }
-        const home = path.join(scratchDir, 'home');
+        const home = workerHome(scratchDir);
         await mkdir(home, { mode: 0o700 });
         let credential: { source: string; copy: string; digest: string } | undefined;
         if (job.provider) {
@@ -155,6 +158,18 @@ export class LocalRuntime {
             await copyFile(path.join(authRoot, name), path.join(target, name), constants.COPYFILE_EXCL);
             await chmod(path.join(target, name), 0o600);
             credential = { source: path.join(authRoot, name), copy: path.join(target, name), digest: sha(await readFile(path.join(authRoot, name))) };
+            if (job.resumeHome) {
+                const previous = await directory(job.resumeHome);
+                const sessions = job.provider === 'codex' ? 'sessions' : 'projects';
+                const sourceSessions = await directory(path.join(previous, `.${job.provider}`, sessions));
+                if (!contains(previous, sourceSessions) || roots.some(root => overlaps(root, previous)))
+                    throw Error('Resume home must be separate from the current job directories');
+                await cp(sourceSessions, path.join(target, sessions), { recursive: true, dereference: false,
+                    filter: async source => {
+                        if ((await lstat(source)).isSymbolicLink()) throw Error('Resume sessions must not contain symlinks');
+                        return true;
+                    } });
+            }
         }
         const temp = await mkdtemp('/private/tmp/factory-');
         try {
@@ -165,7 +180,7 @@ export class LocalRuntime {
                 argv: command, cwd: workspace, stdin: job.stdin,
                 env: { ...job.env, PATH: search.join(path.delimiter), HOME: home, TMPDIR: temp, CLAUDE_CODE_TMPDIR: temp, CODEX_HOME: path.join(home, '.codex'), CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
                 stdoutPath: path.join(captureDir, 'stdout.log'), stderrPath: path.join(captureDir, 'stderr.log'),
-                timeoutMs: job.timeoutMs, maxLogBytes: job.maxLogBytes, signal: job.signal, redact: job.redact, pause: job.pause, onSpawn: job.onSpawn,
+                timeoutMs: job.timeoutMs, maxLogBytes: job.maxLogBytes, signal: job.signal, limit: job.limit, redact: job.redact, pause: job.pause, onSpawn: job.onSpawn,
             });
         } finally {
             await rm(temp, { recursive: true, force: true });

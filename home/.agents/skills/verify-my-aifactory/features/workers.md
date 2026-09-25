@@ -1,5 +1,7 @@
 # Worker contracts
 
+Worker supervision records provider start and last activity independently of token usage. Codex start is `thread.started`; Claude start is `system/init`. Missing start and 600-second idle expiry use `stall_start` and `stall_idle`.
+
 A coordinator constructs a native worker invocation and interprets its structured output without treating malformed or incomplete output as success.
 
 ## Sub-features

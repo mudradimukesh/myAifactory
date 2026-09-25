@@ -7,6 +7,106 @@ import { request } from 'node:http';
 import { createDashboardServer } from '../src/dashboard-server.ts';
 import type { State } from '../src/contracts.ts';
 import { Store, sha } from '../src/store.ts';
+import { Dashboard, projectRun } from '../src/dashboard.ts';
+import { meterReadingSchema, type Segment } from '../src/contracts.ts';
+import { identify } from '../src/process.ts';
+
+test('segment projection preserves counters and sums role and run usage', () => {
+  const state = runState();
+  delete state.activeJob;
+  const segment: Segment = { index: 1, kind: 'work', model: 'gpt-6-sol', startedAt: state.createdAt,
+    endedAt: state.createdAt, reason: 'completed', raw: { input_tokens: 100, output_tokens: 20 },
+    input: 100, cached: 0, output: 20, metered: 120, contextMax: 258400, trigger: 155040,
+    peakContext: 120, source: 'final' };
+  const attempt = state.attempts[0]!;
+  attempt.status = 'completed'; attempt.inputTokens = 300; attempt.outputTokens = 60;
+  attempt.segments = [segment, { ...segment, index: 2, kind: 'handoff' }, { ...segment, index: 3 }];
+  state.attempts.push({ ...attempt, id: 'review-one', role: 'reviewer', segments: [{ ...segment, contextWindowMismatch: true }] });
+  state.reportedTokens = 480;
+  const view = projectRun(state);
+  for (const group of view.usageByRole) {
+    const source = state.attempts.find(a => a.role === group.role)!;
+    assert.deepEqual(group.agents.map(({ raw, input, cached, output, metered }) => ({ raw, input, cached, output, metered })),
+      source.segments!.map(({ raw, input, cached, output, metered }) => ({ raw, input, cached, output, metered })));
+    assert.equal(group.total.metered, group.agents.reduce((sum, row) => sum + row.metered!, 0));
+    for (const key of ['input', 'cached', 'output'] as const)
+      assert.equal(group.total[key], group.agents.reduce((sum, row) => sum + row[key]!, 0));
+    assert.deepEqual(group.total.raw, { input_tokens: group.agents.length * 100, output_tokens: group.agents.length * 20 });
+  }
+  assert.equal(view.usageTotal.metered, state.reportedTokens);
+  assert.ok(view.issues.some(issue => issue.code === 'context_window_mismatch'));
+  attempt.segments.push({ ...segment, index: 4, raw: null, input: null, cached: null, output: null, metered: null });
+  const unknown = projectRun(state).usageByRole[0]!;
+  assert.equal(unknown.total.metered, null);
+  assert.equal(unknown.lowerBound.metered, 360);
+});
+
+test('live usage and context do not show provider-start waiting text', () => {
+  const state = runState();
+  state.activeJob = { id: 'attempt-1', runtime: 'macos-sandbox', kind: 'architect', startedAt: state.createdAt };
+  state.attempts[0].id = 'attempt-1';
+  const reading = meterReadingSchema.parse({ segment: 1, kind: 'work', model: 'gpt-6-sol', raw: { input_tokens: 10 }, usage: { input: 10, cached: 0, output: 2 }, metered: 12,
+    spentBefore: 0, allowance: 100, contextTokens: 50, peakContext: 50, contextMax: 100, trigger: 60, at: state.createdAt, source: 'meter', providerStartedAt: null, lastActivityAt: state.createdAt });
+  const row = projectRun(state, undefined, value => value, undefined, [reading]).usageByRole[0].agents[0];
+  assert.equal(row.providerStartedAt, null);
+  assert.equal(row.input, 10);
+  assert.equal(row.context?.contextTokens, 50);
+  assert.equal(row.live, true);
+});
+
+test('context recommendation uses live occupancy instead of cumulative input', () => {
+  const state = runState();
+  state.activeJob!.id = state.attempts[0]!.id;
+  state.attempts[0]!.inputTokens = 4148633;
+  const meter = meterReadingSchema.parse({ segment: 1, kind: 'work', model: 'gpt-6-sol', raw: null,
+    usage: null, metered: null, spentBefore: 0, allowance: 10000000, contextTokens: 122449,
+    peakContext: 122449, contextMax: 258400, trigger: 155040, at: state.createdAt, source: 'meter' });
+  const warning = (meters: typeof meter[]) => projectRun(state, undefined, undefined, undefined, meters)
+    .issues.find(issue => issue.code === 'reported_input_threshold');
+  assert.equal(warning([meter]), undefined);
+  const reached = warning([{ ...meter, contextTokens: 155040 }]);
+  assert.ok(reached);
+  assert.match(reached.message, /155040.*155040/);
+  assert.doesNotMatch(reached.recommendation, /occupancy is unknown/);
+  assert.match(warning([])!.recommendation, /occupancy is unknown/);
+  assert.match(warning([{ ...meter, contextTokens: null }])!.recommendation, /occupancy is unknown/);
+});
+
+test('snapshot reads active segment meters with current context and preserves unknown usage', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-meter-')); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  state.activeJob!.id = state.attempts[0]!.id; state.activeJob!.kind = 'developer';
+  state.attempts[0]!.status = 'running';
+  await dashboard.store.create(state);
+  const dir = path.join(dashboard.store.dir(state.id), 'attempts', state.activeJob!.id);
+  const meter = meterReadingSchema.parse({ segment: 1, kind: 'work', model: 'gpt-6-sol', raw: { input_tokens: 100 },
+    usage: { input: 100, cached: 50, output: 10 }, metered: 65, spentBefore: 0, allowance: 10000,
+    contextTokens: 80, peakContext: 90, contextMax: 258400, trigger: 155040, at: state.createdAt, source: 'meter' });
+  for (const index of [1, 2]) {
+    await mkdir(path.join(dir, `segment-${index}`), { recursive: true });
+    await writeFile(path.join(dir, `segment-${index}`, 'meter.json'), JSON.stringify({ ...meter, segment: index }));
+  }
+  const view = (await dashboard.snapshot()).runs[0]!;
+  const rows = view.usageByRole[0]!.agents;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.live, false);
+  assert.equal(rows[1]!.live, true);
+  assert.deepEqual(rows[1]!.raw, meter.raw);
+  assert.equal(rows[1]!.metered, meter.metered);
+  assert.deepEqual(rows[1]!.context, { contextMax: meter.contextMax, trigger: meter.trigger,
+    contextTokens: meter.contextTokens, peakContext: meter.peakContext, progress: 80 / 155040 });
+  await writeFile(path.join(dir, 'segment-2', 'meter.json'), JSON.stringify({ ...meter, segment: 2, raw: null, usage: null, metered: null }));
+  assert.equal((await dashboard.snapshot()).runs[0]!.usageByRole[0]!.total.metered, null);
+  await writeFile(path.join(dir, 'segment-2', 'meter.json'), JSON.stringify({ ...meter, segment: 2, usage: { input: -1, cached: 0, output: 0 } }));
+  const corrupt = await dashboard.snapshot();
+  assert.equal(corrupt.runs.length, 0);
+  assert.ok(corrupt.issues.some(issue => issue.code === 'run_corrupt'));
+  await dashboard.store.update(state.id, 'check_started', {}, s => { s.activeJob!.kind = 'check'; });
+  const check = (await dashboard.snapshot()).runs[0]!;
+  assert.equal(check.usageByRole[0]!.agents.some(row => row.live), false);
+  await dashboard.store.update(state.id, 'job_finished', {}, s => { delete s.activeJob; });
+  assert.equal((await dashboard.snapshot()).runs.length, 1);
+});
 
 const roots: string[] = [];
 after(async () => { await Promise.all(roots.map(root => rm(root, { recursive: true, force: true }))); });
@@ -141,6 +241,35 @@ async function session(base: string) {
   });
 }
 
+test('pause refuses a live unsupervised job without changing state', async () => {
+  const app = await openDashboard();
+  try {
+    const store = new Store(app.root), state = runState();
+    const self = await identify(process.pid);
+    assert.ok(self);
+    state.activeJob!.process = self;
+    await store.create(state);
+    const post = await session(app.base);
+    const response = await post('/api/runs/run-one/control', { action: 'pause' });
+    assert.equal(response.status, 409);
+    const body = await response.json();
+    assert.equal(body.code, 'factory_conflict');
+    assert.equal(body.message, 'A worker started outside the dashboard is running. Pause cannot freeze it. Use Stop.');
+    assert.deepEqual(await store.read(state.id), state);
+  } finally { await app.close(); }
+});
+
+test('idle pause says nothing was running', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-idle-pause-')); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  state.activeJob = undefined;
+  await dashboard.store.create(state);
+  const result = await dashboard.control(state.id, { action: 'pause' });
+  assert.equal(result.changed, true);
+  assert.equal(result.message, 'Paused. Nothing was running.');
+  assert.equal((await dashboard.store.read(state.id)).control, 'suspend');
+});
+
 test('control takes the start, pause and stop body and projects a factory view', async () => {
   const app = await openDashboard();
   try {
@@ -158,6 +287,7 @@ test('control takes the start, pause and stop body and projects a factory view',
     assert.equal(paused.status, 200);
     const pausedBody = await paused.json();
     assert.equal(pausedBody.changed, true);
+    assert.equal(pausedBody.message, 'Paused. Nothing was running.');
     assert.equal(pausedBody.factory.state, 'idle');
     assert.equal(pausedBody.factory.startLabel, 'Resume');
     assert.equal(pausedBody.factory.canPause, false);

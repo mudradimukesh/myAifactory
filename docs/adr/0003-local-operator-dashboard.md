@@ -10,9 +10,11 @@ Two independent design candidates compared this direct adapter with a durable co
 
 We accept polling in exchange for using validated snapshots without another telemetry service. We accept local private-file secret storage in exchange for avoiding a second credential service. Credentials are not returned to the browser or included in recovery packets. Application keys remain separate from subscription worker credentials.
 
-Budget settings apply to future configuration. Existing runs retain their original limits. Recovery briefs preserve spent allowances and candidate identity. Automatic context replacement and model escalation remain explicit gaps. GitHub issue synchronization is an explicit operator action.
+Budget settings apply to future configuration. Existing runs retain their original limits. Recovery briefs preserve spent allowances and candidate identity. Context hand-offs retain the attempt's remaining allowance; model escalation remains an explicit gap. GitHub issue synchronization is an explicit operator action.
 
-The dashboard now starts one supervisor for the selected run. Pause suspends its worker group and prevents new work. Stop cancels the run and waits for owned processes to terminate. A persisted process record includes its PID, process group, and start time. Controls compare that identity with the live process before signalling it. Unconfirmed survivors remain visible and keep their ownership records for recovery.
+The dashboard and CLI run and resume commands use the same supervisor. Dashboard Pause suspends its worker group and prevents new work, including when the CLI started the supervisor. Pause refuses a live worker without a live supervisor and directs the operator to Stop. An idle pause records that nothing was running. Stop cancels the run and waits for owned processes to terminate. A persisted process record includes its PID, process group, and start time. Controls compare that identity with the live process before signalling it. Unconfirmed survivors remain visible and keep their ownership records for recovery.
+
+The usage view groups work and hand-off segments by role and shows the provider's raw fields alongside metered budget counts. Role and run totals use those segment records and preserve unknown usage with known lower bounds. During execution, the view reads the same meter files used for enforcement and shows the model, context window, hand-off trigger, current context and peak context. The existing poll refreshes those readings once per second while the run is active.
 
 
 ## Approved records and operator answers

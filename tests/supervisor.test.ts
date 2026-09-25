@@ -13,6 +13,7 @@ import { identify, terminateOwned } from '../src/process.ts';
 import { move } from '../src/store.ts';
 
 const fixtureScript = path.resolve(import.meta.dirname, 'fixtures', 'supervisor-fixture.ts');
+const cliScript = path.resolve(import.meta.dirname, '../src/factory-cli.ts');
 const exec = promisify(execFile);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const model = { provider: 'codex' as const, model: 'fixture-model', effort: 'low' as const };
@@ -92,6 +93,38 @@ async function fixture(t: test.TestContext) {
   };
   return { dashboard, created, read, view, job, supervisor, supervisorPids: () => supervisorPids(dashboard.store.root, 'run') };
 }
+
+for (const command of ['run', 'resume']) test(`CLI ${command} records supervisor lifetime and preserves its JSON output`, async t => {
+  const f = await fixture(t);
+  await f.dashboard.store.transition('run', 'awaiting_input', 'Fixture needs operator input');
+  const { stdout, stderr } = await exec(process.execPath, [cliScript, command, f.dashboard.store.root, 'run'], { timeout: 15000 });
+  const state = await f.read();
+  const events = state.history.filter(event => event.type.startsWith('supervisor_'));
+  assert.deepEqual(events.map(event => event.type), ['supervisor_started', 'supervisor_exited']);
+  assert.equal(state.supervisor, undefined);
+  assert.equal(stderr, '');
+  assert.equal(stdout, JSON.stringify({ run: state.id, status: state.status, revision: state.revision - 1,
+    attempts: state.attempts.length, candidate: state.candidate ?? null,
+    reportedTokens: state.reportedTokens, unknownUsage: state.unknownUsage, reason: state.reason ?? null }) + '\n');
+});
+
+for (const command of ['run', 'resume', 'supervise']) test(`CLI ${command} reports supervisor conflicts with exit 3`, async t => {
+  const f = await fixture(t);
+  const self = await identify(process.pid);
+  assert.ok(self);
+  await f.dashboard.store.update('run', 'fixture_supervisor', {}, state => {
+    state.supervisor = { launchId: 'fixture', process: self, launchedAt: state.createdAt };
+  });
+  const before = await f.read();
+  await assert.rejects(exec(process.execPath, [cliScript, command, f.dashboard.store.root, 'run', 'fixture-conflict'], { timeout: 15000 }), error => {
+    assert.ok(error instanceof Error && 'code' in error && 'stdout' in error && 'stderr' in error);
+    assert.equal(error.code, 3);
+    assert.equal(error.stdout, '');
+    assert.equal(error.stderr, `Supervisor ${self.pid} already runs run\n`);
+    return true;
+  });
+  assert.deepEqual(await f.read(), before);
+});
 
 test('the dashboard starts, pauses, resumes and stops one supervised run', async t => {
   const f = await fixture(t);

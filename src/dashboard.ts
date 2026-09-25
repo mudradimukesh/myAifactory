@@ -1,12 +1,12 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, rename, open, chmod, lstat } from 'node:fs/promises';
+import { mkdir, rename, open, chmod, lstat, readdir, readFile } from 'node:fs/promises';
 import { constants, mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { choice, id, ticketProgress } from './contracts.ts';
-import type { OwnedProcess, State } from './contracts.ts';
+import { choice, id, ticketProgress, meterReadingSchema } from './contracts.ts';
+import type { OwnedProcess, State, Segment, MeterReading } from './contracts.ts';
 import { groupAlive, groupMembers, isOwnedAlive, terminateOwned } from './process.ts';
 import { Store, move } from './store.ts';
 import { validateAuthHome } from './runtime.ts';
@@ -112,11 +112,54 @@ function issue(code: string, message: string, recommendation: string, runId?: st
   return { code, severity: 'warning', message, recommendation, ...(runId ? { runId } : {}) };
 }
 
-const knownReasons = new Set(['completed', 'cancelled', 'timeout', 'output_limit', 'capture_error', 'spawn_error', 'exit_error', 'failed']);
+const knownReasons = new Set(['completed', 'cancelled', 'timeout', 'output_limit', 'capture_error', 'spawn_error', 'exit_error', 'failed',
+    'token_limit', 'context_limit', 'compacted', 'handoff_failed', 'stall_start', 'stall_idle']);
 function safeReason(value: string | undefined) { return value && knownReasons.has(value) ? value : value ? 'recorded_failure' : null; }
 function safeEvent(value: string) { return /^[a-z][a-z0-9_]{0,40}$/.test(value) ? value : 'recorded_event'; }
-export function projectRun(state: State, settings: Settings = defaultSettings, redact: (value: string) => string = value => value, factory?: FactoryView) {
-  const unknownUsage = state.unknownUsage || state.attempts.some(attempt => attempt.inputTokens == null || attempt.outputTokens == null);
+type UsageRow = Pick<Segment, 'kind' | 'model' | 'raw' | 'input' | 'cached' | 'output' | 'metered'> & {
+  attemptId: string; segment: number | null; status: string; reason: string | null; live: boolean;
+  context?: Pick<MeterReading, 'contextMax' | 'trigger' | 'contextTokens' | 'peakContext'> & { progress: number | null };
+  providerStartedAt?: string | null; lastActivityAt?: string | null;
+};
+function usageSum(rows: UsageRow[]) {
+  const raw: Record<string, number> = {};
+  const lowerBound = { raw, input: 0, cached: 0, output: 0, metered: 0 };
+  for (const row of rows) {
+    for (const key of ['input', 'cached', 'output', 'metered'] as const) lowerBound[key] += row[key] ?? 0;
+    for (const [key, value] of Object.entries(row.raw ?? {})) lowerBound.raw[key] = (lowerBound.raw[key] ?? 0) + value;
+  }
+  return { lowerBound, total: { raw: rows.some(row => row.raw === null) ? null : lowerBound.raw,
+    input: rows.some(row => row.input === null) ? null : lowerBound.input,
+    cached: rows.some(row => row.cached === null) ? null : lowerBound.cached,
+    output: rows.some(row => row.output === null) ? null : lowerBound.output,
+    metered: rows.some(row => row.metered === null) ? null : lowerBound.metered } };
+}
+export function projectRun(state: State, settings: Settings = defaultSettings, redact: (value: string) => string = value => value, factory?: FactoryView, meters: MeterReading[] = []) {
+  const groups = new Map<State['attempts'][number]['role'], UsageRow[]>();
+  for (const attempt of state.attempts) {
+    const rows: UsageRow[] = (attempt.segments ?? []).map(segment => ({ attemptId: attempt.id, segment: segment.index,
+      kind: segment.kind, model: redact(segment.model), status: segment.endedAt ? (segment.reason === 'completed' ? 'completed' : 'failed') : attempt.status,
+      reason: safeReason(segment.reason), raw: segment.raw, input: segment.input, cached: segment.cached,
+      output: segment.output, metered: segment.metered, live: false, providerStartedAt: segment.providerStartedAt ?? null, lastActivityAt: segment.lastActivityAt ?? null }));
+    if (attempt.id === state.activeJob?.id) for (const meter of meters) {
+      if (rows.some(row => row.segment === meter.segment)) continue;
+      const stalled = meter.reason === 'stall_start' || meter.reason === 'stall_idle';
+      const live = meter === meters.at(-1) && !stalled;
+      rows.push({ attemptId: attempt.id, segment: meter.segment, kind: meter.kind, model: redact(meter.model),
+        status: live ? 'running' : stalled ? 'failed' : 'completed', reason: safeReason(meter.reason), raw: meter.raw,
+        input: meter.usage?.input ?? null, cached: meter.usage?.cached ?? null, output: meter.usage?.output ?? null,
+        metered: meter.metered, live, providerStartedAt: meter.providerStartedAt ?? null, lastActivityAt: meter.lastActivityAt ?? null, ...(live ? { context: { contextMax: meter.contextMax, trigger: meter.trigger,
+          contextTokens: meter.contextTokens, peakContext: meter.peakContext,
+          progress: meter.contextTokens !== null && meter.trigger !== null && meter.trigger > 0 ? meter.contextTokens / meter.trigger : null } } : {}) });
+    }
+    if (!rows.length) rows.push({ attemptId: attempt.id, segment: null, kind: 'work', model: redact(attempt.model.model),
+      status: attempt.status, reason: safeReason(attempt.result?.reason), raw: null, input: attempt.inputTokens ?? null,
+      cached: attempt.cachedInputTokens ?? null, output: attempt.outputTokens ?? null, metered: null, live: false });
+    groups.set(attempt.role, [...(groups.get(attempt.role) ?? []), ...rows]);
+  }
+  const usageByRole = [...groups].map(([role, agents]) => ({ role, agents, ...usageSum(agents) }));
+  const runUsage = usageSum(usageByRole.flatMap(group => group.agents));
+  const unknownUsage = state.unknownUsage || runUsage.total.metered === null;
   const attempts = state.attempts.map(attempt => ({
     id: attempt.id, role: attempt.role, model: { ...attempt.model, model: redact(attempt.model.model) },
     status: attempt.status, startedAt: attempt.startedAt,
@@ -125,8 +168,14 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
     cachedInputTokens: attempt.cachedInputTokens ?? null, reason: safeReason(attempt.result?.reason),
   }));
   const issues: Issue[] = [];
+  if (state.attempts.some(attempt => attempt.segments?.some(segment => segment.contextWindowMismatch)))
+    issues.push(issue('context_window_mismatch', 'A provider reported a different context window than configured.', 'Review the model context configuration before further work.', state.id));
   if (unknownUsage)
     issues.push(issue('usage_unknown', 'Some worker token use is unknown.', 'Review usage evidence before dispatching another attempt.', state.id));
+  for (const attempt of state.attempts) for (const segment of attempt.segments ?? []) if (segment.reason === 'stall_start' || segment.reason === 'stall_idle')
+    issues.push(issue(segment.reason, `Worker stopped with ${segment.reason} on attempt ${attempt.id}, segment ${segment.index}.`, segment.reason === 'stall_idle'
+      ? 'Inspect the last provider/tool event and capture. Resolve the blockage, reconcile usage, or raise workerIdleTimeoutMs in the run profile if the command is expected to run longer.'
+      : 'Inspect capture, Headroom reachability and provider startup configuration, then reconcile unknown usage before a bounded retry.', state.id));
   const supervised = factory !== undefined && ['running', 'pausing', 'paused', 'resuming'].includes(factory.state);
   if (state.activeJob && !supervised) issues.push(issue('job_unconfirmed', 'A job is recorded as active; live process health is unavailable.', 'Inspect captured evidence and reconcile the job before retrying.', state.id));
   if (state.activeJob && Date.now() - Date.parse(state.activeJob.startedAt) > state.project.limits.attemptTimeoutMs)
@@ -143,7 +192,11 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
     issues.push(issue('verification_reserve', 'The remaining attempt allowance is reserved for verification.', 'Review failed attempts before allocating more implementation work.', state.id));
   if (state.attempts.filter(attempt => attempt.status === 'failed').length >= settings.recovery.maxFailures)
     issues.push(issue('repeated_failures', 'Repeated attempts failed.', 'Review the recovery brief, then consider a smaller task or a different configured model.', state.id));
-  if (state.attempts.some(attempt => (attempt.inputTokens ?? 0) >= settings.recovery.contextTokenThreshold))
+  const liveContext = usageByRole.flatMap(group => group.agents).find(agent => agent.live)?.context;
+  if (liveContext?.contextTokens != null && liveContext.trigger != null) {
+    if (liveContext.contextTokens >= liveContext.trigger)
+      issues.push(issue('reported_input_threshold', `Current context ${liveContext.contextTokens} has reached the hand-off trigger ${liveContext.trigger}.`, 'Review the running segment and its hand-off progress.', state.id));
+  } else if (state.attempts.some(attempt => (attempt.inputTokens ?? 0) >= settings.recovery.contextTokenThreshold))
     issues.push(issue('reported_input_threshold', 'An attempt reported input tokens above the configured threshold.', 'Review the attempt handoff before a new context. Current context occupancy is unknown.', state.id));
   if (state.status === 'awaiting_input') {
     const answered = Boolean(state.questionBatches?.length) && state.questionBatches?.every(batch => batch.answer);
@@ -157,6 +210,7 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
     repository: redact(state.project.repository), brief: redact(state.project.brief),
     coordinator: { ...state.project.models.coordinator, model: redact(state.project.models.coordinator.model) },
     reportedTokens: state.reportedTokens, unknownUsage, elapsedMs: state.elapsedMs,
+    usageByRole, usageTotal: runUsage.total, usageLowerBound: runUsage.lowerBound,
     limits: { maxReportedTokens: state.project.limits.maxReportedTokens, maxAttempts: state.project.limits.maxAttempts,
       verificationReserveAttempts: state.project.limits.verificationReserveAttempts, maxWallMs: state.project.limits.maxWallMs,
       attemptTimeoutMs: state.project.limits.attemptTimeoutMs },
@@ -250,7 +304,25 @@ export class Dashboard {
     const runs = [];
     const issues: Issue[] = [];
     for (const run of ids) {
-      try { const state = await this.store.read(run); runs.push(projectRun(state, settings, redact, await factoryView(state, redact))); }
+      try {
+        const state = await this.store.read(run);
+        const meters: MeterReading[] = [];
+        if (state.activeJob && state.activeJob.kind !== 'check') {
+          const root = path.join(this.store.dir(run), 'attempts', state.activeJob.id);
+          let directories: string[] = [];
+          try { directories = (await readdir(root, { withFileTypes: true })).filter(entry => entry.isDirectory() && /^segment-[1-9][0-9]*$/.test(entry.name)).map(entry => entry.name); }
+          catch (error) { if (!isMissing(error)) throw error; }
+          directories.sort((a, b) => Number(a.slice(8)) - Number(b.slice(8)));
+          for (const directory of directories) {
+            try {
+              const meter = meterReadingSchema.parse(JSON.parse(await readFile(path.join(root, directory, 'meter.json'), 'utf8')));
+              if (meter.segment !== Number(directory.slice(8))) throw Error('Meter segment does not match directory');
+              meters.push(meter);
+            } catch (error) { if (!isMissing(error)) throw error; }
+          }
+        }
+        runs.push(projectRun(state, settings, redact, await factoryView(state, redact), meters));
+      }
       catch { issues.push({ code: 'run_corrupt', severity: 'error', message: `Run ${run} cannot be read safely.`, recommendation: 'Inspect state and event records; do not dispatch or overwrite this run.', runId: run }); }
     }
     runs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -375,14 +447,20 @@ export class Dashboard {
     const done = async (changed: boolean, message: string) => ({ factory: await factoryView(await this.store.read(run)), changed, message });
     if (input.action === 'pause') {
       let changed = false;
+      let supervised = false;
       const state = await this.store.read(run);
       if (!terminal(state.status) && !state.control)
-        await this.store.update(run, 'factory_pause_requested', {}, current => {
+        await this.store.update(run, 'factory_pause_requested', {}, async current => {
           if (terminal(current.status) || current.control) return;
+          supervised = current.supervisor !== undefined && await isOwnedAlive(current.supervisor.process);
+          if (!supervised && current.activeJob?.process && await isOwnedAlive(current.activeJob.process))
+            throw new FactoryConflict('A worker started outside the dashboard is running. Pause cannot freeze it. Use Stop.');
           current.control = 'suspend';
           changed = true;
         });
-      return done(changed, changed ? 'Pause requested. The supervisor freezes running workers and starts no new work.' : 'The factory is already paused, stopping, or finished.');
+      return done(changed, changed ? supervised
+        ? 'Pause requested. The supervisor freezes running workers and starts no new work.'
+        : 'Paused. Nothing was running.' : 'The factory is already paused, stopping, or finished.');
     }
     const launchLock = <T>(fn: () => Promise<T>) => this.store.lock(`launch-${run}`, fn).catch((error: unknown) => {
       if (error instanceof Error && 'code' in error && error.code === 'ELOCKED' && 'file' in error && path.basename(String(error.file)) === `launch-${run}`) throw new FactoryConflict('Another start or stop for this run is in progress.');

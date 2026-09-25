@@ -136,6 +136,19 @@ a.button { text-decoration: none; }
 .badge.paused, .badge.exited { border-color: #eee4ce; background: #fbf7ed; color: #95723a; }
 .badge.starting, .badge.pausing, .badge.resuming { border-color: #d7e3f2; background: #eef4fc; color: #476a95; }
 .badge.stopping { border-color: #f0d8d2; background: #fbf1ee; color: #a55548; }
+.token-panel { margin-top: 20px; min-width: 0; }
+.token-row { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(0, 2fr) 200px; gap: 12px 24px; padding: 14px 10px; border-bottom: 1px solid #e9efec; font-size: 12px; }
+.token-total { background: #eef4f0; border-radius: 6px; margin-top: 12px; }
+.token-summary { display: flex; flex-wrap: nowrap; align-content: start; gap: 4px 8px; }
+.token-summary > span { white-space: nowrap; }
+.token-agent { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; overflow-wrap: anywhere; }
+.token-fields { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.token-field { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 10px; }
+.token-field dd { margin: 0; font-variant-numeric: tabular-nums; }
+.token-metered { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.token-context { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 7px; }
+.token-progress { width: 100%; height: 10px; accent-color: #39715b; }
+@media (max-width: 600px) { .token-row { grid-template-columns: minmax(0, 1fr); gap: 10px; } .token-summary { flex-wrap: wrap; } .token-metered { white-space: normal; } }
 .history-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px; }
 .history-column h3 { margin: 0 0 8px; color: #657570; font-size: 10px; font-weight: 700; }
 .history-item { display: flex; min-width: 0; align-items: flex-start; gap: 8px; padding: 8px 0; border-top: 1px solid #edf1ef; }

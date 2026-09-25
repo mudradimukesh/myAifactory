@@ -1,5 +1,17 @@
 # Factory review status
 
+## CLI supervision and pause, 2026-09-25
+
+Steps 14 and 15 use one CLI supervision path for run, resume and supervise, reject dashboard Pause for live unsupervised workers, and update the budget copy and ADRs. The supervisor, dashboard and coordinator suites pass 65 tests on Node 24.19.0 with zero failures or skips. New tests first reproduced missing supervisor events, conflict exit code 1, false pause success and misleading idle copy. TypeScript, JavaScript syntax, bundle loading and diff whitespace checks pass.
+
+The CLI tests use disposable awaiting_input runs without provider calls. Existing process fixtures verify freezing, resuming and cleanup. These results do not establish live subscription pause behavior, provider connections surviving a long pause, or application acceptance. Full-suite verification remains with the orchestrator.
+
+## Token dashboard steps 12 and 13, 2026-09-25
+
+Two focused projection tests pass on Node 24.19.0. They cover saved segment equality, role and run totals, live sidecar context, nullable usage, schema rejection, and exclusion of check jobs and inactive sidecars. TypeScript, browser JavaScript syntax, and diff whitespace checks pass. The full dashboard test invocation crashed at Node's `InternalCallbackScope::Close` assertion after these two tests passed; its remaining HTTP tests were not verified in this sandbox.
+
+The token panel and Playwright assertions are implemented. The screenshot script at `/tmp/factory-fp-0925/swarm/budget/ui/shoot.mjs` was blocked by `listen EPERM` on loopback before Chrome launched. Desktop, narrow layout, and one-second browser refresh remain unverified until the orchestrator runs that script outside the sandbox. No subscription calls or application acceptance were exercised.
+
 Reviewed on 2026-09-23. The factory remains incomplete and is not approved for operational use.
 
 ## Confirmed fixes
@@ -88,6 +100,10 @@ Historical evidence is limited to the supplied handoff, design, and subscription
 
 
 ## Factory controls, 2026-09-25
+
+[LOCAL-VERIFIED] Worker stall protection records `stall_start` and `stall_idle`, ends stdin on every process path, and exposes provider activity timestamps and recovery recommendations in the dashboard. Focused worker, coordinator, dashboard and type checks cover the local implementation.
+
+[HUMAN-CHECK H2/H3] Live provider startup and resume event behavior remains unverified. Native process-group and browser stall rendering require the orchestrator's host checks. A 600-second idle default is profile-overridable; no live provider call was made here.
 
 [LOCAL-VERIFIED] The integrated suite passes 111 tests with no failures or skips, and TypeScript checking passes. Real subprocess tests cover pause, resume, cancellation, duplicate starts, supervisor loss, orphaned children, and terminal-run cleanup. Failed cleanup retains ownership records and the reservation. Successful cleanup releases the reservation without changing a failed run into a successful one. Legacy profiles without Headroom are refused before a Codex attempt or execution-state transition. All seven worker roles load unslop, bro, guard-the-context-window, and never-block-on-the-human.
 

@@ -7,6 +7,7 @@ A coordinator launches a bounded process and keeps captured evidence. `LocalRunt
 - Direct argv execution excludes inherited secrets; logs persist and redact split credentials.
 - Timeout, cancellation, failure and normal completion clean up the supervised process group.
 - Output limits bound runner-captured evidence.
+- Worker stdin always reaches EOF, and provider startup or idle stalls stop the owned group with a distinct reason.
 - Canonical workspace, policy, proposal, capture and scratch directories are disjoint.
 - Reviewer source and policy are read-only; proposals and scratch are writable; runner capture is inaccessible.
 - A fresh HOME receives only the validated dedicated credential file in its provider home, allowing attempt-local refresh.

@@ -1,0 +1,1 @@
+{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":10,"cache_creation_input_tokens":34058,"cache_read_input_tokens":95575,"output_tokens":4730},"modelUsage":{"claude-sonnet-5":{"inputTokens":10,"cacheCreationInputTokens":34058,"cacheReadInputTokens":95575,"outputTokens":4730,"contextWindow":200000}}}

@@ -248,7 +248,7 @@ import { openClaudeLogin } from './claude-login.js';
     append(metrics,
       metric('Tracked runs', number(runs.length), 'Saved run records', '◫'),
       metric('Recorded attempts', number(totalAttempts), 'Across all saved runs', '↗'),
-      metric('Reported tokens', number(tokens), 'Provider-reported totals', '◈'),
+      metric('Reported tokens', number(tokens), 'Metered: uncached input + output + cache reads at 1/10', '◈'),
       metric('Open recommendations', number(issues.length), issues.length ? 'Review the suggested next steps' : 'No flagged issues', '✳'));
     overview.append(metrics);
 
@@ -315,7 +315,7 @@ import { openClaudeLogin } from './claude-login.js';
     const maxAttempts = run.limits?.maxAttempts;
     const attemptsRemaining = Number.isFinite(Number(maxAttempts)) ? number(Math.max(0, Number(maxAttempts) - attemptCount)) : 'Unknown';
     append(stats, smallStat('Attempts left', attemptsRemaining), smallStat('Tokens left', tokenRemaining), smallStat('Checks passed', Number.isFinite(passedChecks) && Number.isFinite(totalChecks) ? `${passedChecks} / ${totalChecks}` : 'Unknown'), smallStat('Elapsed', duration(run.elapsedMs)));
-    detail.append(stats);
+    detail.append(stats, tokenPanel(run));
     const coordinator = run.coordinator || {};
     const coordinatorProvider = coordinator.provider;
     const coordinatorModel = coordinator.model;
@@ -510,6 +510,52 @@ import { openClaudeLogin } from './claude-login.js';
     if (reason) copy.append(node('span', 'history-reason', reason));
     append(row, marker, copy, item.status ? badge(item.status) : null);
     return row;
+  }
+  function tokenPanel(run) {
+    const panel = node('section', 'token-panel');
+    panel.setAttribute('aria-label', 'Token usage');
+    panel.append(node('h3', '', 'Token usage'));
+    const totalText = (value, lower) => value == null ? `Unknown (at least ${number(lower)})` : number(value);
+    for (const group of run.usageByRole || []) {
+      const role = group.role.charAt(0).toUpperCase() + group.role.slice(1).replaceAll('_', ' ');
+      const total = node('div', 'token-row token-total');
+      const summary = node('span', 'token-summary');
+      for (const [key, label] of [['input', 'Input'], ['cached', 'Cached'], ['output', 'Output']])
+        summary.append(node('span', '', `${label} ${totalText(group.total[key], group.lowerBound[key])}`));
+      append(total, node('strong', '', `${role} total`), summary,
+        node('strong', 'token-metered', `Metered (budget) ${totalText(group.total.metered, group.lowerBound.metered)}`));
+      panel.append(total);
+      for (const agent of group.agents) {
+        const row = node('div', 'token-row');
+        const label = node('div', 'token-agent');
+        append(label, node('strong', '', agent.segment == null ? 'Segment unavailable' : `Segment ${agent.segment} - ${agent.kind === 'handoff' ? 'hand-off' : 'work'}`),
+          node('small', '', agent.attemptId), node('small', '', `Model ${agent.model}`), badge(agent.status));
+        if (agent.reason && agent.reason !== agent.status) label.append(node('small', '', agent.reason));
+        if (agent.lastActivityAt) label.append(node('small', '', `Last activity ${duration(Math.max(0, Date.now() - Date.parse(agent.lastActivityAt)))} ago`));
+        else if (agent.live && !agent.providerStartedAt && agent.raw === null && agent.input === null && agent.output === null && agent.cached === null) label.append(node('small', '', 'Waiting for provider start'));
+        const fields = node('dl', 'token-fields');
+        if (agent.raw === null) fields.append(node('span', '', 'Provider usage Unknown'));
+        else for (const [key, value] of Object.entries(agent.raw)) {
+          const field = node('div', 'token-field');
+          append(field, node('dt', '', key), node('dd', '', number(value))); fields.append(field);
+        }
+        append(row, label, fields, node('strong', 'token-metered', `Metered (budget) ${number(agent.metered)}`));
+        if (agent.live && agent.context) {
+          const context = agent.context, block = node('div', 'token-context');
+          append(block, node('span', '', `Max context before compaction ${number(context.contextMax)} · Hand-off trigger ${number(context.trigger)}`),
+            node('span', '', `Current context ${number(context.contextTokens)} · Peak ${number(context.peakContext)}`));
+          const progress = node('progress', 'token-progress');
+          progress.max = 1;
+          if (context.progress !== null) progress.value = Math.min(1, Math.max(0, context.progress));
+          progress.setAttribute('aria-label', 'Current context toward hand-off trigger');
+          append(block, progress, node('small', '', context.progress === null ? 'Context progress Unknown' : `${number(Math.round(context.progress * 100))}% of hand-off trigger`));
+          row.append(block);
+        }
+        panel.append(row);
+      }
+    }
+    if (!run.usageByRole?.length) panel.append(node('p', 'muted', 'No worker usage recorded.'));
+    return panel;
   }
   function safeSummary(value) {
     if (typeof value === 'string') return value;
@@ -824,7 +870,7 @@ import { openClaudeLogin } from './claude-login.js';
     const panel = card('Run limits', 'These are local guardrails, not a view of your provider subscription quota.', 'settings-panel');
     const form = node('form', 'settings-form budget-form');
     const budgetGrid = node('div', 'form-grid two');
-    budgetGrid.append(field('Maximum reported tokens', input('maxReportedTokens', budget.maxReportedTokens, 'number', { min: 1, step: 1, required: true }), 'Configured for future runs. This dashboard cannot enforce a stop. Unknown usage cannot be treated as zero.'));
+    budgetGrid.append(field('Maximum reported tokens', input('maxReportedTokens', budget.maxReportedTokens, 'number', { min: 1, step: 1, required: true }), 'Configured for future runs. A worker is stopped when it exceeds its share. Unknown usage cannot be treated as zero.'));
     budgetGrid.append(field('Maximum attempts', input('maxAttempts', budget.maxAttempts, 'number', { min: 1, max: 100, step: 1, required: true }), 'Finite total across the run. A retry does not reset this count.'));
     budgetGrid.append(field('Verification reserve attempts', input('verificationReserveAttempts', budget.verificationReserveAttempts, 'number', { min: 1, max: 100, step: 1, required: true }), 'Attempts held for independent review and checks.'));
     budgetGrid.append(field('Maximum run time (minutes)', input('maxWallMinutes', budget.maxWallMinutes, 'number', { min: 1, step: 1, required: true }), 'Total elapsed time allowed for the run.'));
