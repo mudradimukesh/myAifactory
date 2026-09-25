@@ -50,8 +50,6 @@ export const projectSchema = z.object({
     for (const r of v.requirements)
         if (!v.checks.some(x => x.requirements.includes(r)))
             c.addIssue({ code: 'custom', message: `No mandatory check covers ${r}` });
-    if (v.models.developer.provider !== 'codex')
-        c.addIssue({ code: 'custom', message: 'The first subscription profile requires Codex for implementation and Git commits' });
 });
 export type Project = z.infer<typeof projectSchema>;
 export type Check = z.infer<typeof check>;

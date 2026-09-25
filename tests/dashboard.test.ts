@@ -152,6 +152,19 @@ test('settings require local origin and CSRF, and reject limits that the project
   } finally { await app.close(); }
 });
 
+test('settings accept a Claude developer', async () => {
+  const app = await openDashboard();
+  try {
+    const { csrfToken } = await (await fetch(`${app.base}/api/session`)).json();
+    const initial = await (await fetch(`${app.base}/api/dashboard`)).json();
+    const settings = { ...initial.settings, models: { ...initial.settings.models, developer: { provider: 'claude', model: 'claude-sonnet-5', effort: 'medium' } } };
+    const response = await fetch(`${app.base}/api/settings`, { method: 'PUT', headers: { Origin: app.base, 'X-CSRF-Token': csrfToken }, body: JSON.stringify(settings) });
+    assert.equal(response.status, 200);
+    const after = await (await fetch(`${app.base}/api/dashboard`)).json();
+    assert.deepEqual(after.settings.models.developer, { provider: 'claude', model: 'claude-sonnet-5', effort: 'medium' });
+  } finally { await app.close(); }
+});
+
 test('credentials remain private and concurrent application key writes preserve both keys', async () => {
   const app = await openDashboard();
   try {

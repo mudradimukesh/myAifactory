@@ -26,6 +26,8 @@ const proposal = (role: 'developer' | 'reviewer', selected: WorkerChoice) => JSO
 const codexOutput = (text: string, usage = { input_tokens: 10, output_tokens: 10, cached_input_tokens: 0 }) =>
     JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } }) + '\n' +
     JSON.stringify({ type: 'turn.completed', usage }) + '\n';
+const claudeOutput = (text: string, usage = { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 10 }) =>
+    JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: text, usage });
 
 class FakeRuntime extends LocalRuntime {
     readonly calls: string[] = [];
@@ -57,7 +59,7 @@ class FakeRuntime extends LocalRuntime {
             const candidate = await git(job.workspace, ['rev-parse', 'HEAD']);
             text = JSON.stringify({ schemaVersion: 1, candidate, specDigest: sha('Fix the behavior'), requirements: ['behavior'], verdict: 'pass', findings: [] });
         }
-        await writeFile(path.join(job.captureDir, 'stdout.log'), job.id.startsWith('check-') ? 'check passed\n' : codexOutput(text));
+        await writeFile(path.join(job.captureDir, 'stdout.log'), job.id.startsWith('check-') ? 'check passed\n' : job.provider === 'claude' ? claudeOutput(text) : codexOutput(text));
         await writeFile(path.join(job.captureDir, 'stderr.log'), '');
         return { exitCode: 0, signal: null, reason: 'completed' as const, startedAt: start, endedAt: new Date().toISOString(), pausedMs: 0 };
     }
@@ -724,11 +726,22 @@ for (const proposed of ['configured', 'provider', 'model', 'effort'] as const) {
     });
 }
 
-test('createRun rejects a Claude developer', { timeout: 10000 }, async () => {
+test('a Claude developer runs to the fixture happy path', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
-        f.project.models.developer = { provider: 'claude', model: 'sonnet', effort: 'medium' };
-        await assert.rejects(createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' }), /requires Codex for implementation/);
+        f.project.models.developer = { provider: 'claude', model: 'claude-sonnet-5', effort: 'medium' };
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        let developerJob: Job | undefined;
+        class DeveloperCaptureRuntime extends FakeRuntime {
+            override async execute(job: Job) {
+                if (job.id.startsWith('developer-')) developerJob = job;
+                return super.execute(job);
+            }
+        }
+        const final = await runRun(f.store, 'run', new DeveloperCaptureRuntime());
+        assert.equal(final.status, 'handoff_ready');
+        assert.match(developerJob!.argv.join(' '), /Read,Glob,Grep,Edit,Write,Bash/);
+        assert.equal(developerJob!.readOnlySource, false);
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 

@@ -22,7 +22,6 @@ export const settingsSchema = z.object({
     maxWallMinutes: positive.max(Math.floor(Number.MAX_SAFE_INTEGER / 60000)), attemptTimeoutMinutes: positive.max(30), applicationBudgetUsd: finite }).strict(),
   recovery: z.object({ staleMinutes: positive, maxFailures: positive, contextTokenThreshold: positive }).strict(),
 }).strict().superRefine((value, ctx) => {
-  if (value.models.developer.provider !== 'codex') ctx.addIssue({ code: 'custom', path: ['models', 'developer', 'provider'], message: 'Developer requires Codex' });
   if (value.budget.verificationReserveAttempts >= value.budget.maxAttempts) ctx.addIssue({ code: 'custom', path: ['budget', 'verificationReserveAttempts'], message: 'Verification reserve must be smaller than total attempts' });
   if (value.budget.attemptTimeoutMinutes > value.budget.maxWallMinutes) ctx.addIssue({ code: 'custom', path: ['budget', 'attemptTimeoutMinutes'], message: 'Attempt timeout exceeds wall budget' });
 });

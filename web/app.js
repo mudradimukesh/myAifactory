@@ -735,7 +735,7 @@ import { openClaudeLogin } from './claude-login.js';
       const configured = s.models?.[key] || {};
       const modelCard = node('div', 'model-card');
       append(modelCard, node('strong', '', roleName), node('span', 'model-description', detail));
-      modelCard.append(field('Provider', select(`${key}Provider`, configured.provider || 'codex', key === 'developer' ? [['codex', 'Codex required for implementation']] : [['codex', 'Codex'], ['claude', 'Claude Code']])));
+      modelCard.append(field('Provider', select(`${key}Provider`, configured.provider || 'codex', [['codex', 'Codex'], ['claude', 'Claude Code']])));
       modelCard.append(field('Model', input(`${key}Model`, configured.model || ({ coordinator: 'gpt-6-astra', developer: 'gpt-6-sol', reviewer: 'gpt-6-sol', inspector: 'gpt-6-luna' })[key], 'text', { required: true })));
       modelCard.append(field('Effort', select(`${key}Effort`, configured.effort || 'medium', [['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high']])));
       modelGrid.append(modelCard);
