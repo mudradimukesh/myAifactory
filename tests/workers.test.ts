@@ -79,14 +79,14 @@ test('Headroom routes Codex and Claude workers through the same proxy', () => {
   assert.ok(codex.args.includes(`openai_base_url=${JSON.stringify(baseUrl)}`));
   const claude = workerCommand({ provider: 'claude', model: 'sonnet', effort: 'medium' },
     'reviewer', '/tmp/project', 'Review the change', 'Follow this policy', { baseUrl });
-  assert.deepEqual(claude.env, { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8791' });
+  assert.deepEqual(claude.env, { CLAUDE_STREAM_IDLE_TIMEOUT_MS: '120000', ANTHROPIC_BASE_URL: 'http://127.0.0.1:8791' });
   const claudeProject = workerCommand({ provider: 'claude', model: 'sonnet', effort: 'medium' },
     'reviewer', '/tmp/project', 'Review the change', 'Follow this policy',
     { baseUrl: 'http://127.0.0.1:8791/p/my-aifactory/v1' });
-  assert.deepEqual(claudeProject.env, { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8791/p/my-aifactory' });
+  assert.deepEqual(claudeProject.env, { CLAUDE_STREAM_IDLE_TIMEOUT_MS: '120000', ANTHROPIC_BASE_URL: 'http://127.0.0.1:8791/p/my-aifactory' });
   const claudeUnrouted = workerCommand({ provider: 'claude', model: 'sonnet', effort: 'medium' },
     'reviewer', '/tmp/project', 'Review the change', 'Follow this policy');
-  assert.deepEqual(claudeUnrouted.env, {});
+  assert.deepEqual(claudeUnrouted.env, { CLAUDE_STREAM_IDLE_TIMEOUT_MS: '120000' });
   for (const command of [claude, claudeProject, claudeUnrouted])
     assert.ok(!command.args.some(arg => arg.includes('8791')));
 });

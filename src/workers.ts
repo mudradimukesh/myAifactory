@@ -73,7 +73,8 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
             ...(outputSchema ? ['--json-schema', outputSchema.json] : []),
         ],
         stdin: prompt,
-        env: routing ? { ANTHROPIC_BASE_URL: routing.baseUrl.slice(0, -'/v1'.length) } : {},
+        // A dead upstream connection leaves a stream silent until the attempt timeout; fail it fast so the CLI retries.
+        env: { CLAUDE_STREAM_IDLE_TIMEOUT_MS: '120000', ...(routing ? { ANTHROPIC_BASE_URL: routing.baseUrl.slice(0, -'/v1'.length) } : {}) },
     };
 }
 function object(value: unknown): Record<string, unknown> | null {
