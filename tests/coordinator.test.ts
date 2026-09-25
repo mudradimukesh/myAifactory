@@ -30,10 +30,12 @@ const codexOutput = (text: string, usage = { input_tokens: 10, output_tokens: 10
 class FakeRuntime extends LocalRuntime {
     readonly calls: string[] = [];
     readonly schemas = new Map<string, string>();
+    readonly prompts = new Map<string, string>();
     proposedReviewerModel?: WorkerChoice;
     override async preflight() { return []; }
     override async execute(job: Job): Promise<Awaited<ReturnType<LocalRuntime['execute']>>> {
         this.calls.push(job.id);
+        this.prompts.set(job.id, [job.argv.join('\n'), job.stdin].filter(Boolean).join('\n'));
         const schemaFlag = job.argv.indexOf('--output-schema');
         if (schemaFlag >= 0) this.schemas.set(job.id, await readFile(job.argv[schemaFlag + 1], 'utf8'));
         if (job.provider === 'codex') assert.equal(job.env?.OPENAI_BASE_URL, 'http://127.0.0.1:8791/v1');
@@ -523,7 +525,7 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
         const runtime = new FakeRuntime();
         const final = await runRun(f.store, 'run', runtime);
         assert.equal(final.status, 'handoff_ready');
-        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'developer-1', 'review-1', 'check-unit-1', 'check-artifact-1']);
+        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'developer-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
         assert.deepEqual([...runtime.schemas.keys()], ['plan-architect', 'plan-tester', 'review-1']);
         assert.deepEqual(JSON.parse(runtime.schemas.get('plan-architect')!).required, ['schemaVersion', 'tasks']);
         assert.ok(JSON.parse(runtime.schemas.get('review-1')!).required.includes('verdict'));
@@ -533,6 +535,44 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
         assert.equal(final.reportedTokens, 80);
         assert.equal(final.review?.record.candidate, final.candidate);
         assert.equal(await git(path.join(f.store.dir('run'), 'candidates.git'), ['rev-parse', `refs/candidates/${final.candidate}`]), final.candidate);
+        const reviewPrompt = runtime.prompts.get('review-1')!;
+        assert.match(reviewPrompt, /check passed/);
+        assert.match(reviewPrompt, /id=unit/);
+        assert.match(reviewPrompt, /id=artifact/);
+        assert.match(reviewPrompt, /You have no shell/);
+        assert.match(reviewPrompt, /capture\/stdout\.log/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('mandatory checks run before the independent review', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FakeRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'handoff_ready');
+        const firstReview = runtime.calls.findIndex(id => id.startsWith('review-'));
+        const lastCheck = runtime.calls.map(id => id.startsWith('check-')).lastIndexOf(true);
+        assert.ok(firstReview > lastCheck);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('a failed mandatory check moves to changes_requested without running the review', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        class FailingCheckRuntime extends FakeRuntime {
+            override async execute(job: Job) {
+                const result = await super.execute(job);
+                if (job.id.startsWith('check-')) return { ...result, exitCode: 1, reason: 'exit_error' as const };
+                return result;
+            }
+        }
+        const runtime = new FailingCheckRuntime();
+        let state = await stepRun(f.store, 'run', runtime);
+        for (let i = 0; i < 20 && state.status !== 'changes_requested'; i++) state = await stepRun(f.store, 'run', runtime);
+        assert.match(state.reason ?? '', /Mandatory check .* failed/);
+        assert.equal(runtime.calls.some(id => id.startsWith('review-')), false);
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
@@ -560,7 +600,7 @@ test('reset retries a failed planner with fresh evidence and dispatches the fixt
         const runtime = new FakeRuntime();
         const final = await runRun(f.store, 'run', runtime);
         assert.equal(final.status, 'handoff_ready');
-        assert.deepEqual(runtime.calls, ['plan-architect-2', 'plan-tester', 'developer-1', 'review-1', 'check-unit-1', 'check-artifact-1']);
+        assert.deepEqual(runtime.calls, ['plan-architect-2', 'plan-tester', 'developer-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
         assert.equal(await readFile(path.join(f.store.dir('run'), 'attempts', 'plan-architect', 'sentinel.txt'), 'utf8'), 'old evidence');
         assert.notEqual(final.attempts.find(attempt => attempt.id === 'plan-architect-2')?.id, 'plan-architect');
         assert.equal(final.reworks, 0);

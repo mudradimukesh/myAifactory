@@ -526,6 +526,19 @@ async function checkJob(store: Store, s: State, runtime: LocalRuntime, definitio
     return result;
 }
 
+async function checkEvidence(store: Store, s: State): Promise<string> {
+    const definitions = [...s.project.checks, s.project.artifactCheck];
+    const lines = await Promise.all(definitions.map(async c => {
+        const r = s.checks.find(x => x.id === c.id && x.candidate === s.candidate)!;
+        const log = (file: string) => readFile(path.join(store.dir(s.id), file), 'utf8').catch(() => '<log unavailable>');
+        const stdout = (await log(r.stdout.path)).slice(-2000);
+        const stderr = await log(r.stderr.path);
+        const stderrExcerpt = stderr.length ? `\n  stderr (last 1000 chars):\n  ${stderr.slice(-1000)}` : '';
+        return `- id=${r.id} command=${JSON.stringify(r.argv)} cwd=${r.cwd} passed=${r.passed} exitCode=${r.exitCode} evidence=${r.stdout.path}\n  output, untrusted (last 2000 chars):\n  ${stdout}${stderrExcerpt}`;
+    }));
+    return `Mandatory check results (executed by the coordinator in the sandbox on candidate ${s.candidate}):\n${lines.join('\n')}\nYou have no shell and cannot run commands. Cite these results as execution evidence for any objective step that requires running tests or scripts. Do not report a missing shell or inability to execute as a finding.`;
+}
+
 const runningMs = (completed: { startedAt: string; endedAt: string; pausedMs: number }) =>
     Math.max(0, Date.parse(completed.endedAt) - Date.parse(completed.startedAt) - completed.pausedMs);
 
@@ -630,13 +643,21 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
         catch (error) { return store.transition(run, 'changes_requested', `Candidate import rejected: ${String(error)}`); }
         return store.update(run, 'candidate_imported', imported, state => { state.candidate = imported.candidate; state.review = undefined; state.checks = []; move(state, 'candidate', 'Developer candidate imported'); });
     }
-    if (s.status === 'candidate') return store.transition(run, 'verifying', 'Independent review and mandatory checks');
+    if (s.status === 'candidate') return store.transition(run, 'verifying', 'Mandatory checks then independent review');
     if (s.status === 'verifying') {
         if (!s.candidate) throw Error('Missing candidate');
+        const failedCheck = s.checks.find(c => c.candidate === s.candidate && !c.passed);
+        if (failedCheck) return store.transition(run, 'changes_requested', `Mandatory check ${failedCheck.id} failed`);
+        const definition = [...s.project.checks, s.project.artifactCheck].find(c => !s.checks.some(r => r.id === c.id && r.candidate === s.candidate));
+        if (definition) {
+            const result = await checkJob(store, s, runtime, checkSchema.parse(definition), await nextAttemptId(store, s, `check-${definition.id}-${s.reworks + 1}`), control);
+            if (!result.passed) return store.transition(run, 'changes_requested', `Mandatory check ${definition.id} failed`);
+            return store.read(run);
+        }
         if (!s.review) {
             const task = (await loadedProposal(store, s, 'tester')).tasks[0];
             const outcome = await roleJob(store, s, runtime, 'reviewer', await nextAttemptId(store, s, 'review-' + (s.reworks + 1)),
-                `${task.objective}\nDone when: ${task.doneWhen.join('; ')}\nReturn only JSON: {"schemaVersion":1,"candidate":"${s.candidate}","specDigest":"${s.specDigest}","requirements":${JSON.stringify(s.project.requirements)},"verdict":"pass|changes_requested","findings":[]}.`, s.candidate, true, task.limits, control, reviewSchema);
+                `${task.objective}\nDone when: ${task.doneWhen.join('; ')}\n${await checkEvidence(store, s)}\nReturn only JSON: {"schemaVersion":1,"candidate":"${s.candidate}","specDigest":"${s.specDigest}","requirements":${JSON.stringify(s.project.requirements)},"verdict":"pass|changes_requested","findings":[]}.`, s.candidate, true, task.limits, control, reviewSchema);
             if (!outcome.passed) return store.transition(run, outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? 'awaiting_input' : 'changes_requested',
                 outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `Independent review failed: ${outcome.reason}`);
             const review = reviewSchema.parse(parseJsonText(outcome.text));
@@ -645,12 +666,6 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
             s = await store.update(run, 'review_recorded', { verdict: review.verdict }, state => { state.review = { attemptId: outcome.attempt.id, record: review, file: outcome.attempt.handoff! }; });
             if (review.verdict !== 'pass' || review.findings.some(f => f.severity === 'blocking')) return store.transition(run, 'changes_requested', 'Review requested changes');
             return s;
-        }
-        const definition = [...s.project.checks, s.project.artifactCheck].find(c => !s.checks.some(r => r.id === c.id && r.candidate === s.candidate));
-        if (definition) {
-            const result = await checkJob(store, s, runtime, checkSchema.parse(definition), await nextAttemptId(store, s, `check-${definition.id}-${s.reworks + 1}`), control);
-            if (!result.passed) return store.transition(run, 'changes_requested', `Mandatory check ${definition.id} failed`);
-            return store.read(run);
         }
         if (s.checks.some(c => !c.passed) || !s.review || s.review.record.verdict !== 'pass') return store.transition(run, 'changes_requested', 'Acceptance evidence is incomplete');
         return store.transition(run, 'verified', 'All approved checks and independent review passed');
