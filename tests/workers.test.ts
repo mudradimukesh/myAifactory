@@ -27,6 +27,24 @@ test('Codex workers use explicit policy and delegate filesystem isolation to Loc
   assert.equal(reviewer.args[reviewer.args.indexOf('--sandbox') + 1], 'danger-full-access');
 });
 
+test('JSON-returning workers pass the output schema to the CLI', () => {
+  const schema = { json: '{"type":"object"}', file: '/tmp/policy/output-schema.json' };
+  const codex = workerCommand({ provider: 'codex', model: 'gpt-5.4', effort: 'high' }, 'architect', '/tmp/project', 'Plan', 'Policy', undefined, schema);
+  assert.deepEqual(codex.args.slice(-5), ['-C', '/tmp/project', '--output-schema', schema.file, '-']);
+  const claude = workerCommand({ provider: 'claude', model: 'claude-sonnet-4-6', effort: 'low' }, 'reviewer', '/tmp/project', 'Review', 'Policy', undefined, schema);
+  assert.equal(claude.args[claude.args.indexOf('--json-schema') + 1], schema.json);
+  const plain = workerCommand({ provider: 'claude', model: 'claude-sonnet-4-6', effort: 'low' }, 'reviewer', '/tmp/project', 'Review', 'Policy');
+  assert.equal(plain.args.includes('--json-schema'), false);
+});
+
+test('Claude structured output replaces a prose result', () => {
+  const parsed = parseWorkerOutput('claude', JSON.stringify({ type: 'result', subtype: 'success',
+    result: 'Now I have a grounded design.\n```json\n{"a":1}\n```', structured_output: { a: 1 },
+    usage: { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 } }));
+  assert.equal(parsed.failed, false);
+  assert.deepEqual(JSON.parse(parsed.text), { a: 1 });
+});
+
 test('Claude workers have explicit model and restricted role tools', () => {
   const reviewer = workerCommand(
     { provider: 'claude', model: 'claude-sonnet-4-6', effort: 'low' },

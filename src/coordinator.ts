@@ -1,6 +1,7 @@
 import { mkdir, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
+import { zodToJsonSchema } from 'zod-to-json-schema';
 import { bundle } from './bundle.ts';
 import { check as checkSchema, choice, id, projectSchema, reviewSchema } from './contracts.ts';
 import type { Attempt, Check, Project, Result, Role, State, WorkerChoice } from './contracts.ts';
@@ -114,6 +115,12 @@ function budget(s: State, role: Role) {
     if (remaining(s) <= reserve) throw Error('Verification attempt reserve reached');
 }
 
+// CLI structured-output engines reject bound keywords; zod still enforces every bound when the result is parsed.
+const unenforced = new Set(['$schema', 'minLength', 'maxLength', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'minItems', 'maxItems']);
+function outputSchema(schema: z.ZodTypeAny): string {
+    return JSON.stringify(zodToJsonSchema(schema, { $refStrategy: 'none' }), (key, value) => unenforced.has(key) ? undefined : value);
+}
+
 function parseJsonText(text: string): unknown {
     const trimmed = text.trim().replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '');
     return JSON.parse(trimmed);
@@ -162,7 +169,7 @@ function plannerPrompt(s: State, role: 'developer' | 'reviewer') {
 }
 
 async function roleJob(store: Store, s: State, runtime: LocalRuntime, role: Role, jobId: string, objective: string, source: string, readOnlySource: boolean,
-    limits: { maxSeconds: number; maxTokens: number } | undefined, control: RunControl | undefined): Promise<JobOutcome> {
+    limits: { maxSeconds: number; maxTokens: number } | undefined, control: RunControl | undefined, output?: z.ZodTypeAny): Promise<JobOutcome> {
     if (control?.signal.aborted) throw new RunCancelled();
     budget(s, role);
     const maxTokens = Math.min(tokenAllowance(s, role), limits?.maxTokens ?? Infinity);
@@ -175,7 +182,9 @@ async function roleJob(store: Store, s: State, runtime: LocalRuntime, role: Role
     await checkout(candidateStore(store, run), workspace, source);
     const b = await bundle();
     const policy = b.content[role];
-    const worker = workerCommand(choiceFor(s, role), role, workspace, prompt(s, objective), policy, s.project.headroom);
+    const schema = output && { json: outputSchema(output), file: path.join(policyDir, 'output-schema.json') };
+    if (schema) await durable(schema.file, schema.json);
+    const worker = workerCommand(choiceFor(s, role), role, workspace, prompt(s, objective), policy, s.project.headroom, schema);
     const startedAt = now();
     await store.update(run, 'job_started', { jobId, role }, state => {
         budget(state, role);
@@ -329,7 +338,7 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
     if (s.status === 'ready') {
         if (!s.attempts.some(a => a.role === 'architect')) {
             const objective = plannerPrompt(s, 'developer');
-            const outcome = await roleJob(store, s, runtime, 'architect', 'plan-architect', objective, s.sourceBase, true, undefined, control);
+            const outcome = await roleJob(store, s, runtime, 'architect', 'plan-architect', objective, s.sourceBase, true, undefined, control, proposalSchema);
             if (!outcome.passed) return store.transition(run, 'awaiting_input', 'Architect plan failed or usage unknown');
             s = await store.read(run);
             try { admitProposal(parseJsonText(outcome.text), s, 'architect'); }
@@ -338,7 +347,7 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
         }
         if (!s.attempts.some(a => a.role === 'tester')) {
             const objective = plannerPrompt(s, 'reviewer');
-            const outcome = await roleJob(store, s, runtime, 'tester', 'plan-tester', objective, s.sourceBase, true, undefined, control);
+            const outcome = await roleJob(store, s, runtime, 'tester', 'plan-tester', objective, s.sourceBase, true, undefined, control, proposalSchema);
             if (!outcome.passed) return store.transition(run, 'awaiting_input', 'Test plan failed or usage unknown');
             s = await store.read(run);
             try { admitProposal(parseJsonText(outcome.text), s, 'tester'); }
@@ -361,7 +370,7 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
         if (!s.review) {
             const task = (await loadedProposal(store, s, 'tester')).tasks[0];
             const outcome = await roleJob(store, s, runtime, 'reviewer', 'review-' + (s.reworks + 1),
-                `${task.objective}\nDone when: ${task.doneWhen.join('; ')}\nReturn only JSON: {"schemaVersion":1,"candidate":"${s.candidate}","specDigest":"${s.specDigest}","requirements":${JSON.stringify(s.project.requirements)},"verdict":"pass|changes_requested","findings":[]}.`, s.candidate, true, task.limits, control);
+                `${task.objective}\nDone when: ${task.doneWhen.join('; ')}\nReturn only JSON: {"schemaVersion":1,"candidate":"${s.candidate}","specDigest":"${s.specDigest}","requirements":${JSON.stringify(s.project.requirements)},"verdict":"pass|changes_requested","findings":[]}.`, s.candidate, true, task.limits, control, reviewSchema);
             if (!outcome.passed) return store.transition(run, 'changes_requested', 'Independent review failed');
             const review = reviewSchema.parse(parseJsonText(outcome.text));
             if (review.candidate !== s.candidate || review.specDigest !== s.specDigest || s.project.requirements.some(r => !review.requirements.includes(r)))

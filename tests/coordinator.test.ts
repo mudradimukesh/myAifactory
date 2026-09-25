@@ -21,10 +21,13 @@ const codexOutput = (text: string, usage = { input_tokens: 10, output_tokens: 10
 
 class FakeRuntime extends LocalRuntime {
     readonly calls: string[] = [];
+    readonly schemas = new Map<string, string>();
     proposedReviewerModel?: WorkerChoice;
     override async preflight() { return []; }
     override async execute(job: Job) {
         this.calls.push(job.id);
+        const schemaFlag = job.argv.indexOf('--output-schema');
+        if (schemaFlag >= 0) this.schemas.set(job.id, await readFile(job.argv[schemaFlag + 1], 'utf8'));
         if (job.provider === 'codex') assert.equal(job.env?.OPENAI_BASE_URL, 'http://127.0.0.1:8791/v1');
         if (job.provider === 'claude') {
             assert.equal(job.env?.OPENAI_BASE_URL, undefined);
@@ -100,6 +103,10 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
         const final = await runRun(f.store, 'run', runtime);
         assert.equal(final.status, 'handoff_ready');
         assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'developer-1', 'review-1', 'check-unit-1', 'check-artifact-1']);
+        assert.deepEqual([...runtime.schemas.keys()], ['plan-architect', 'plan-tester', 'review-1']);
+        assert.deepEqual(JSON.parse(runtime.schemas.get('plan-architect')!).required, ['schemaVersion', 'tasks']);
+        assert.ok(JSON.parse(runtime.schemas.get('review-1')!).required.includes('verdict'));
+        assert.doesNotMatch(runtime.schemas.get('plan-architect')!, /minLength|minItems|maximum|\$schema/);
         assert.equal(final.attempts.length, 4);
         assert.equal(final.checks.length, 2);
         assert.equal(final.reportedTokens, 80);

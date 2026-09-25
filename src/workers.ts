@@ -12,7 +12,7 @@ export type WorkerOutput = {
 const writeRoles = new Set<Role>(['business', 'domain', 'architect', 'developer', 'tester']);
 // Execute these commands only through LocalRuntime. Its outer macOS sandbox
 // owns filesystem permissions; macOS rejects a second nested Seatbelt sandbox.
-export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, prompt: string, policy: string, headroom?: Headroom): {
+export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, prompt: string, policy: string, headroom?: Headroom, outputSchema?: { json: string; file: string }): {
     executable: string;
     args: string[];
     stdin: string;
@@ -46,6 +46,7 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
                 '-c', 'project_doc_max_bytes=0',
                 '--sandbox', 'danger-full-access',
                 '-C', cwd,
+                ...(outputSchema ? ['--output-schema', outputSchema.file] : []),
                 '-',
             ],
             stdin: `Worker policy:\n${policy}\n\nTask:\n${prompt}`,
@@ -69,6 +70,7 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
             '--model', choice.model,
             '--effort', choice.effort,
             '--append-system-prompt', policy,
+            ...(outputSchema ? ['--json-schema', outputSchema.json] : []),
         ],
         stdin: prompt,
         env: routing ? { ANTHROPIC_BASE_URL: routing.baseUrl.slice(0, -'/v1'.length) } : {},
@@ -162,7 +164,7 @@ export function parseWorkerOutput(provider: WorkerChoice['provider'], stdout: st
         }
         else if (event.type === 'result') {
             completed = true;
-            const result = string(event.result);
+            const result = object(event.structured_output) ? JSON.stringify(event.structured_output) : string(event.result);
             if (result)
                 output.text = result;
             if (event.usage)
