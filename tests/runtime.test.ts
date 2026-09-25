@@ -77,22 +77,45 @@ test('native developer can write only its workspace and network policy is enforc
   });
 });
 
-test('native runtime copies only dedicated credentials and keeps refresh changes local', { skip: process.platform !== 'darwin' }, async () => {
+test('native runtime copies only dedicated credentials and returns a refreshed credential', { skip: process.platform !== 'darwin' }, async () => {
   await fixture(async (job, root) => {
     const auth = path.join(root, 'auth');
     await mkdir(auth);
     const original = JSON.stringify({ auth_mode: 'chatgpt', tokens: { fixture: 'not-a-live-credential' } });
+    const refreshed = JSON.stringify({ auth_mode: 'chatgpt', tokens: { fixture: 'rotated-fixture' } });
     await writeFile(path.join(auth, 'auth.json'), original);
     job.project.runtime.authHomes.codex = auth;
     assert.deepEqual(await new LocalRuntime().preflight(job.project), []);
-    const script = `const fs=require('fs');const p=process.env.CODEX_HOME+'/auth.json';const mode=JSON.parse(fs.readFileSync(p)).auth_mode;fs.writeFileSync(p,'updated');let denied=false;try{fs.readFileSync(${JSON.stringify(path.join(auth, 'auth.json'))})}catch(e){denied=e.code==='EPERM'};console.log(JSON.stringify({mode,denied}));`;
+    const script = `const fs=require('fs');const p=process.env.CODEX_HOME+'/auth.json';const mode=JSON.parse(fs.readFileSync(p)).auth_mode;fs.writeFileSync(p,${JSON.stringify(refreshed)});let denied=false;try{fs.readFileSync(${JSON.stringify(path.join(auth, 'auth.json'))})}catch(e){denied=e.code==='EPERM'};console.log(JSON.stringify({mode,denied}));`;
     const result = await new LocalRuntime().execute({ ...job, provider: 'codex', argv: [process.execPath, '-e', script] });
     assert.equal(result.reason, 'completed');
     assert.deepEqual(JSON.parse(await readFile(path.join(job.captureDir, 'stdout.log'), 'utf8')), { mode: 'chatgpt', denied: true });
-    assert.equal(await readFile(path.join(auth, 'auth.json'), 'utf8'), original);
+    assert.equal(await readFile(path.join(auth, 'auth.json'), 'utf8'), refreshed, 'the next attempt must start from the rotated credential');
     await writeFile(path.join(auth, 'config.toml'), 'unapproved');
     await assert.rejects(validateAuthHome('codex', auth), /credentials only/);
   });
+});
+
+test('native runtime never returns an invalid credential or overwrites a changed source', { skip: process.platform !== 'darwin' }, async () => {
+  for (const [name, write, source] of [
+    ['api key', JSON.stringify({ auth_mode: 'apikey', OPENAI_API_KEY: 'fixture' }), undefined],
+    ['cleared', '{}', undefined],
+    ['not json', 'updated', undefined],
+    ['source changed', JSON.stringify({ auth_mode: 'chatgpt', tokens: { fixture: 'job' } }), JSON.stringify({ auth_mode: 'chatgpt', tokens: { fixture: 'other-login' } })],
+  ] as const) {
+    await fixture(async (job, root) => {
+      const auth = path.join(root, 'auth');
+      await mkdir(auth);
+      const original = JSON.stringify({ auth_mode: 'chatgpt', tokens: { fixture: 'not-a-live-credential' } });
+      await writeFile(path.join(auth, 'auth.json'), original);
+      job.project.runtime.authHomes.codex = auth;
+      const script = `require('fs').writeFileSync(process.env.CODEX_HOME+'/auth.json',${JSON.stringify(write)});`;
+      const running = new LocalRuntime().execute({ ...job, provider: 'codex', argv: [process.execPath, '-e', script + (source === undefined ? '' : `require('child_process').execFileSync('/bin/sleep',['1']);`)] });
+      if (source !== undefined) { await new Promise(resolve => setTimeout(resolve, 300)); await writeFile(path.join(auth, 'auth.json'), source); }
+      assert.equal((await running).reason, 'completed');
+      assert.equal(await readFile(path.join(auth, 'auth.json'), 'utf8'), source ?? original, name);
+    });
+  }
 });
 
 test('native configuration rejects old profiles, overlapping roots and privilege escalation', async () => {

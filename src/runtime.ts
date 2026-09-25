@@ -9,7 +9,7 @@ import type { Project } from './contracts.ts';
 import { runProcess } from './process.ts';
 import type { ProcessSpec } from './process.ts';
 import { z } from 'zod';
-import { exists, json, sha } from './store.ts';
+import { durable, exists, json, sha } from './store.ts';
 
 const exec = promisify(execFile);
 const sandbox = '/usr/bin/sandbox-exec';
@@ -142,6 +142,7 @@ export class LocalRuntime {
         }
         const home = path.join(scratchDir, 'home');
         await mkdir(home, { mode: 0o700 });
+        let credential: { source: string; copy: string; digest: string } | undefined;
         if (job.provider) {
             const source = job.project.runtime.authHomes[job.provider];
             if (!source) throw Error(`Configure a dedicated ${job.provider} subscription auth home`);
@@ -153,6 +154,7 @@ export class LocalRuntime {
             const name = job.provider === 'codex' ? 'auth.json' : '.credentials.json';
             await copyFile(path.join(authRoot, name), path.join(target, name), constants.COPYFILE_EXCL);
             await chmod(path.join(target, name), 0o600);
+            credential = { source: path.join(authRoot, name), copy: path.join(target, name), digest: sha(await readFile(path.join(authRoot, name))) };
         }
         const temp = await mkdtemp('/private/tmp/factory-');
         try {
@@ -167,8 +169,26 @@ export class LocalRuntime {
             });
         } finally {
             await rm(temp, { recursive: true, force: true });
+            if (credential && job.provider) await returnRefreshedCredential(job.provider, credential);
         }
     }
+}
+
+// Providers rotate refresh tokens, so the next attempt needs the credential this attempt refreshed.
+// Write it back only if it is still a subscription credential and no other writer changed the source.
+async function returnRefreshedCredential(provider: 'codex' | 'claude', credential: { source: string; copy: string; digest: string }) {
+    const info = await lstat(credential.copy).catch(() => null);
+    if (!info?.isFile() || info.size > 65536) return;
+    const refreshed = await readFile(credential.copy);
+    if (sha(refreshed) === credential.digest || sha(await readFile(credential.source)) !== credential.digest) return;
+    try { subscriptionCredential(provider, JSON.parse(refreshed.toString('utf8'))); } catch { return; }
+    await durable(credential.source, refreshed);
+}
+
+function subscriptionCredential(provider: 'codex' | 'claude', auth: { auth_mode?: unknown; OPENAI_API_KEY?: unknown; claudeAiOauth?: unknown }) {
+    if (provider === 'codex' && (auth.auth_mode !== 'chatgpt' || auth.OPENAI_API_KEY))
+        throw Error('Codex worker requires ChatGPT subscription auth, not an API key');
+    if (provider === 'claude' && !auth.claudeAiOauth) throw Error('Claude worker requires Claude subscription auth');
 }
 
 export async function validateAuthHome(provider: 'codex' | 'claude', home: string) {
@@ -180,8 +200,5 @@ export async function validateAuthHome(provider: 'codex' | 'claude', home: strin
     }
     const file = path.join(root, filename);
     if (!await exists(file)) throw Error(`No ${provider} subscription credential file in the dedicated auth home`);
-    const auth = JSON.parse(await readFile(file, 'utf8'));
-    if (provider === 'codex' && (auth.auth_mode !== 'chatgpt' || auth.OPENAI_API_KEY))
-        throw Error('Codex worker requires ChatGPT subscription auth, not an API key');
-    if (provider === 'claude' && !auth.claudeAiOauth) throw Error('Claude worker requires Claude subscription auth');
+    subscriptionCredential(provider, JSON.parse(await readFile(file, 'utf8')));
 }
