@@ -70,6 +70,7 @@ export type FactoryView = {
   activeJob: { id: string; kind: string; startedAt: string; frozen: boolean } | null;
   canStart: boolean; canPause: boolean; canStop: boolean; canReset: boolean; startLabel: 'Start' | 'Resume';
   reason: string | null; orphans: number[];
+  activity: { job: string; summary: string; ageSeconds: number | null }[];
 };
 const factoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const terminal = (status: State['status']) => status === 'failed' || status === 'cancelled' || status === 'handoff_ready';
@@ -78,8 +79,60 @@ const choiceFor = (state: State, role: typeof roles[number]) => role === 'develo
   : role === 'reviewer' ? state.project.models.reviewer : role === 'coordinator' ? state.project.models.coordinator : state.project.models.inspector;
 const exitDetail = z.object({ outcome: z.enum(['waiting', 'finished', 'cancelled', 'error']), message: z.string() }).passthrough();
 
+/** One line per Codex or Claude stream-json event: what ran, never its text, reasoning, tool results, or prompts. */
+function summarizeEvent(event: Record<string, unknown>): string[] {
+  if (event.type === 'item.started' || event.type === 'item.completed') {
+    const item = event.item as Record<string, unknown> | undefined;
+    if (!item || typeof item !== 'object') return [];
+    if (item.type === 'command_execution') {
+      const command = Array.isArray(item.command) ? item.command.join(' ') : String(item.command ?? '');
+      return [event.type === 'item.started' ? `running ${command}` : `ran ${command} (exit ${item.exit_code})`];
+    }
+    if (item.type === 'agent_message') return ['message'];
+    return [String(item.type ?? 'event')];
+  }
+  if (event.type === 'turn.completed') return ['turn finished'];
+  if (event.type === 'assistant') {
+    const content = (event.message as Record<string, unknown> | undefined)?.content;
+    if (!Array.isArray(content)) return [];
+    return content.filter((block): block is Record<string, unknown> => Boolean(block) && typeof block === 'object' && block.type === 'tool_use')
+      .map(block => {
+        const input = block.input as Record<string, unknown> | undefined;
+        const detail = [input?.file_path, input?.pattern, input?.command].find(value => typeof value === 'string');
+        return detail !== undefined ? `${block.name} ${detail}` : String(block.name ?? 'tool');
+      });
+  }
+  if (event.type === 'result') return ['finished'];
+  return [];
+}
+const collapse = (value: string) => value.replace(/\s+/g, ' ').trim();
+const clip = (value: string) => value.length > 160 ? `${value.slice(0, 160)}...` : value;
+/** Reads only the tail of a possibly large capture log and returns up to the last 5 event summaries. */
+async function tailEvents(file: string, maxBytes = 65536): Promise<string[]> {
+  let handle;
+  try { handle = await open(file, 'r'); }
+  catch { return []; }
+  try {
+    const size = (await handle.stat()).size;
+    const n = Math.min(size, maxBytes);
+    const buffer = Buffer.alloc(n);
+    await handle.read(buffer, 0, n, size - n);
+    let text = buffer.toString('utf8');
+    if (n < size) { const newline = text.indexOf('\n'); text = newline >= 0 ? text.slice(newline + 1) : ''; }
+    const summaries: string[] = [];
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let event: unknown;
+      try { event = JSON.parse(trimmed); } catch { continue; }
+      if (event && typeof event === 'object') summaries.push(...summarizeEvent(event as Record<string, unknown>));
+    }
+    return summaries.slice(-5);
+  } catch { return []; } finally { await handle.close().catch(() => {}); }
+}
+
 /** Derives operator controls from stored facts plus a live ownership check of the recorded supervisor. */
-export async function factoryView(state: State, redact: (value: string) => string = value => value): Promise<FactoryView> {
+export async function factoryView(state: State, redact: (value: string) => string = value => value, runDir?: string): Promise<FactoryView> {
   const live = state.supervisor !== undefined && await isOwnedAlive(state.supervisor.process);
   const factory: FactoryState = terminal(state.status) ? 'terminal'
     : state.control === 'cancel' ? 'stopping'
@@ -98,6 +151,14 @@ export async function factoryView(state: State, redact: (value: string) => strin
     : state.unknownUsage && !terminal(state.status) ? 'Some worker token use is unknown. Review usage before starting.'
     : state.reason ? redact(state.reason) : null;
   const startable = factory === 'idle' || factory === 'exited' || factory === 'pausing' || factory === 'paused';
+  let activity: FactoryView['activity'] = [];
+  if (runDir && job && job.kind !== 'check') {
+    const file = path.join(runDir, 'attempts', job.id, 'capture', 'stdout.log');
+    const summaries = await tailEvents(file);
+    let ageSeconds: number | null = null;
+    try { ageSeconds = Math.max(0, Math.round((Date.now() - (await lstat(file)).mtimeMs) / 1000)); } catch { /* advisory */ }
+    activity = summaries.map((summary, index) => ({ job: job.id, summary: clip(redact(collapse(summary))), ageSeconds: index === summaries.length - 1 ? ageSeconds : null }));
+  }
   return {
     state: factory,
     supervisor: state.supervisor ? { pid: state.supervisor.process.pid, launchedAt: state.supervisor.launchedAt } : null,
@@ -107,7 +168,7 @@ export async function factoryView(state: State, redact: (value: string) => strin
     canStop: factory !== 'terminal' || live || jobLive || orphans.length > 0 || supervisorOrphans.length > 0,
     canReset: resettable(state) && !state.activeJob && !live && !jobLive && !state.control && orphans.length === 0 && supervisorOrphans.length === 0,
     startLabel: state.control === 'suspend' || state.suspended ? 'Resume' : 'Start',
-    reason, orphans,
+    reason, orphans, activity,
   };
 }
 

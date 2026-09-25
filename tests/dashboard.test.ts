@@ -7,7 +7,7 @@ import { request } from 'node:http';
 import { createDashboardServer } from '../src/dashboard-server.ts';
 import type { State } from '../src/contracts.ts';
 import { Store, sha } from '../src/store.ts';
-import { Dashboard, FactoryConflict, projectRun } from '../src/dashboard.ts';
+import { Dashboard, FactoryConflict, projectRun, factoryView } from '../src/dashboard.ts';
 import { meterReadingSchema, type Segment } from '../src/contracts.ts';
 import { identify } from '../src/process.ts';
 
@@ -229,6 +229,102 @@ function runState(): State {
   };
 }
 
+async function activityRunDir(content: string | null, jobId = 'job-one') {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-activity-'));
+  roots.push(root);
+  const dir = path.join(root, 'attempts', jobId, 'capture');
+  await mkdir(dir, { recursive: true });
+  if (content !== null) await writeFile(path.join(dir, 'stdout.log'), content);
+  return root;
+}
+
+test('activity summarizes a Codex capture log without showing message text or reasoning', async () => {
+  const log = [
+    { type: 'item.started', item: { type: 'command_execution', command: 'npm test' } },
+    { type: 'item.completed', item: { type: 'command_execution', command: 'npm test', exit_code: 0 } },
+    { type: 'item.completed', item: { type: 'agent_message', text: 'All tests pass, this text must never appear.' } },
+    { type: 'item.completed', item: { type: 'reasoning', text: 'Secret chain of thought.' } },
+    { type: 'turn.completed', usage: {} },
+  ].map(event => JSON.stringify(event)).join('\n') + '\n';
+  const root = await activityRunDir(log);
+  const view = await factoryView(runState(), value => value, root);
+  assert.deepEqual(view.activity.map(entry => entry.summary), ['running npm test', 'ran npm test (exit 0)', 'message', 'reasoning', 'turn finished']);
+  assert.deepEqual(view.activity.map(entry => entry.ageSeconds === null), [true, true, true, true, false]);
+  assert.ok(view.activity.every(entry => entry.job === 'job-one'));
+});
+
+test('activity summarizes a Claude capture log, skipping user/tool_result lines', async () => {
+  const log = [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: 'src/app.ts' } }] } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'npm test' } }] } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'StructuredOutput', input: { plan: 'secret plan text' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', content: 'secret tool output' }] } },
+    { type: 'result', subtype: 'success', result: 'Implemented and committed', usage: {} },
+  ].map(event => JSON.stringify(event)).join('\n') + '\n';
+  const root = await activityRunDir(log);
+  const view = await factoryView(runState(), value => value, root);
+  assert.deepEqual(view.activity.map(entry => entry.summary), ['Edit src/app.ts', 'Bash npm test', 'StructuredOutput', 'finished']);
+});
+
+test('activity drops the leading partial line when the capture log exceeds 64 KB', async () => {
+  const padding = 'x'.repeat(70000);
+  const events = [
+    { type: 'item.completed', item: { type: 'command_execution', command: 'first', exit_code: 0 } },
+    { type: 'item.completed', item: { type: 'command_execution', command: 'second', exit_code: 0 } },
+  ].map(event => JSON.stringify(event)).join('\n');
+  const log = `${padding}\n${events}\n`;
+  assert.ok(Buffer.byteLength(log) > 65536);
+  const root = await activityRunDir(log);
+  const view = await factoryView(runState(), value => value, root);
+  assert.deepEqual(view.activity.map(entry => entry.summary), ['ran first (exit 0)', 'ran second (exit 0)']);
+});
+
+test('activity is empty when the capture log is missing', async () => {
+  const root = await activityRunDir(null);
+  const view = await factoryView(runState(), value => value, root);
+  assert.deepEqual(view.activity, []);
+});
+
+test('activity redacts secrets found in a command summary', async () => {
+  const log = JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: 'deploy --token sk-secret123', exit_code: 0 } }) + '\n';
+  const root = await activityRunDir(log);
+  const redact = (value: string) => value.replaceAll('sk-secret123', '[REDACTED]');
+  const view = await factoryView(runState(), redact, root);
+  assert.deepEqual(view.activity.map(entry => entry.summary), ['ran deploy --token [REDACTED] (exit 0)']);
+});
+
+test('activity redacts a secret that crosses the 160-character cut', async () => {
+  const log = JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: 'a'.repeat(150) + ' sk-secret123', exit_code: 0 } }) + '\n';
+  const root = await activityRunDir(log);
+  const view = await factoryView(runState(), value => value.replaceAll('sk-secret123', '[REDACTED]'), root);
+  assert.ok(!view.activity[0]!.summary.includes('sk-sec'));
+});
+
+test('an unreadable activity log leaves the run view intact', async () => {
+  const root = await activityRunDir('');
+  const file = path.join(root, 'attempts', runState().activeJob!.id, 'capture', 'stdout.log');
+  await rm(file); await mkdir(file);
+  assert.deepEqual((await factoryView(runState(), value => value, root)).activity, []);
+});
+
+test('activity cuts a long command summary to 160 characters', async () => {
+  const command = 'a'.repeat(500);
+  const log = JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command, exit_code: 1 } }) + '\n';
+  const root = await activityRunDir(log);
+  const view = await factoryView(runState(), value => value, root);
+  assert.equal(view.activity[0]!.summary.length, 163);
+  assert.ok(view.activity[0]!.summary.endsWith('...'));
+});
+
+test('a check job has no activity', async () => {
+  const log = JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: 'npm test', exit_code: 0 } }) + '\n';
+  const state = runState();
+  state.activeJob = { ...state.activeJob!, kind: 'check' };
+  const root = await activityRunDir(log);
+  const view = await factoryView(state, value => value, root);
+  assert.deepEqual(view.activity, []);
+});
+
 test('run projection flags unconfirmed job and missing token usage; recovery keeps counters but no freeform event details', async () => {
   const app = await openDashboard();
   try {
@@ -296,7 +392,7 @@ test('control takes the start, pause and stop body and projects a factory view',
     const initial = (await (await fetch(`${app.base}/api/dashboard`)).json()).runs[0];
     assert.equal('controlPending' in initial, false);
     assert.deepEqual(initial.factory, { state: 'idle', supervisor: null, activeJob: { id: 'job-one', kind: 'worker', startedAt: '2026-09-23T00:00:00.000Z', frozen: false },
-      canStart: true, canPause: true, canStop: true, canReset: false, startLabel: 'Start', reason: null, orphans: [] });
+      canStart: true, canPause: true, canStop: true, canReset: false, startLabel: 'Start', reason: null, orphans: [], activity: [] });
     const paused = await control({ action: 'pause' });
     assert.equal(paused.status, 200);
     const pausedBody = await paused.json();
