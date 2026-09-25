@@ -3,7 +3,11 @@
   "roles": {
     "developer": {
       "skills": [
-        "factory-tdd"
+        "factory-tdd",
+        "unslop",
+        "bro",
+        "principle-guard-the-context-window",
+        "principle-never-block-on-the-human"
       ],
       "tools": [
         "read",
@@ -17,7 +21,11 @@
     },
     "reviewer": {
       "skills": [
-        "factory-review"
+        "factory-review",
+        "unslop",
+        "bro",
+        "principle-guard-the-context-window",
+        "principle-never-block-on-the-human"
       ],
       "tools": [
         "read",
@@ -28,7 +36,12 @@
     },
     "tester": {
       "skills": [
-        "factory-verify"
+        "factory-verify",
+        "factory-swarm",
+        "unslop",
+        "bro",
+        "principle-guard-the-context-window",
+        "principle-never-block-on-the-human"
       ],
       "tools": [
         "read",
@@ -42,7 +55,11 @@
     },
     "business": {
       "skills": [
-        "factory-discovery"
+        "factory-discovery",
+        "unslop",
+        "bro",
+        "principle-guard-the-context-window",
+        "principle-never-block-on-the-human"
       ],
       "tools": [
         "read",
@@ -55,7 +72,11 @@
     },
     "domain": {
       "skills": [
-        "factory-discovery"
+        "factory-discovery",
+        "unslop",
+        "bro",
+        "principle-guard-the-context-window",
+        "principle-never-block-on-the-human"
       ],
       "tools": [
         "read",
@@ -68,7 +89,12 @@
     },
     "architect": {
       "skills": [
-        "factory-design"
+        "factory-design",
+        "factory-swarm",
+        "unslop",
+        "bro",
+        "principle-guard-the-context-window",
+        "principle-never-block-on-the-human"
       ],
       "tools": [
         "read",
@@ -82,7 +108,11 @@
     "coordinator": {
       "skills": [
         "factory-coordinate",
-        "factory-communicate"
+        "factory-communicate",
+        "unslop",
+        "bro",
+        "principle-guard-the-context-window",
+        "principle-never-block-on-the-human"
       ],
       "tools": [
         "read",

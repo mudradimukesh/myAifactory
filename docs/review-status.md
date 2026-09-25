@@ -65,3 +65,34 @@ Historical evidence is limited to the supplied handoff, design, and subscription
 [BROWSER-VERIFIED] Browser checks used disposable synthetic records. Project inputs persisted after reload and invalid repository URLs produced actionable errors. Budgets saved an eight-attempt allowance, three-attempt verification reserve, and a $25 planning allocation. An application key stayed masked after reload and was removed. The recovery file downloaded through Safari preserved three attempts, 35,600 reported tokens, and unknown usage. A suspend request remained pending without changing the running status. Desktop layout and a 400-pixel responsive view were visually inspected.
 
 [UNIMPLEMENTED] Live coordinator supervision, heartbeat collection, automatic context replacement, model escalation, GitHub clone/access checks, application-key injection, provider quota and spend enforcement, and the complete accepted-release workflow remain absent. Credential-file shape validation is not a live authentication test. The macOS Claude Keychain-only login is not imported by the existing runtime.
+
+
+## Discovery records and operator decisions, 2026-09-24
+
+[LOCAL-VERIFIED] Approved business and domain specifications, architect tickets, and consequential question batches now persist in run state and appear in the dashboard and recovery briefs. Approved revisions and surfaced questions preserve their history. Complete named answer batches record atomically under revision locking without changing acceptance, suspension, or spent allowances. Ticket progress follows linked attempts and affected questions; worker completion alone does not mark delivery accepted.
+
+[LOCAL-VERIFIED] Node 24.19.0 passes all 61 tests with zero failures and zero skips. TypeScript checking, browser JavaScript syntax checking, and `git diff --check` pass. The new tests reproduced the absent collaboration projection and the misleading post-answer prompt before their fixes. GitHub transport tests cover issue creation, owned-issue updates, retry recovery, pull-request exclusion, credential redaction, failed-sync persistence, and rejection of unrelated issue ownership.
+
+[BROWSER-VERIFIED] Native Chrome displayed both approved specification kinds, approval details, revision digests, and a blocked architect ticket using disposable synthetic state. Selecting a constrained answer and entering free text submitted the complete batch. A direct read of persisted state confirmed both answers and operator identity, unchanged 700-token usage, preserved suspension, and `awaiting_input` status. Desktop specification and ticket layout was visually inspected. Responsive layout and the conflict-retry UI were not visually reverified in this pass.
+
+[UNIMPLEMENTED] No execution coordinator consumes answers, reconciles revised acceptance, dispatches workers, or automatically publishes ticket updates. GitHub issue sync requires an explicit operator action and an HTTPS GitHub repository in the run profile. Mock transport evidence does not establish live GitHub permissions or remote delivery; no external issues were written. The scoped comment review found no comments or suppressions to remove, but the required Comment Sicko agent type was unavailable, so full no-comments certification is not claimed.
+
+
+## Headroom request routing, 2026-09-24
+
+[LOCAL-VERIFIED] Installed free Headroom CLI 0.38.0 runs separately on loopback port 8791. The factory injects the route into every configured Codex invocation, preserving native subscription authentication and the isolated worker home. New CLI runs select this protected proxy by default. Existing run profiles are not silently changed. The effective general profile disables user/system message compression, lossy ML compression, response caching, memory, learning, and telemetry. Proxy state has mode 0700 outside worker-writable directories.
+
+[LOCAL-VERIFIED] A live sandboxed `gpt-5.6-luna` worker completed through the proxy. Headroom reported 651 tokens removed from 26,578 original request tokens, a 2.45% reduction for that synthetic run. The observed transform was tool-schema compaction; this is not a claim of the advertised compression percentages or subscription cost savings. The first two direct-provider startup checks failed before model output; enabling only the outbound macOS DNS socket and the system CA bundle fixed those reproduced integration failures.
+
+[LOCAL-VERIFIED] The full suite passes 68 tests with zero failures and zero skips, including explicit proxy routing, fail-closed health settings, URL rejection, exact stdin, native auth isolation, private state/capture denial, and DNS restrictions. TypeScript checking and diff whitespace checks pass. Live Claude routing remains unverified. Floor-plan work remains paused until the final Headroom content check completes.
+
+
+## Factory controls, 2026-09-25
+
+[LOCAL-VERIFIED] The integrated suite passes 111 tests with no failures or skips, and TypeScript checking passes. Real subprocess tests cover pause, resume, cancellation, duplicate starts, supervisor loss, orphaned children, and terminal-run cleanup. Failed cleanup retains ownership records and the reservation. Successful cleanup releases the reservation without changing a failed run into a successful one. Legacy profiles without Headroom are refused before a Codex attempt or execution-state transition. All seven worker roles load unslop, bro, guard-the-context-window, and never-block-on-the-human.
+
+[LOCAL-VERIFIED] A dedicated Chrome profile exercised Start, Pause, Resume, and Stop through the HTTP dashboard with owned fixture processes. The browser observed running, paused, running, then cancelled state. The final run had no supervisor or active job. Keyboard focus survived redraws, and the 390-pixel layout had no horizontal overflow. These fixtures do not establish live subscription-worker execution.
+
+[DEFERRED] The operator paused Claude integration after its subscription limit was reached. Partial login code remains in the repository. The real authentication flow is unverified, and no live Claude integration claim is made. Previous failed floor-plan runs, saved browser evidence, and pending human visual approval remain unchanged.
+
+Evidence for this pass is in `/tmp/factory-codex-0925/`: `full-tests.log`, `live-final-results.json`, browser captures, per-agent reports, and `decisions.tsv`. Earlier entries describe their dated revisions.

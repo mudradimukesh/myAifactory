@@ -1,11 +1,14 @@
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir, rename, open, chmod, lstat } from 'node:fs/promises';
 import { constants, mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { choice, id } from './contracts.ts';
-import type { State } from './contracts.ts';
-import { Store } from './store.ts';
+import { choice, id, ticketProgress } from './contracts.ts';
+import type { OwnedProcess, State } from './contracts.ts';
+import { groupAlive, groupMembers, isOwnedAlive, terminateOwned } from './process.ts';
+import { Store, move } from './store.ts';
 import { validateAuthHome } from './runtime.ts';
 
 const finite = z.number().finite().nonnegative();
@@ -62,6 +65,49 @@ async function privateJson(file: string, data: unknown) {
   await chmod(file, 0o600);
 }
 
+export type FactoryState = 'idle' | 'running' | 'pausing' | 'paused' | 'resuming' | 'stopping' | 'exited' | 'terminal';
+export type FactoryView = {
+  state: FactoryState; supervisor: { pid: number; launchedAt: string } | null;
+  activeJob: { id: string; kind: string; startedAt: string; frozen: boolean } | null;
+  canStart: boolean; canPause: boolean; canStop: boolean; startLabel: 'Start' | 'Resume';
+  reason: string | null; orphans: number[];
+};
+const factoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const terminal = (status: State['status']) => status === 'failed' || status === 'cancelled' || status === 'handoff_ready';
+const exitDetail = z.object({ outcome: z.enum(['waiting', 'finished', 'cancelled', 'error']), message: z.string() }).passthrough();
+
+/** Derives operator controls from stored facts plus a live ownership check of the recorded supervisor. */
+export async function factoryView(state: State, redact: (value: string) => string = value => value): Promise<FactoryView> {
+  const live = state.supervisor !== undefined && await isOwnedAlive(state.supervisor.process);
+  const factory: FactoryState = terminal(state.status) ? 'terminal'
+    : state.control === 'cancel' ? 'stopping'
+    : !live ? (state.supervisor ? 'exited' : 'idle')
+    : state.control === 'suspend' && state.suspended ? 'paused'
+    : state.control === 'suspend' ? 'pausing'
+    : state.suspended ? 'resuming' : 'running';
+  const job = state.activeJob;
+  const jobLive = job?.process !== undefined && await isOwnedAlive(job.process);
+  const orphans = job?.process && !jobLive ? await groupMembers(job.process.pgid) : [];
+  const supervisorOrphans = state.supervisor && !live ? await groupMembers(state.supervisor.process.pgid) : [];
+  const lastExit = state.history.findLast(event => event.type === 'supervisor_exited');
+  const exit = lastExit ? exitDetail.safeParse(lastExit.detail) : null;
+  const reason = factory === 'exited' ? 'The supervisor process ended without recording its exit. Start clears the stale record.'
+    : factory === 'idle' && exit?.success && exit.data.outcome === 'error' ? redact(exit.data.message)
+    : state.unknownUsage && !terminal(state.status) ? 'Some worker token use is unknown. Review usage before starting.'
+    : state.reason ? redact(state.reason) : null;
+  const startable = factory === 'idle' || factory === 'exited' || factory === 'pausing' || factory === 'paused';
+  return {
+    state: factory,
+    supervisor: state.supervisor ? { pid: state.supervisor.process.pid, launchedAt: state.supervisor.launchedAt } : null,
+    activeJob: job ? { id: job.id, kind: job.kind, startedAt: job.startedAt, frozen: live && state.suspended } : null,
+    canStart: startable && !state.unknownUsage,
+    canPause: factory === 'running' || factory === 'resuming' || ((factory === 'idle' || factory === 'exited') && state.control !== 'suspend'),
+    canStop: factory !== 'terminal' || live || jobLive || orphans.length > 0 || supervisorOrphans.length > 0,
+    startLabel: state.control === 'suspend' || state.suspended ? 'Resume' : 'Start',
+    reason, orphans,
+  };
+}
+
 function issue(code: string, message: string, recommendation: string, runId?: string): Issue {
   return { code, severity: 'warning', message, recommendation, ...(runId ? { runId } : {}) };
 }
@@ -69,7 +115,7 @@ function issue(code: string, message: string, recommendation: string, runId?: st
 const knownReasons = new Set(['completed', 'cancelled', 'timeout', 'output_limit', 'capture_error', 'spawn_error', 'exit_error', 'failed']);
 function safeReason(value: string | undefined) { return value && knownReasons.has(value) ? value : value ? 'recorded_failure' : null; }
 function safeEvent(value: string) { return /^[a-z][a-z0-9_]{0,40}$/.test(value) ? value : 'recorded_event'; }
-export function projectRun(state: State, settings: Settings = defaultSettings, redact: (value: string) => string = value => value) {
+export function projectRun(state: State, settings: Settings = defaultSettings, redact: (value: string) => string = value => value, factory?: FactoryView) {
   const unknownUsage = state.unknownUsage || state.attempts.some(attempt => attempt.inputTokens == null || attempt.outputTokens == null);
   const attempts = state.attempts.map(attempt => ({
     id: attempt.id, role: attempt.role, model: { ...attempt.model, model: redact(attempt.model.model) },
@@ -81,7 +127,8 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
   const issues: Issue[] = [];
   if (unknownUsage)
     issues.push(issue('usage_unknown', 'Some worker token use is unknown.', 'Review usage evidence before dispatching another attempt.', state.id));
-  if (state.activeJob) issues.push(issue('job_unconfirmed', 'A job is recorded as active; live process health is unavailable.', 'Inspect captured evidence and reconcile the job before retrying.', state.id));
+  const supervised = factory !== undefined && ['running', 'pausing', 'paused', 'resuming'].includes(factory.state);
+  if (state.activeJob && !supervised) issues.push(issue('job_unconfirmed', 'A job is recorded as active; live process health is unavailable.', 'Inspect captured evidence and reconcile the job before retrying.', state.id));
   if (state.activeJob && Date.now() - Date.parse(state.activeJob.startedAt) > state.project.limits.attemptTimeoutMs)
     issues.push(issue('job_stale', 'The recorded job has exceeded its attempt timeout; process health is unconfirmed.', 'Inspect capture and reconcile ownership before retrying.', state.id));
   if (Date.now() - Date.parse(state.updatedAt) > settings.recovery.staleMinutes * 60000 && ['running', 'verifying'].includes(state.status))
@@ -98,7 +145,12 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
     issues.push(issue('repeated_failures', 'Repeated attempts failed.', 'Review the recovery brief, then consider a smaller task or a different configured model.', state.id));
   if (state.attempts.some(attempt => (attempt.inputTokens ?? 0) >= settings.recovery.contextTokenThreshold))
     issues.push(issue('reported_input_threshold', 'An attempt reported input tokens above the configured threshold.', 'Review the attempt handoff before a new context. Current context occupancy is unknown.', state.id));
-  if (state.status === 'awaiting_input') issues.push(issue('input_required', 'This run awaits an operator decision.', 'Review the last event and failed checks.', state.id));
+  if (state.status === 'awaiting_input') {
+    const answered = Boolean(state.questionBatches?.length) && state.questionBatches?.every(batch => batch.answer);
+    issues.push(answered
+      ? issue('answers_pending_review', 'Answers await coordinator review.', 'Reconcile the recorded answers with the approved specification before resuming work.', state.id)
+      : issue('input_required', 'This run awaits an operator decision.', 'Review the consequential questions and their impact before answering.', state.id));
+  }
   if (state.status === 'failed') issues.push(issue('run_failed', 'This run failed.', 'Review recorded attempts and checks.', state.id));
   return {
     id: state.id, status: state.status, revision: state.revision, updatedAt: state.updatedAt,
@@ -110,7 +162,18 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
       attemptTimeoutMs: state.project.limits.attemptTimeoutMs },
     attempts, events: state.history.map(({ sequence, at, type }) => ({ sequence, at, type: safeEvent(type) })), issues,
     candidate: state.candidate ?? null, checks: { passed: state.checks.filter(check => check.passed).length, total: state.checks.length },
-    recoveryAvailable: true, controlPending: state.control ?? null,
+    specifications: (state.specifications ?? []).map(spec => ({ ...spec, title: redact(spec.title), content: redact(spec.content),
+      approval: { ...spec.approval, owner: redact(spec.approval.owner), statement: redact(spec.approval.statement) } })),
+    tickets: (state.tickets ?? []).map(ticket => ({ ...ticket, status: ticketProgress(state, ticket), title: redact(ticket.title), architectNote: redact(ticket.architectNote) })),
+    questionBatches: (state.questionBatches ?? []).map(batch => ({ ...batch, title: redact(batch.title),
+      questions: batch.questions.map(({ visualEvidence, ...question }) => ({ ...question, prompt: redact(question.prompt), owner: redact(question.owner),
+        impact: redact(question.impact), recommendation: redact(question.recommendation), options: question.options.map(redact),
+        ...(visualEvidence ? { visualEvidence: visualEvidence.filter(image => image.candidate === state.candidate && image.specDigest === state.specDigest)
+          .map(image => ({ id: image.id, label: redact(image.label), sourceId: image.sourceId,
+            url: `/api/runs/${state.id}/questions/${batch.id}/${question.id}/images/${image.id}` })),
+          visualEvidenceStale: visualEvidence.some(image => image.candidate !== state.candidate || image.specDigest !== state.specDigest) } : {}) })),
+      ...(batch.answer ? { answer: { ...batch.answer, owner: redact(batch.answer.owner), answers: batch.answer.answers.map(answer => ({ ...answer, value: redact(answer.value) })) } } : {}) })),
+    recoveryAvailable: true, ...(factory ? { factory } : {}),
   };
 }
 
@@ -119,7 +182,11 @@ export class Dashboard {
   readonly store: Store;
   readonly privateDir: string;
   private mutation = Promise.resolve();
-  constructor(root: string) { mkdirSync(root, { recursive: true, mode: 0o700 }); const canonical = realpathSync(root); this.store = new Store(canonical); this.privateDir = path.join(canonical, '.dashboard'); }
+  private readonly githubFetch: typeof fetch;
+  private readonly supervisorCommand: (root: string, run: string, launchId: string) => string[];
+  constructor(root: string, githubFetch: typeof fetch = fetch, options: { supervisorCommand?: (root: string, run: string, launchId: string) => string[] } = {}) {
+    this.supervisorCommand = options.supervisorCommand ?? ((stateRoot, run, launchId) => [process.execPath, path.join(factoryRoot, 'src', 'factory-cli.ts'), 'supervise', stateRoot, run, launchId]);
+    this.githubFetch = githubFetch; mkdirSync(root, { recursive: true, mode: 0o700 }); const canonical = realpathSync(root); this.store = new Store(canonical); this.privateDir = path.join(canonical, '.dashboard'); }
 
   private async serialized<T>(fn: () => Promise<T>): Promise<T> {
     const result = this.mutation.then(fn);
@@ -183,7 +250,7 @@ export class Dashboard {
     const runs = [];
     const issues: Issue[] = [];
     for (const run of ids) {
-      try { runs.push(projectRun(await this.store.read(run), settings, redact)); }
+      try { const state = await this.store.read(run); runs.push(projectRun(state, settings, redact, await factoryView(state, redact))); }
       catch { issues.push({ code: 'run_corrupt', severity: 'error', message: `Run ${run} cannot be read safely.`, recommendation: 'Inspect state and event records; do not dispatch or overwrite this run.', runId: run }); }
     }
     runs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -195,13 +262,16 @@ export class Dashboard {
         reviewer: { ...settings.models.reviewer, model: redact(settings.models.reviewer.model) },
         inspector: { ...settings.models.inspector, model: redact(settings.models.inspector.model) },
       } };
-    return { generatedAt: new Date().toISOString(), capabilities: { execution: false, liveHeartbeat: false },
+    return { generatedAt: new Date().toISOString(), capabilities: { execution: true, liveHeartbeat: false, githubSync: true },
       settings: safeSettings, credentials, runs, issues };
   }
   async recovery(run: string) {
     id.parse(run);
     const state = await this.store.read(run);
+    const projected = (await this.snapshot()).runs.find(record => record.id === run);
+    if (!projected) throw new Error('Run cannot be projected');
     return {
+      specifications: projected.specifications, tickets: projected.tickets, questionBatches: projected.questionBatches,
       kind: 'recovery_brief', runId: state.id, status: state.status, revision: state.revision,
       sourceBase: state.sourceBase, candidate: state.candidate ?? null, specDigest: state.specDigest,
       counters: { attempts: state.attempts.length, reworks: state.reworks, reportedTokens: state.reportedTokens,
@@ -219,16 +289,203 @@ export class Dashboard {
       nextAction: state.activeJob ? 'Reconcile the recorded job and external effects before retrying.' : 'Review failed evidence and resume through a future coordinator.',
     };
   }
-  async control(run: string, value: unknown) {
+  async answerQuestions(run: string, value: unknown) {
     id.parse(run);
-    const input = z.object({ action: z.enum(['suspend', 'cancel']), expectedRevision: positive }).strict().parse(value);
-    await this.store.update(run, 'control_requested', { action: input.action }, state => {
+    const input = z.object({ expectedRevision: positive, batchId: id, owner: z.string().trim().min(1).max(300),
+      answers: z.array(z.object({ questionId: id, value: z.string().trim().min(1).max(10000) }).strict()).min(1),
+    }).strict().parse(value);
+    await this.store.update(run, 'questions_answered', { batchId: input.batchId, owner: input.owner }, async state => {
       if (state.revision !== input.expectedRevision) throw new StaleRevision();
-      state.control = input.action;
+      const batch = state.questionBatches?.find(record => record.id === input.batchId);
+      if (!batch || batch.answer) throw new CollaborationError('Question batch is unavailable');
+      if (['cancelled', 'failed', 'handoff_ready'].includes(state.status)) throw new CollaborationError('Run cannot receive answers');
+      if (batch.questions.some(question => question.visualEvidence?.length) && input.owner !== state.approval.owner)
+        throw new CollaborationError('Visual answer owner does not match approval owner');
+      for (const question of batch.questions) for (const image of question.visualEvidence ?? []) {
+        if (image.candidate !== state.candidate || image.specDigest !== state.specDigest)
+          throw new CollaborationError('Visual evidence belongs to a different candidate or specification');
+        if (input.answers.some(answer => answer.questionId === question.id && answer.value === 'approve'))
+          await this.store.readVisualEvidence(run, batch.id, question.id, image);
+      }
+      batch.answer = { owner: input.owner, source: 'operator', answeredAt: new Date().toISOString(), answers: input.answers };
     });
-    return { message: `${input.action} requested and recorded. No coordinator is running to confirm the worker has stopped.` };
+    return { message: 'Answers recorded for the factory. Acceptance and execution status remain unchanged.' };
+  }
+  async visualImage(run: string, batchId: string, questionId: string, imageId: string) {
+    id.parse(run); id.parse(batchId); id.parse(questionId); id.parse(imageId);
+    const state = await this.store.read(run);
+    const batch = state.questionBatches?.find(item => item.id === batchId);
+    const question = batch?.questions.find(item => item.id === questionId);
+    const image = question?.visualEvidence?.find(item => item.id === imageId);
+    if (!image || image.candidate !== state.candidate || image.specDigest !== state.specDigest) return null;
+    return this.store.readVisualEvidence(run, batchId, questionId, image);
+  }
+  async syncTickets(run: string, value: unknown) {
+    id.parse(run);
+    const input = z.object({ expectedRevision: positive }).strict().parse(value);
+    const secrets = await this.secrets();
+    const token = secrets.github;
+    const redact = (value: string) => [token, ...Object.values(secrets.application)].filter((secret): secret is string => Boolean(secret)).sort((a, b) => b.length - a.length).reduce((result, secret) => result.replaceAll(secret, '[REDACTED]'), value);
+    if (!token) throw new CollaborationError('GitHub credential is required');
+    await this.store.update(run, 'tickets_synced', {}, async state => {
+      if (state.revision !== input.expectedRevision) throw new StaleRevision();
+      const repository = githubUrl.parse(state.project.repository).replace(/\.git$/, '').slice('https://github.com/'.length);
+      const headers = { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28' };
+      for (const ticket of state.tickets ?? []) {
+        ticket.status = ticketProgress(state, ticket);
+        const marker = `<!-- factory:${state.id}:${ticket.id} -->`;
+        const specifications = (state.specifications ?? []).filter(spec => ticket.specificationIds.includes(spec.id));
+        const body = [marker, `Requirements: ${ticket.requirements.join(', ')}`, `Progress: ${ticket.status}`, ticket.architectNote,
+          ...specifications.map(spec => `## ${spec.kind}: ${spec.title} (revision ${spec.revision})\nApproved by ${spec.approval.owner}: ${spec.approval.statement}\nDigest: ${spec.digest}\n\n${spec.content}`)].join('\n\n');
+        let number = ticket.github?.number;
+        if (!number) {
+          for (let page = 1; ; page++) {
+            const response = await this.githubFetch(`https://api.github.com/repos/${repository}/issues?state=all&per_page=100&page=${page}`, { headers, redirect: 'error', signal: AbortSignal.timeout(15000) });
+            if (!response.ok) throw new CollaborationError('GitHub ticket lookup failed');
+            const issues = z.array(z.object({ number: positive, body: z.string().nullable(), pull_request: z.unknown().optional() })).parse(await response.json());
+            number = issues.find(issue => !issue.pull_request && issue.body?.includes(marker))?.number;
+            if (number || issues.length < 100) break;
+          }
+        }
+        if (number) {
+          const response = await this.githubFetch(`https://api.github.com/repos/${repository}/issues/${number}`, { headers, redirect: 'error', signal: AbortSignal.timeout(15000) });
+          if (!response.ok) throw new CollaborationError('GitHub ticket ownership lookup failed');
+          const existing = z.object({ number: positive, body: z.string().nullable(), pull_request: z.unknown().optional() }).parse(await response.json());
+          if (existing.number !== number || existing.pull_request || !existing.body?.includes(marker)) throw new CollaborationError('GitHub ticket ownership mismatch');
+        }
+        const response = await this.githubFetch(`https://api.github.com/repos/${repository}/issues${number ? '/' + number : ''}`, {
+          method: number ? 'PATCH' : 'POST', headers, redirect: 'error', signal: AbortSignal.timeout(15000),
+          body: JSON.stringify({ title: redact(ticket.title), body: redact(body), state: ticket.status === 'done' ? 'closed' : 'open' }),
+        });
+        if (!response.ok) throw new CollaborationError('GitHub ticket sync failed');
+        const result = z.object({ number: positive, html_url: z.string().url() }).parse(await response.json());
+        if (result.html_url !== `https://github.com/${repository}/issues/${result.number}`) throw new CollaborationError('Unexpected GitHub ticket identity');
+        ticket.github = { number: result.number, url: result.html_url, syncedAt: new Date().toISOString() };
+      }
+    });
+    return { message: 'Tickets and approved specifications synced to GitHub.' };
+  }
+  async control(run: string, value: unknown): Promise<{ factory: FactoryView; changed: boolean; message: string }> {
+    id.parse(run);
+    const input = z.discriminatedUnion('action', [
+      z.object({ action: z.literal('start'), expectedRevision: positive }).strict(),
+      z.object({ action: z.literal('pause') }).strict(),
+      z.object({ action: z.literal('stop') }).strict(),
+    ]).parse(value);
+    const done = async (changed: boolean, message: string) => ({ factory: await factoryView(await this.store.read(run)), changed, message });
+    if (input.action === 'pause') {
+      let changed = false;
+      const state = await this.store.read(run);
+      if (!terminal(state.status) && !state.control)
+        await this.store.update(run, 'factory_pause_requested', {}, current => {
+          if (terminal(current.status) || current.control) return;
+          current.control = 'suspend';
+          changed = true;
+        });
+      return done(changed, changed ? 'Pause requested. The supervisor freezes running workers and starts no new work.' : 'The factory is already paused, stopping, or finished.');
+    }
+    const launchLock = <T>(fn: () => Promise<T>) => this.store.lock(`launch-${run}`, fn).catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'ELOCKED') throw new FactoryConflict('Another start or stop for this run is in progress.');
+      throw error;
+    });
+    if (input.action === 'stop') return launchLock(async () => {
+      const before = await this.store.read(run);
+      const changed = await this.stop(run);
+      return done(changed, !changed ? 'The run is already finished.' : terminal(before.status)
+        ? `Remaining processes stopped. The run remains ${before.status}.` : 'The factory stopped and the run is cancelled.');
+    });
+    return this.serialized(() => launchLock(async () => {
+      const state = await this.store.read(run);
+      if (terminal(state.status)) throw new FactoryConflict(`The run is ${state.status}; a finished run cannot start.`);
+      if (state.unknownUsage) throw new FactoryConflict('Some worker token use is unknown. Review usage before starting.');
+      const holder = await this.store.holder();
+      if (holder && holder !== run) throw new FactoryConflict(`Run ${holder} holds the state root.`);
+      if (state.control === 'cancel') throw new FactoryConflict('The factory is stopping. Finish Stop first.');
+      if (state.supervisor && await isOwnedAlive(state.supervisor.process)) {
+        if (state.control !== 'suspend') return done(false, 'The factory is already running.');
+        await this.store.update(run, 'factory_resume_requested', {}, current => { if (current.control === 'suspend') current.control = undefined; });
+        return done(true, 'Resume requested. The supervisor continues the frozen workers.');
+      }
+      if (state.revision !== input.expectedRevision) throw new StaleRevision();
+      // A job left by a lost supervisor is stopped only when its recorded identity is proven.
+      // The record stays, so the coordinator moves the run to awaiting_input as an uncertain prior job.
+      if (state.activeJob?.process && await terminateOwned(state.activeJob.process, 5000) !== 'gone')
+        throw new FactoryConflict('A prior worker process group is still running. Stop the run and inspect its processes before starting.');
+      const launchId = randomUUID();
+      await this.store.update(run, 'factory_start_requested', { launchId }, current => {
+        if (current.revision !== state.revision) throw new StaleRevision();
+        current.control = undefined; current.suspended = false; current.supervisor = undefined;
+      });
+      await this.launch(run, launchId);
+      return done(true, 'The factory supervisor started.');
+    }));
+  }
+  private async launch(run: string, launchId: string) {
+    const logDir = path.join(this.store.dir(run), 'supervisor');
+    await mkdir(logDir, { recursive: true, mode: 0o700 });
+    const logPath = path.join(logDir, `${launchId}.log`);
+    const log = await open(logPath, 'wx', 0o600);
+    const argv = this.supervisorCommand(this.store.root, run, launchId);
+    const env = Object.fromEntries(['PATH', 'HOME', 'LANG', 'TMPDIR', 'USER', 'LOGNAME'].flatMap(name => process.env[name] ? [[name, process.env[name]]] : []));
+    let exitCode: number | null = null;
+    let exited = false;
+    const child = spawn(argv[0], argv.slice(1), { cwd: factoryRoot, detached: true, stdio: ['ignore', log.fd, log.fd], env });
+    child.once('exit', code => { exited = true; exitCode = code; });
+    child.once('error', () => { exited = true; });
+    await log.close();
+    child.unref();
+    const registered = (state: State) => state.supervisor?.launchId === launchId || state.history.some(event =>
+      event.type === 'supervisor_started' && z.object({ launchId: z.string() }).passthrough().safeParse(event.detail).data?.launchId === launchId);
+    const deadline = Date.now() + 5000;
+    while (!exited && Date.now() < deadline) {
+      if (registered(await this.store.read(run))) return;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    if (registered(await this.store.read(run))) return;
+    // Our own unreaped child cannot have a reused pid, so signalling its group is safe.
+    if (!exited && child.pid !== undefined) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* Exited meanwhile. */ } }
+    throw new LaunchFailed(`The supervisor did not register${exited ? ` and exited with code ${exitCode}` : ' within 5 seconds'}. Log: ${logPath}`);
+  }
+  /** Returns false when the run is already finished and nothing remains to stop. */
+  private async stop(run: string): Promise<boolean> {
+    const state = await this.store.read(run);
+    if (terminal(state.status) && !state.activeJob?.process && !state.supervisor?.process) return false;
+    if (!terminal(state.status) && state.control !== 'cancel')
+      await this.store.update(run, 'factory_stop_requested', {}, current => { if (!terminal(current.status)) current.control = 'cancel'; });
+    const supervisor = state.supervisor?.process;
+    if (supervisor && await isOwnedAlive(supervisor)) {
+      try { process.kill(supervisor.pid, 'SIGTERM'); }
+      catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error; }
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline && await isOwnedAlive(supervisor))
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    const job = (await this.store.read(run)).activeJob?.process ?? state.activeJob?.process;
+    if (supervisor) await terminateOwned(supervisor, 0);
+    if (job) await terminateOwned(job, 2000);
+    const survivors = (await Promise.all([supervisor, job].filter((owned): owned is OwnedProcess => owned !== undefined)
+      .map(async owned => await groupAlive(owned.pgid) ? groupMembers(owned.pgid) : []))).flat();
+    if (survivors.length) throw new StopIncomplete(`Processes still running after Stop: ${survivors.join(', ')}.`);
+    const current = await this.store.read(run);
+    if (!terminal(current.status) || current.activeJob || current.supervisor || current.control || current.suspended) {
+      await this.store.update(run, current.status === 'failed' || current.status === 'handoff_ready' ? 'factory_processes_cleaned' : 'run_cancelled_recovered', {}, recovered => {
+        const at = new Date().toISOString();
+        for (const attempt of recovered.attempts.filter(attempt => attempt.status === 'running')) {
+          attempt.status = 'interrupted'; attempt.endedAt = at; recovered.unknownUsage = true;
+        }
+        recovered.activeJob = undefined; recovered.supervisor = undefined;
+        recovered.control = undefined; recovered.suspended = false;
+        if (!terminal(recovered.status)) move(recovered, 'cancelled', 'Operator stopped the factory');
+      });
+    }
+    await this.store.release(run);
+    return !terminal(state.status) || Boolean(supervisor || job);
   }
 }
 
+export class FactoryConflict extends Error {}
+export class LaunchFailed extends Error {}
+export class StopIncomplete extends Error {}
+export class CollaborationError extends Error {}
 export class StaleRevision extends Error {}
 function isMissing(error: unknown) { return error instanceof Error && 'code' in error && error.code === 'ENOENT'; }

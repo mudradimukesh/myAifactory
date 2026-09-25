@@ -21,13 +21,13 @@ async function openDashboard() {
   return { root, base: `http://127.0.0.1:${address.port}`, close: () => new Promise<void>(resolve => server.close(() => resolve())) };
 }
 
-test('empty dashboard tells the operator execution is unavailable', async () => {
+test('empty dashboard reports execution controls as available', async () => {
   const app = await openDashboard();
   try {
     const response = await fetch(`${app.base}/api/dashboard`);
     assert.equal(response.status, 200);
     const body = await response.json();
-    assert.deepEqual(body.capabilities, { execution: false, liveHeartbeat: false });
+    assert.deepEqual(body.capabilities, { execution: true, liveHeartbeat: false, githubSync: true });
     assert.deepEqual(body.runs, []);
     assert.equal(body.settings.budget.maxAttempts > body.settings.budget.verificationReserveAttempts, true);
     assert.equal(body.credentials.github, false);
@@ -134,21 +134,91 @@ test('run projection flags unconfirmed job and missing token usage; recovery kee
   } finally { await app.close(); }
 });
 
-test('control request records pending intent and rejects stale revision', async () => {
+async function session(base: string) {
+  const { csrfToken } = await (await fetch(`${base}/api/session`)).json();
+  return (url: string, value: unknown, token: string | null = csrfToken) => fetch(`${base}${url}`, {
+    method: 'POST', headers: { Origin: base, ...(token ? { 'X-CSRF-Token': token } : {}) }, body: JSON.stringify(value),
+  });
+}
+
+test('control takes the start, pause and stop body and projects a factory view', async () => {
   const app = await openDashboard();
   try {
-    await new Store(app.root).create(runState());
-    const { csrfToken } = await (await fetch(`${app.base}/api/session`)).json();
-    const request = (expectedRevision: number) => fetch(`${app.base}/api/runs/run-one/control`, {
-      method: 'POST', headers: { Origin: app.base, 'X-CSRF-Token': csrfToken },
-      body: JSON.stringify({ action: 'suspend', expectedRevision }),
-    });
-    assert.equal((await request(1)).status, 200);
-    const state = await new Store(app.root).read('run-one');
-    assert.equal(state.control, 'suspend');
-    assert.equal(state.revision, 2);
-    assert.equal((await request(1)).status, 409);
-    assert.equal((await new Store(app.root).read('run-one')).revision, 2);
+    const store = new Store(app.root);
+    await store.create(runState());
+    const post = await session(app.base);
+    const control = (value: unknown) => post('/api/runs/run-one/control', value);
+    assert.equal((await control({ action: 'suspend', expectedRevision: 1 })).status, 400);
+    assert.equal((await control({ action: 'pause', expectedRevision: 1 })).status, 400);
+    const initial = (await (await fetch(`${app.base}/api/dashboard`)).json()).runs[0];
+    assert.equal('controlPending' in initial, false);
+    assert.deepEqual(initial.factory, { state: 'idle', supervisor: null, activeJob: { id: 'job-one', kind: 'worker', startedAt: '2026-09-23T00:00:00.000Z', frozen: false },
+      canStart: true, canPause: true, canStop: true, startLabel: 'Start', reason: null, orphans: [] });
+    const paused = await control({ action: 'pause' });
+    assert.equal(paused.status, 200);
+    const pausedBody = await paused.json();
+    assert.equal(pausedBody.changed, true);
+    assert.equal(pausedBody.factory.state, 'idle');
+    assert.equal(pausedBody.factory.startLabel, 'Resume');
+    assert.equal(pausedBody.factory.canPause, false);
+    assert.equal((await store.read('run-one')).control, 'suspend');
+    assert.equal((await (await control({ action: 'pause' })).json()).changed, false);
+    assert.equal((await store.read('run-one')).revision, 2);
+    // Stop with no supervisor records the cancellation and resolves the unproven job record.
+    const stopped = await control({ action: 'stop' });
+    assert.equal(stopped.status, 200);
+    const stoppedBody = await stopped.json();
+    assert.equal(stoppedBody.changed, true);
+    assert.equal(stoppedBody.factory.state, 'terminal');
+    assert.deepEqual([stoppedBody.factory.canStart, stoppedBody.factory.canPause, stoppedBody.factory.canStop], [false, false, false]);
+    const state = await store.read('run-one');
+    assert.equal(state.status, 'cancelled');
+    assert.equal(state.activeJob, undefined);
+    assert.equal(state.control, undefined);
+    assert.equal(state.history.at(-1)?.type, 'run_cancelled_recovered');
+    const bytes = await readFile(path.join(store.dir('run-one'), 'state.json'));
+    const repeat = await control({ action: 'stop' });
+    assert.equal((await repeat.json()).changed, false);
+    const start = await control({ action: 'start', expectedRevision: state.revision });
+    assert.equal(start.status, 409);
+    assert.equal((await start.json()).code, 'factory_conflict');
+    assert.deepEqual(await readFile(path.join(store.dir('run-one'), 'state.json')), bytes);
+  } finally { await app.close(); }
+});
+
+test('start rejects a stale revision without launching or writing', async () => {
+  const app = await openDashboard();
+  try {
+    const store = new Store(app.root);
+    await store.create(runState());
+    await store.update('run-one', 'fixture_changed', {}, () => {});
+    const bytes = await readFile(path.join(store.dir('run-one'), 'state.json'));
+    const response = await (await session(app.base))('/api/runs/run-one/control', { action: 'start', expectedRevision: 1 });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).code, 'stale_revision');
+    assert.deepEqual(await readFile(path.join(store.dir('run-one'), 'state.json')), bytes);
+    await assert.rejects(lstat(path.join(store.dir('run-one'), 'supervisor')), { code: 'ENOENT' });
+  } finally { await app.close(); }
+});
+
+test('control and Claude login routes reject requests without the session CSRF token', async () => {
+  const app = await openDashboard();
+  try {
+    const store = new Store(app.root);
+    await store.create(runState());
+    const post = await session(app.base);
+    for (const [url, value] of [['/api/runs/run-one/control', { action: 'pause' }], ['/api/auth/claude/login', {}],
+      ['/api/auth/claude/login/code', { code: 'fixture-code' }], ['/api/auth/claude/login/cancel', {}]] as const) {
+      for (const token of [null, 'wrong-token']) {
+        const response = await post(url, value, token);
+        assert.equal(response.status, 403, url);
+        assert.equal((await response.json()).code, 'csrf_rejected');
+      }
+    }
+    assert.equal((await store.read('run-one')).revision, 1);
+    const script = await fetch(`${app.base}/claude-login.js`);
+    assert.equal(script.status, 200);
+    assert.match(script.headers.get('content-type') ?? '', /^text\/javascript/);
   } finally { await app.close(); }
 });
 

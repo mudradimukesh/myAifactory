@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import test from 'node:test';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { runProcess } from '../src/process.ts';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+import { PauseGate, groupAlive, identify, runProcess, terminateOwned } from '../src/process.ts';
 
 async function withLogs(run: (paths: { stdoutPath: string; stderrPath: string }) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'factory-process-'));
@@ -212,4 +214,113 @@ test('persists output while the worker is still running', async () => {
       await pending;
     }
   });
+});
+
+const execAsync = promisify(execFile);
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+async function psStat(pid: number): Promise<string> {
+  try { return (await execAsync('/bin/ps', ['-o', 'stat=', '-p', String(pid)])).stdout.trim(); }
+  catch { return ''; }
+}
+async function until<T>(read: () => Promise<T>, done: (value: T) => boolean, ms = 3000): Promise<T> {
+  const deadline = Date.now() + ms;
+  let value = await read();
+  while (!done(value) && Date.now() < deadline) { await sleep(25); value = await read(); }
+  return value;
+}
+function alive(pid: number) {
+  try { process.kill(pid, 0); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; throw error; }
+}
+// The leader prints the grandchild pid once the grandchild runs. The marker lets a ps filter find leftovers.
+const forking = (grandchild: string) => `/*dev1-fixture*/const c=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify('/*dev1-fixture*/' + grandchild)}],{stdio:['ignore','ignore','ignore','ipc']});c.on('message',()=>process.stdout.write(String(c.pid)));setInterval(()=>{},1000)`;
+const readyGrandchild = "process.send('ready');setInterval(()=>{},1000)";
+
+test('pause stops every group member including a grandchild and resume continues them', async () => {
+  await withLogs(async paths => {
+    const gate = new PauseGate();
+    const controller = new AbortController();
+    let leader = 0;
+    const pending = runProcess({ argv: [process.execPath, '-e', forking(readyGrandchild)], cwd: process.cwd(), ...paths,
+      timeoutMs: 20000, maxLogBytes: 4096, signal: controller.signal, pause: gate, onSpawn: async pid => { leader = pid; } });
+    try {
+      const grandchild = Number(await until(() => readFile(paths.stdoutPath, 'utf8').catch(() => ''), text => text.length > 0));
+      assert.ok(leader > 0 && grandchild > 0 && grandchild !== leader);
+      gate.pause();
+      const frozen = await until(() => Promise.all([psStat(leader), psStat(grandchild)]), all => all.every(value => value.includes('T')));
+      assert.ok(frozen.every(value => value.includes('T')), `stopped states ${frozen}`);
+      gate.resume();
+      const thawed = await until(() => Promise.all([psStat(leader), psStat(grandchild)]), all => all.every(value => /^[SR]/.test(value)));
+      assert.ok(thawed.every(value => /^[SR]/.test(value)), `running states ${thawed}`);
+      controller.abort();
+      const result = await pending;
+      assert.equal(result.reason, 'cancelled');
+      assert.ok(result.pausedMs > 0);
+      assert.equal(await until(async () => alive(grandchild), value => !value), false);
+    } finally { controller.abort(); await pending; }
+  });
+});
+
+test('a pause freezes the timeout and reports the frozen time', async () => {
+  await withLogs(async paths => {
+    const gate = new PauseGate();
+    const started = Date.now();
+    let settled = false;
+    const pending = runProcess({ argv: [process.execPath, '-e', '/*dev1-fixture*/setInterval(()=>{},1000)'], cwd: process.cwd(), ...paths,
+      timeoutMs: 1500, maxLogBytes: 4096, pause: gate });
+    void pending.then(() => { settled = true; });
+    await sleep(200);
+    gate.pause();
+    await sleep(3000);
+    assert.equal(settled, false, 'the timeout fired during the pause');
+    gate.resume();
+    const result = await pending;
+    assert.equal(result.reason, 'timeout');
+    assert.ok(result.pausedMs >= 2500, `pausedMs ${result.pausedMs}`);
+    assert.ok(Date.now() - started >= 1500 + 2500);
+  });
+});
+
+test('cancel while paused kills a descendant that ignores SIGTERM', async () => {
+  await withLogs(async paths => {
+    const gate = new PauseGate();
+    const controller = new AbortController();
+    const pending = runProcess({ argv: [process.execPath, '-e', forking("process.on('SIGTERM',()=>{});" + readyGrandchild)], cwd: process.cwd(), ...paths,
+      timeoutMs: 20000, maxLogBytes: 4096, signal: controller.signal, pause: gate });
+    let grandchild = 0;
+    try {
+      grandchild = Number(await until(() => readFile(paths.stdoutPath, 'utf8').catch(() => ''), text => text.length > 0));
+      gate.pause();
+      assert.ok((await until(() => psStat(grandchild), value => value.includes('T'))).includes('T'));
+      controller.abort();
+      const result = await pending;
+      assert.equal(result.reason, 'cancelled');
+      assert.equal(await until(async () => alive(grandchild), value => !value), false);
+    } finally { controller.abort(); await pending; if (grandchild && alive(grandchild)) process.kill(grandchild, 'SIGKILL'); }
+  });
+});
+
+test('a rejected onSpawn record kills the group and reports spawn_error', async () => {
+  await withLogs(async paths => {
+    let leader = 0;
+    const result = await runProcess({ argv: [process.execPath, '-e', '/*dev1-fixture*/setInterval(()=>{},1000)'], cwd: process.cwd(), ...paths,
+      timeoutMs: 20000, maxLogBytes: 4096, onSpawn: async pid => { leader = pid; throw new Error('record failed'); } });
+    assert.equal(result.reason, 'spawn_error');
+    assert.ok(leader > 0);
+    assert.equal(await groupAlive(leader), false);
+  });
+});
+
+test('terminateOwned signals nothing for a changed identity and stops the proven owner', async () => {
+  const child = spawn(process.execPath, ['-e', '/*dev1-fixture*/setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+  try {
+    const owned = await until(() => identify(child.pid!), value => value !== null);
+    assert.ok(owned);
+    assert.equal(owned.pgid, child.pid);
+    assert.equal(await terminateOwned({ ...owned, started: 'Thu Jan  1 00:00:00 1970' }, 0), 'not_owned');
+    await sleep(200);
+    assert.deepEqual(await identify(owned.pid), owned, 'the process was signalled');
+    assert.equal(await terminateOwned(owned, 1000), 'gone');
+    assert.equal(await groupAlive(owned.pgid), false);
+    assert.equal(await identify(owned.pid), null);
+  } finally { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* Already gone. */ } }
 });

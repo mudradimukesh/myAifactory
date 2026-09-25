@@ -1,6 +1,15 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { open } from 'node:fs/promises';
 import { fsyncSync, writeSync } from 'node:fs';
+import { promisify } from 'node:util';
+import type { OwnedProcess } from './contracts.ts';
+const exec = promisify(execFile);
+/** Operator pause for a running process group. Emits 'pause' and 'resume'. */
+export class PauseGate extends EventTarget {
+    paused = false;
+    pause() { if (this.paused) return; this.paused = true; this.dispatchEvent(new Event('pause')); }
+    resume() { if (!this.paused) return; this.paused = false; this.dispatchEvent(new Event('resume')); }
+}
 export interface ProcessSpec {
     argv: string[];
     cwd: string;
@@ -12,6 +21,9 @@ export interface ProcessSpec {
     maxLogBytes: number;
     signal?: AbortSignal;
     redact?: string[];
+    pause?: PauseGate;
+    /** Awaited before the timeout is armed. A rejection kills the group and yields spawn_error. */
+    onSpawn?: (pid: number) => Promise<void>;
 }
 export interface ProcessResult {
     exitCode: number | null;
@@ -19,6 +31,7 @@ export interface ProcessResult {
     reason: 'completed' | 'exit_error' | 'timeout' | 'cancelled' | 'spawn_error' | 'output_limit' | 'capture_error';
     startedAt: string;
     endedAt: string;
+    pausedMs: number;
 }
 function redactBytes(input: Buffer, secrets: Buffer[]): Buffer {
     let output = input;
@@ -92,6 +105,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
     let timeout: NodeJS.Timeout | undefined;
     let forceKill: NodeJS.Timeout | undefined;
     let cleanup: (() => void) | undefined;
+    let pausedMs = 0;
     try {
         if (spec.signal?.aborted) {
             reason = 'cancelled';
@@ -125,6 +139,8 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                     return;
                 reason = why;
                 kill('SIGTERM');
+                // A group frozen by SIGSTOP acts on SIGTERM only after SIGCONT.
+                kill('SIGCONT');
                 forceKill = setTimeout(() => {
                     kill('SIGKILL');
                     child.stdout.destroy();
@@ -132,8 +148,42 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                 }, 1000);
             };
             const onAbort = () => stop('cancelled');
+            // The timeout counts running time only. A pause keeps the unused remainder.
+            let remaining = spec.timeoutMs;
+            let armedAt = 0;
+            let pausedAt: number | null = null;
+            const arm = () => {
+                armedAt = Date.now();
+                timeout = setTimeout(() => stop('timeout'), remaining);
+            };
+            const freeze = () => {
+                if (pausedAt !== null || reason)
+                    return;
+                pausedAt = Date.now();
+                kill('SIGSTOP');
+                if (timeout) {
+                    clearTimeout(timeout);
+                    timeout = undefined;
+                    remaining = Math.max(0, remaining - (pausedAt - armedAt));
+                }
+            };
+            const thaw = () => {
+                if (pausedAt === null)
+                    return;
+                pausedMs += Date.now() - pausedAt;
+                pausedAt = null;
+                kill('SIGCONT');
+                if (!reason)
+                    arm();
+            };
             cleanup = () => {
                 spec.signal?.removeEventListener('abort', onAbort);
+                spec.pause?.removeEventListener('pause', freeze);
+                spec.pause?.removeEventListener('resume', thaw);
+                if (pausedAt !== null) {
+                    pausedMs += Date.now() - pausedAt;
+                    pausedAt = null;
+                }
                 kill('SIGKILL');
             };
             let captureFailed = false;
@@ -170,7 +220,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                 child.stdin.end(spec.stdin);
             else
                 child.stdin.end();
-            await new Promise<void>((resolve) => {
+            const closed = new Promise<void>((resolve) => {
                 child.once('error', () => { reason ??= 'spawn_error'; });
                 // The direct process can exit while descendants retain pipes or
                 // keep running without them. Neither extends this invocation.
@@ -180,13 +230,28 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                     exitSignal = signal;
                     resolve();
                 });
-                timeout = setTimeout(() => stop('timeout'), spec.timeoutMs);
+            });
+            if (child.pid !== undefined && spec.onSpawn) {
+                // An unrecorded worker must not keep running.
+                try { await spec.onSpawn(child.pid); }
+                catch {
+                    reason ??= 'spawn_error';
+                    kill('SIGKILL');
+                }
+            }
+            if (!reason) {
+                spec.pause?.addEventListener('pause', freeze);
+                spec.pause?.addEventListener('resume', thaw);
+                if (spec.pause?.paused)
+                    freeze();
+                else
+                    arm();
                 spec.signal?.addEventListener('abort', onAbort, { once: true });
                 if (spec.signal?.aborted)
                     onAbort();
-            });
-            spec.signal?.removeEventListener('abort', onAbort);
-            kill('SIGKILL');
+            }
+            await closed;
+            cleanup();
             if (timeout)
                 clearTimeout(timeout);
             if (forceKill)
@@ -204,7 +269,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
                 reason = 'capture_error';
             }
         }
-        return { exitCode, signal: exitSignal, reason: reason!, startedAt, endedAt: new Date().toISOString() };
+        return { exitCode, signal: exitSignal, reason: reason!, startedAt, endedAt: new Date().toISOString(), pausedMs };
     }
     finally {
         cleanup?.();
@@ -214,4 +279,82 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
             clearTimeout(forceKill);
         await Promise.all([stdoutFile.close(), stderrFile.close()]);
     }
+}
+
+/** Identity of a live, non-zombie process, or null when it does not exist. */
+export async function identify(pid: number): Promise<OwnedProcess | null> {
+    try {
+        const { stdout } = await exec('/bin/ps', ['-o', 'pgid=,stat=,lstart=', '-p', String(pid)], { env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, timeout: 5000 });
+        const match = /^\s*(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(stdout);
+        if (!match || match[2].startsWith('Z'))
+            return null;
+        return { pid, pgid: Number(match[1]), started: match[3] };
+    }
+    catch (error) {
+        // ps exits 1 when the pid does not exist.
+        if ((error as { code?: unknown }).code === 1)
+            return null;
+        throw error;
+    }
+}
+export async function isOwnedAlive(p: OwnedProcess): Promise<boolean> {
+    const live = await identify(p.pid);
+    return live !== null && live.pgid === p.pgid && live.started === p.started;
+}
+export async function groupAlive(pgid: number): Promise<boolean> {
+    try {
+        process.kill(-pgid, 0);
+        return true;
+    }
+    catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ESRCH')
+            return false;
+        // macOS answers EPERM for a group whose only members are unreaped zombies.
+        if (code === 'EPERM')
+            return (await groupMembers(pgid)).length > 0;
+        throw error;
+    }
+}
+/** Live members of a process group, excluding zombies. */
+export async function groupMembers(pgid: number): Promise<number[]> {
+    const { stdout } = await exec('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], { env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, timeout: 5000, maxBuffer: 16 * 1024 * 1024 });
+    return stdout.split('\n').map(line => line.trim().split(/\s+/)).filter(([pid, group, stat]) => pid && Number(group) === pgid && !stat?.startsWith('Z')).map(([pid]) => Number(pid));
+}
+/** Whether every live member of a process group has acknowledged SIGSTOP. */
+export async function groupStopped(pgid: number): Promise<boolean> {
+    const { stdout } = await exec('/bin/ps', ['-A', '-o', 'pgid=,stat='], { env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, timeout: 5000, maxBuffer: 16 * 1024 * 1024 });
+    return stdout.split('\n').map(line => line.trim().split(/\s+/))
+        .filter(([group, stat]) => Number(group) === pgid && stat && !stat.startsWith('Z'))
+        .every(([, stat]) => stat.includes('T'));
+}
+async function groupGone(pgid: number, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    for (;;) {
+        if (!await groupAlive(pgid))
+            return true;
+        if (Date.now() >= deadline)
+            return false;
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
+}
+/**
+ * Terminates a recorded process group only after proving the leader is the recorded process.
+ * A group whose leader is dead cannot be proven ours (ADR 0002), so it is reported, never signalled.
+ */
+export async function terminateOwned(p: OwnedProcess, graceMs: number): Promise<'gone' | 'not_owned' | 'survived'> {
+    if (!await isOwnedAlive(p))
+        return await groupAlive(p.pgid) ? 'not_owned' : 'gone';
+    const signal = (name: NodeJS.Signals) => {
+        try { process.kill(-p.pgid, name); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+    };
+    signal('SIGTERM');
+    signal('SIGCONT');
+    // The pgid cannot be reused while any member of the group is alive, so a group
+    // still present after a proven identity check remains ours.
+    if (await groupGone(p.pgid, graceMs))
+        return 'gone';
+    signal('SIGKILL');
+    return await groupGone(p.pgid, 2000) ? 'gone' : 'survived';
 }

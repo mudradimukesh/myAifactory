@@ -3,6 +3,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { State } from '../src/contracts.ts';
 import { Store, json, sha } from '../src/store.ts';
 
@@ -72,5 +74,26 @@ test('holds the state-root reservation across execution calls until explicitly r
     await assert.rejects(store.execution('second', async () => {}), /holds the state root/);
     await store.release('first');
     await store.execution('second', async () => {});
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('concurrent updates from two processes both commit without ELOCKED', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-store-'));
+  const store = new Store(root);
+  try {
+    await store.create(initial());
+    const storeModule = path.resolve(import.meta.dirname, '../src/store.ts');
+    // Each writer holds the run lock for 30 ms per update, so the two processes contend on every write.
+    const writer = (name: string) => promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+      const { Store } = await import(${JSON.stringify(storeModule)});
+      const store = new Store(${JSON.stringify(root)});
+      for (let i = 0; i < 10; i++)
+        await store.update('fixture', ${JSON.stringify(name)}, { i }, () => new Promise(resolve => setTimeout(resolve, 30)));
+    `], { timeout: 30000 });
+    await Promise.all([writer('writer_a'), writer('writer_b')]);
+    const state = await store.read('fixture');
+    assert.equal(state.revision, 21);
+    assert.equal(state.history.filter(event => event.type === 'writer_a').length, 10);
+    assert.equal(state.history.filter(event => event.type === 'writer_b').length, 10);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

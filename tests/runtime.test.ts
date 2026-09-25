@@ -107,3 +107,39 @@ test('native configuration rejects old profiles, overlapping roots and privilege
     await assert.rejects(runtime.execute({ ...job, project: { ...job.project, runtime: { ...job.project.runtime, toolPaths: ['/'] } } }), /Tool directories/);
   });
 });
+
+
+test('outbound sandbox can reach the macOS DNS resolver while restricted jobs cannot', { skip: process.platform !== 'darwin' }, async () => {
+  for (const network of ['none', 'loopback', 'outbound'] as const) await fixture(async job => {
+    job.project.runtime.network = 'outbound';
+    const script = `const net=require('node:net');const socket=net.createConnection('/private/var/run/mDNSResponder');socket.once('connect',()=>{console.log('connected');socket.end();});socket.once('error',error=>{console.log(error.code);});`;
+    const result = await new LocalRuntime().execute({ ...job, network, argv: [process.execPath, '-e', script] });
+    assert.equal(result.reason, 'completed');
+    assert.equal((await readFile(path.join(job.captureDir, 'stdout.log'), 'utf8')).trim(), network === 'outbound' ? 'connected' : 'EPERM');
+  });
+});
+
+test('deep attempt paths retain private Unix IPC and remove temporary files after execution', { skip: process.platform !== 'darwin' }, async () => {
+  await fixture(async (job) => {
+    job.scratchDir = path.join(job.scratchDir, 'deep-attempt-'.repeat(12));
+    await mkdir(job.scratchDir);
+    const script = `
+      const fs=require('node:fs'), net=require('node:net'), path=require('node:path');
+      const temp=process.env.TMPDIR;
+      const server=net.createServer();
+      server.listen(path.join(temp,'worker.sock'),()=>{
+        console.log(JSON.stringify({temp,claudeTemp:process.env.CLAUDE_CODE_TMPDIR,zone:(()=>{try{return fs.readFileSync('/etc/localtime').length>0}catch(e){return e.code}})(),mode:fs.statSync(temp).mode&0o777}));
+        server.close();
+      });
+    `;
+    const result = await new LocalRuntime().execute({ ...job, argv: [process.execPath, '-e', script] });
+    assert.equal(result.reason, 'completed', await readFile(path.join(job.captureDir, 'stderr.log'), 'utf8'));
+    const output = JSON.parse(await readFile(path.join(job.captureDir, 'stdout.log'), 'utf8'));
+    assert.equal(output.mode, 0o700);
+    assert.equal(output.claudeTemp, output.temp);
+    assert.equal(output.zone, true, 'Claude Code spins at startup when it cannot read the local time zone');
+    assert.match(output.temp, /^\/private\/tmp\/factory-[A-Za-z0-9]+$/);
+    await assert.rejects(readFile(path.join(output.temp, 'worker.sock')), { code: 'ENOENT' });
+    await assert.rejects(realpath(output.temp), { code: 'ENOENT' });
+  });
+});

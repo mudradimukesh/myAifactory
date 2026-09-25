@@ -60,7 +60,7 @@
     {
       "name": "factory-design",
       "path": "home/.agents/skills/factory-design/SKILL.md",
-      "sha256": "bddbee79f454dea1d18d80351c4928255edac7e557d277c3e08313dc4acf7b1a",
+      "sha256": "52e4e5a792b0c3d3323fb442d9d5f619c8113e048fdccbbc3bc2c2c6ca41f4f1",
       "references": [
         {
           "path": "home/.agents/skills/factory-design/references/architecture-improvement.md",
@@ -264,7 +264,7 @@
     {
       "name": "factory-verify",
       "path": "home/.agents/skills/factory-verify/SKILL.md",
-      "sha256": "a030594b39413fe58a4253ff3703f3d27222b4edf5152e6843c4955ad83b48c4",
+      "sha256": "14c9db366b34b06c34b801532e9c6f2e956b0d94714c9fee5fd9b5c4d126c6dd",
       "references": [
         {
           "path": "home/.agents/skills/factory-tdd/references/testing-quality.md",
@@ -320,6 +320,19 @@
             "adaptationNotes": "Adapted observable outcomes and meaningful defect sensitivity; absence can be valid specified behavior and is not categorically forbidden."
           }
         ]
+      }
+    },
+    {
+      "name": "factory-swarm",
+      "path": "home/.agents/skills/factory-swarm/SKILL.md",
+      "sha256": "eefc6de387c469df7b6d0ebfef17c4fcea42614c5f183d691389d7e094d6241e",
+      "references": [],
+      "provenance": {
+        "kind": "original-local-instructions",
+        "decision": "docs/adr/0004-bounded-worker-proposals.md",
+        "sourcePaths": [],
+        "licenses": [],
+        "editorialNotes": ["Only the Coordinator runner admits a proposed task; worker-loaded instructions grant no direct spawning authority."]
       }
     },
     {
@@ -437,6 +450,74 @@
             "retrieved": true,
             "adaptationNotes": "Adapted selective reads and compact scoped contracts; excluded automatic subagent fan-out and context-size claims."
           }
+        ]
+      }
+    },
+    {
+      "name": "unslop",
+      "path": "home/.agents/skills/unslop/SKILL.md",
+      "sha256": "c6d2572294d933a428211921069e9a248490e9b466ca59437cb4d9de248600ca",
+      "references": [],
+      "provenance": {
+        "kind": "copied-local-skill",
+        "sourcePath": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/unslop/SKILL.md",
+        "sourceSha256": "c6d2572294d933a428211921069e9a248490e9b466ca59437cb4d9de248600ca",
+        "licenses": [],
+        "editorialNotes": [
+          "Copied unchanged from the operator's local dotfiles as a shared worker skill for every role.",
+          "The frontmatter sets disable-model-invocation: true. The factory ignores frontmatter and loads the text through roles.json.",
+          "Applies to worker prose. JSON-only planner and reviewer outputs are not prose; a live smoke test must confirm workers still return bare JSON."
+        ]
+      }
+    },
+    {
+      "name": "bro",
+      "path": "home/.agents/skills/bro/SKILL.md",
+      "sha256": "aa329d0ceeeecb6822a7174ad76bb07a7826a3c52ceb6a588dec4138815084bb",
+      "references": [],
+      "provenance": {
+        "kind": "copied-local-skill",
+        "sourcePath": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/bro/SKILL.md",
+        "sourceSha256": "aa329d0ceeeecb6822a7174ad76bb07a7826a3c52ceb6a588dec4138815084bb",
+        "licenses": [],
+        "editorialNotes": [
+          "Copied unchanged from the operator's local dotfiles as a shared worker skill for every role.",
+          "The frontmatter sets disable-model-invocation: true. The factory ignores frontmatter and loads the text through roles.json.",
+          "Conflict recorded, not resolved: the skill tells the agent to restate its last message. That contradicts JSON-only planner and reviewer outputs, and agent-factory-design.md section 6.4 deletes conflicting instructions from a bundle before approval. A live smoke test must confirm JSON outputs still parse."
+        ]
+      }
+    },
+    {
+      "name": "principle-guard-the-context-window",
+      "path": "home/.agents/skills/principle-guard-the-context-window/SKILL.md",
+      "sha256": "9f60e2c79b35f865cb103462f9128c6760b70f603475d1e535e5930f61840f66",
+      "references": [],
+      "provenance": {
+        "kind": "copied-local-skill",
+        "sourcePath": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-guard-the-context-window/SKILL.md",
+        "sourceSha256": "9f60e2c79b35f865cb103462f9128c6760b70f603475d1e535e5930f61840f66",
+        "licenses": [],
+        "editorialNotes": [
+          "Copied unchanged from the operator's local dotfiles as a shared worker skill for every role.",
+          "The frontmatter sets disable-model-invocation: true. The factory ignores frontmatter and loads the text through roles.json.",
+          "Conflict recorded, not resolved: the skill routes bulk work to subagents. agent-factory-design.md section 6.4 deletes conflicting instructions, and ADR 0004 forbids recursive worker delegation. Delegation cannot run because Codex workers disable multi_agent and Claude workers have no Task tool."
+        ]
+      }
+    },
+    {
+      "name": "principle-never-block-on-the-human",
+      "path": "home/.agents/skills/principle-never-block-on-the-human/SKILL.md",
+      "sha256": "d82bce9ab9193249d1ec0d514202d89602f0fd3d312174d622c2dd222bae5a2e",
+      "references": [],
+      "provenance": {
+        "kind": "copied-local-skill",
+        "sourcePath": "/Users/mukeshkumarmudradi/.dotfiles/home/.agents/skills/principle-never-block-on-the-human/SKILL.md",
+        "sourceSha256": "d82bce9ab9193249d1ec0d514202d89602f0fd3d312174d622c2dd222bae5a2e",
+        "licenses": [],
+        "editorialNotes": [
+          "Copied unchanged from the operator's local dotfiles as a shared worker skill for every role.",
+          "The frontmatter sets disable-model-invocation: true. The factory ignores frontmatter and loads the text through roles.json.",
+          "Workers still stop through the Coordinator question path. The skill does not authorize irreversible actions or bypass runner acceptance."
         ]
       }
     }

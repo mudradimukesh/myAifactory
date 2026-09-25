@@ -1,5 +1,5 @@
-import { choice as choiceSchema, role as roleSchema } from './contracts.ts';
-import type { Role, WorkerChoice } from './contracts.ts';
+import { choice as choiceSchema, role as roleSchema, headroomSchema } from './contracts.ts';
+import type { Role, WorkerChoice, Headroom } from './contracts.ts';
 export type WorkerOutput = {
     text: string;
     inputTokens: number | null;
@@ -12,12 +12,13 @@ export type WorkerOutput = {
 const writeRoles = new Set<Role>(['business', 'domain', 'architect', 'developer', 'tester']);
 // Execute these commands only through LocalRuntime. Its outer macOS sandbox
 // owns filesystem permissions; macOS rejects a second nested Seatbelt sandbox.
-export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, prompt: string, policy: string): {
+export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, prompt: string, policy: string, headroom?: Headroom): {
     executable: string;
     args: string[];
     stdin: string;
     env: Record<string, string>;
 } {
+    const routing = headroom === undefined ? undefined : headroomSchema.parse(headroom);
     if (choice.provider !== 'codex' && choice.provider !== 'claude') {
         throw new Error('Unknown worker provider');
     }
@@ -35,6 +36,10 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
             args: [
                 'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules',
                 '--disable', 'multi_agent',
+                '--disable', 'apps',
+                '--disable', 'skill_search',
+                '--enable', 'skip_host_skill_discovery',
+                ...(routing ? ['-c', `openai_base_url=${JSON.stringify(routing.baseUrl)}`] : []),
                 '--model', choice.model,
                 '-c', `model_reasoning_effort="${choice.effort}"`,
                 '-c', 'approval_policy="never"',
@@ -44,10 +49,12 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
                 '-',
             ],
             stdin: `Worker policy:\n${policy}\n\nTask:\n${prompt}`,
-            env: {},
+            env: { CODEX_CA_CERTIFICATE: '/private/etc/ssl/cert.pem', SSL_CERT_FILE: '/private/etc/ssl/cert.pem',
+                ...(routing ? { OPENAI_BASE_URL: routing.baseUrl } : {}) },
         };
     }
-    const tools = writeRoles.has(role) ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
+    const tools = (writeRoles.has(role) ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep')
+        + (role === 'developer' || role === 'tester' ? ',Bash' : '');
     return {
         executable: 'claude',
         args: [
@@ -64,7 +71,7 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
             '--append-system-prompt', policy,
         ],
         stdin: prompt,
-        env: {},
+        env: routing ? { ANTHROPIC_BASE_URL: routing.baseUrl.slice(0, -'/v1'.length) } : {},
     };
 }
 function object(value: unknown): Record<string, unknown> | null {
@@ -78,10 +85,17 @@ function string(value: unknown): string | null {
 function tokens(value: unknown): number | null {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
-function usageFields(value: unknown): Pick<WorkerOutput, 'inputTokens' | 'outputTokens' | 'cachedInputTokens'> {
+function usageFields(value: unknown, provider: WorkerChoice['provider']): Pick<WorkerOutput, 'inputTokens' | 'outputTokens' | 'cachedInputTokens'> {
     const usage = object(value);
+    let inputTokens = tokens(usage?.input_tokens ?? usage?.inputTokens);
+    if (provider === 'claude') {
+        const created = tokens(usage && ('cache_creation_input_tokens' in usage ? usage.cache_creation_input_tokens : usage.cacheCreationInputTokens));
+        const read = tokens(usage && ('cache_read_input_tokens' in usage ? usage.cache_read_input_tokens : usage.cacheReadInputTokens));
+        inputTokens = inputTokens !== null && created !== null && read !== null
+            ? tokens(inputTokens + created + read) : null;
+    }
     return {
-        inputTokens: tokens(usage?.input_tokens ?? usage?.inputTokens),
+        inputTokens,
         outputTokens: tokens(usage?.output_tokens ?? usage?.outputTokens),
         cachedInputTokens: tokens(usage?.cached_input_tokens ?? usage?.cache_read_input_tokens ?? usage?.cacheReadInputTokens),
     };
@@ -126,7 +140,7 @@ export function parseWorkerOutput(provider: WorkerChoice['provider'], stdout: st
             }
             else if (event.type === 'turn.completed') {
                 completed = true;
-                Object.assign(output, usageFields(event.usage));
+                Object.assign(output, usageFields(event.usage, provider));
             }
             else if (event.type === 'turn.failed' || event.type === 'error') {
                 output.failed = true;
@@ -143,7 +157,7 @@ export function parseWorkerOutput(provider: WorkerChoice['provider'], stdout: st
             if (model)
                 output.model = model;
             if (message?.usage && output.inputTokens === null) {
-                Object.assign(output, usageFields(message.usage));
+                Object.assign(output, usageFields(message.usage, provider));
             }
         }
         else if (event.type === 'result') {
@@ -152,14 +166,14 @@ export function parseWorkerOutput(provider: WorkerChoice['provider'], stdout: st
             if (result)
                 output.text = result;
             if (event.usage)
-                Object.assign(output, usageFields(event.usage));
+                Object.assign(output, usageFields(event.usage, provider));
             const modelUsage = object(event.modelUsage);
             if (modelUsage) {
                 const models = Object.entries(modelUsage);
                 if (models.length === 1)
                     output.model = models[0][0];
                 if (!event.usage) {
-                    const totals = models.map(([, value]) => usageFields(value));
+                    const totals = models.map(([, value]) => usageFields(value, provider));
                     for (const key of ['inputTokens', 'outputTokens', 'cachedInputTokens'] as const) {
                         const values = totals.map((total) => total[key]);
                         output[key] = values.every((value): value is number => value !== null)
@@ -173,7 +187,8 @@ export function parseWorkerOutput(provider: WorkerChoice['provider'], stdout: st
                 output.reason ??= string(event.result) ?? string(event.subtype) ?? 'Worker failed';
             }
         }
-        else if (event.type === 'error' || event.type === 'rate_limit_event') {
+        else if (event.type === 'error' || event.type === 'rate_limit_event'
+            && !string(object(event.rate_limit_info)?.status)?.startsWith('allowed')) {
             output.failed = true;
             output.reason ??= eventError(event);
         }

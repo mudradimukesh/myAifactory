@@ -30,3 +30,11 @@ test('loads verified role instructions and rejects missing roles, unsupported to
     await assert.rejects(bundle(root), /Skill hash mismatch/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('every role loads the shared worker skills', async () => {
+  const { content } = await bundle();
+  assert.equal(Object.keys(content).length, 7);
+  for (const [role, text] of Object.entries(content))
+    for (const name of ['unslop', 'bro', 'principle-guard-the-context-window', 'principle-never-block-on-the-human'])
+      assert.ok(text.includes(`Resource home/.agents/skills/${name}/SKILL.md\n`), `${role} lacks ${name}`);
+});

@@ -18,7 +18,7 @@ test('Codex workers use explicit policy and delegate filesystem isolation to Loc
   assert.ok(developer.args.includes('project_doc_max_bytes=0'));
   assert.equal(developer.args[developer.args.indexOf('--sandbox') + 1], 'danger-full-access');
   assert.match(developer.stdin, /Worker policy:\nFollow this policy\n\nTask:\nImplement the change/);
-  assert.deepEqual(developer.env, {});
+  assert.deepEqual(developer.env, { CODEX_CA_CERTIFICATE: '/private/etc/ssl/cert.pem', SSL_CERT_FILE: '/private/etc/ssl/cert.pem' });
 
   const reviewer = workerCommand(
     { provider: 'codex', model: 'gpt-5.4-mini', effort: 'medium' },
@@ -48,10 +48,29 @@ test('Claude workers have explicit model and restricted role tools', () => {
     { provider: 'claude', model: 'claude-sonnet-4-6', effort: 'xhigh' },
     'developer', '/tmp/project', 'Build', 'Policy',
   );
-  assert.equal(developer.args[developer.args.indexOf('--tools') + 1], 'Read,Glob,Grep,Edit,Write');
-  assert.ok(!developer.args.join(' ').includes('Bash'));
+  assert.equal(developer.args[developer.args.indexOf('--tools') + 1], 'Read,Glob,Grep,Edit,Write,Bash');
   assert.ok(!developer.args.join(' ').includes('Agent'));
   assert.ok(!developer.args.join(' ').includes('Task'));
+});
+
+test('Headroom routes Codex and Claude workers through the same proxy', () => {
+  const baseUrl = 'http://127.0.0.1:8791/v1';
+  const codex = workerCommand({ provider: 'codex', model: 'gpt-5.4', effort: 'high' },
+    'developer', '/tmp/project', 'Implement the change', 'Follow this policy', { baseUrl });
+  assert.equal(codex.env.OPENAI_BASE_URL, baseUrl);
+  assert.ok(codex.args.includes(`openai_base_url=${JSON.stringify(baseUrl)}`));
+  const claude = workerCommand({ provider: 'claude', model: 'sonnet', effort: 'medium' },
+    'reviewer', '/tmp/project', 'Review the change', 'Follow this policy', { baseUrl });
+  assert.deepEqual(claude.env, { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8791' });
+  const claudeProject = workerCommand({ provider: 'claude', model: 'sonnet', effort: 'medium' },
+    'reviewer', '/tmp/project', 'Review the change', 'Follow this policy',
+    { baseUrl: 'http://127.0.0.1:8791/p/my-aifactory/v1' });
+  assert.deepEqual(claudeProject.env, { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8791/p/my-aifactory' });
+  const claudeUnrouted = workerCommand({ provider: 'claude', model: 'sonnet', effort: 'medium' },
+    'reviewer', '/tmp/project', 'Review the change', 'Follow this policy');
+  assert.deepEqual(claudeUnrouted.env, {});
+  for (const command of [claude, claudeProject, claudeUnrouted])
+    assert.ok(!command.args.some(arg => arg.includes('8791')));
 });
 
 test('worker command refuses implicit model or policy', () => {
@@ -85,12 +104,12 @@ test('Claude stream JSON extracts result, usage, and model', () => {
     { type: 'assistant', message: { model: 'claude-sonnet-4-6', content: [{ type: 'text', text: 'Draft' }] } },
     {
       type: 'result', subtype: 'success', is_error: false, result: 'Final answer',
-      usage: { input_tokens: 90, output_tokens: 15, cache_read_input_tokens: 10 },
-      modelUsage: { 'claude-sonnet-4-6': { inputTokens: 90, outputTokens: 15, cacheReadInputTokens: 10 } },
+      usage: { input_tokens: 90, output_tokens: 15, cache_creation_input_tokens: 0, cache_read_input_tokens: 10 },
+      modelUsage: { 'claude-sonnet-4-6': { inputTokens: 90, outputTokens: 15, cacheCreationInputTokens: 0, cacheReadInputTokens: 10 } },
     },
   ].map((event) => JSON.stringify(event)).join('\n');
   assert.deepEqual(parseWorkerOutput('claude', stdout), {
-    text: 'Final answer', inputTokens: 90, outputTokens: 15,
+    text: 'Final answer', inputTokens: 100, outputTokens: 15,
     cachedInputTokens: 10, model: 'claude-sonnet-4-6', failed: false, reason: null,
   });
 });
@@ -98,10 +117,10 @@ test('Claude stream JSON extracts result, usage, and model', () => {
 test('Claude modelUsage supplies counts when result usage is absent', () => {
   const stdout = JSON.stringify({
     type: 'result', subtype: 'success', is_error: false, result: 'Done',
-    modelUsage: { 'claude-sonnet-4-6': { inputTokens: 8, outputTokens: 3, cacheReadInputTokens: 2 } },
+    modelUsage: { 'claude-sonnet-4-6': { inputTokens: 8, outputTokens: 3, cacheCreationInputTokens: 0, cacheReadInputTokens: 2 } },
   });
   assert.deepEqual(parseWorkerOutput('claude', stdout), {
-    text: 'Done', inputTokens: 8, outputTokens: 3,
+    text: 'Done', inputTokens: 10, outputTokens: 3,
     cachedInputTokens: 2, model: 'claude-sonnet-4-6', failed: false, reason: null,
   });
 });
@@ -123,4 +142,49 @@ test('malformed output, missing completion, errors, and rate limits fail', () =>
   assert.equal(parseWorkerOutput('claude', JSON.stringify({
     type: 'result', subtype: 'success', is_error: false, result: '',
   })).failed, true);
+  const allowed = (status: string) => [
+    { type: 'rate_limit_event', rate_limit_info: { status } },
+    { type: 'result', subtype: 'success', is_error: false, result: 'Plan' },
+  ].map((event) => JSON.stringify(event)).join('\n');
+  assert.equal(parseWorkerOutput('claude', allowed('allowed')).failed, false);
+  assert.equal(parseWorkerOutput('claude', allowed('allowed_warning')).failed, false);
+  assert.equal(parseWorkerOutput('claude', allowed('rejected')).failed, true);
+});
+
+
+test('Claude counts uncached, cache creation, and cache read input without changing result precedence', () => {
+  const result = { type: 'result', subtype: 'success', result: 'Done',
+    usage: { input_tokens: 18, cache_creation_input_tokens: 27728, cache_read_input_tokens: 201700, output_tokens: 5205 },
+    modelUsage: { 'claude-sonnet': { inputTokens: 18, cacheCreationInputTokens: 27728, cacheReadInputTokens: 201700, outputTokens: 5205 },
+      'claude-haiku': { inputTokens: 1082, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 19 } } };
+  const parsed = parseWorkerOutput('claude', JSON.stringify(result));
+  assert.equal(parsed.inputTokens, 229446);
+  assert.equal(parsed.outputTokens, 5205);
+  assert.equal(parsed.cachedInputTokens, 201700);
+  const fallback = parseWorkerOutput('claude', JSON.stringify({ ...result, usage: undefined }));
+  assert.equal(fallback.inputTokens, 230528);
+  assert.equal(fallback.outputTokens, 5224);
+});
+
+test('Claude missing or invalid cache categories leave input usage unknown', () => {
+  for (const field of ['cache_creation_input_tokens', 'cache_read_input_tokens']) {
+    for (const value of [undefined, null, -1, 1.5, '10', Number.MAX_SAFE_INTEGER]) {
+      const parsed = parseWorkerOutput('claude', JSON.stringify({ type: 'result', subtype: 'success', result: 'Done',
+        usage: { input_tokens: 18, cache_creation_input_tokens: 27728, cache_read_input_tokens: 201700, output_tokens: 5205,
+          [field]: value } }));
+      assert.equal(parsed.inputTokens, null);
+    }
+  }
+});
+
+
+test('Claude Bash access is limited to developer and tester roles', () => {
+  for (const role of ['developer', 'tester', 'reviewer', 'business', 'domain', 'architect', 'coordinator'] as const) {
+    const command = workerCommand({ provider: 'claude', model: 'claude-sonnet-4-6', effort: 'low' },
+      role, '/tmp/project', 'Task', 'Policy');
+    for (const flag of ['--tools', '--allowedTools']) {
+      assert.equal(command.args[command.args.indexOf(flag) + 1].split(',').includes('Bash'),
+        role === 'developer' || role === 'tester', `${role} ${flag}`);
+    }
+  }
 });

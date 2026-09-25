@@ -1,17 +1,19 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile, readdir, lstat, realpath, mkdir, copyFile, chmod, writeFile, access } from 'node:fs/promises';
+import { readFile, readdir, lstat, realpath, mkdir, copyFile, chmod, writeFile, access, mkdtemp, rm } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir, release } from 'node:os';
 import path from 'node:path';
 import { id, projectSchema } from './contracts.ts';
 import type { Project } from './contracts.ts';
 import { runProcess } from './process.ts';
+import type { ProcessSpec } from './process.ts';
+import { z } from 'zod';
 import { exists, json, sha } from './store.ts';
 
 const exec = promisify(execFile);
 const sandbox = '/usr/bin/sandbox-exec';
-const systemRoots = ['/usr/bin', '/usr/sbin', '/usr/lib', '/usr/share', '/bin', '/sbin', '/System/Library', '/System/Cryptexes', '/System/Volumes/Preboot/Cryptexes', '/Library/Apple', '/Library/Developer', '/private/etc', '/private/var/db/dyld'];
+const systemRoots = ['/usr/bin', '/usr/sbin', '/usr/lib', '/usr/share', '/bin', '/sbin', '/System/Library', '/System/Cryptexes', '/System/Volumes/Preboot/Cryptexes', '/Library/Apple', '/Library/Developer', '/private/etc', '/private/var/db/dyld', '/private/var/db/timezone'];
 const contains = (root: string, value: string) => root === path.sep || value === root || value.startsWith(root + path.sep);
 const overlaps = (a: string, b: string) => contains(a, b) || contains(b, a);
 
@@ -33,6 +35,8 @@ export interface Job {
     timeoutMs: number;
     maxLogBytes: number;
     signal: AbortSignal;
+    pause?: ProcessSpec['pause'];
+    onSpawn?: ProcessSpec['onSpawn'];
 }
 
 async function directory(value: string): Promise<string> {
@@ -43,7 +47,7 @@ async function directory(value: string): Promise<string> {
     return resolved;
 }
 
-function profile(read: string[], write: string[], network: Job['network']): string {
+export function sandboxProfile(read: string[], write: string[], network: Job['network'], temp?: string): string {
     const paths = (values: string[]) => values.map(value => `(subpath ${JSON.stringify(value)})`).join(' ');
     return [
         '(version 1)', '(deny default)',
@@ -53,8 +57,9 @@ function profile(read: string[], write: string[], network: Job['network']): stri
         '(allow file-read-metadata)',
         `(allow file-read* (literal "/") ${paths([...systemRoots, ...read])} (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom"))`,
         `(allow file-write* (literal "/dev/null") ${paths(write)})`,
+        temp ? `(allow network-bind network-inbound network-outbound (subpath ${JSON.stringify(temp)}))` : '',
         network === 'none' ? '' : '(allow mach-lookup (global-name "com.apple.bsd.dirhelper") (global-name "com.apple.system.opendirectoryd") (global-name "com.apple.SystemConfiguration.configd") (global-name "com.apple.networkd") (global-name "com.apple.dnssd.service") (global-name "com.apple.trustd"))',
-        network === 'outbound' ? '(allow network-outbound (remote ip "*:*"))' : '',
+        network === 'outbound' ? '(allow network-outbound (remote ip "*:*") (literal "/private/var/run/mDNSResponder"))' : '',
         network === 'none' ? '' : '(allow network-bind (local ip "localhost:*")) (allow network-inbound (local ip "localhost:*")) (allow network-outbound (remote ip "localhost:*"))',
     ].filter(Boolean).join('\n');
 }
@@ -67,7 +72,7 @@ export class LocalRuntime {
         if (process.platform !== 'darwin') return ['Native execution requires macOS'];
         const errors: string[] = [];
         try {
-            const result = await exec(sandbox, ['-p', profile([], [], 'none'), '/bin/echo', 'factory-sandbox-ready'], {
+            const result = await exec(sandbox, ['-p', sandboxProfile([], [], 'none'), '/bin/echo', 'factory-sandbox-ready'], {
                 cwd: '/', env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' }, timeout: 5000,
             });
             if (result.stdout.trim() !== 'factory-sandbox-ready') throw Error('Unexpected sandbox probe result');
@@ -84,6 +89,17 @@ export class LocalRuntime {
                 if (!home) throw Error(`Configure a dedicated ${provider} subscription auth home`);
                 await validateAuthHome(provider, home);
             } catch (error) { errors.push((error as Error).message); }
+        }
+        if (project.headroom) {
+            try {
+                const response = await fetch(new URL('/health', project.headroom.baseUrl), { redirect: 'error', signal: AbortSignal.timeout(5000) });
+                if (!response.ok) throw Error('Headroom health request failed');
+                z.object({ service: z.literal('headroom-proxy'), status: z.literal('healthy'), ready: z.literal(true),
+                    config: z.object({ savings_profile: z.literal('general'), optimize: z.literal(true), cache: z.literal(false), disable_kompress: z.literal(true),
+                        disable_kompress_fallback: z.literal(true), disable_kompress_openai: z.literal(true), force_kompress: z.literal(false), compress_user_messages: z.literal(false), compress_system_messages: z.literal(false),
+                        disable_kompress_anthropic: z.literal(true), anthropic_api_url: z.null() }),
+                }).parse(await response.json());
+            } catch { errors.push('Required Headroom proxy is unavailable or its protected compression configuration does not match'); }
         }
         return errors;
     }
@@ -121,13 +137,11 @@ export class LocalRuntime {
         if (!executable || ![...systemRoots, ...tools, workspace, scratchDir].some(root => contains(root, executable)))
             throw Error('Executable must resolve inside an approved tool installation or workspace');
         for (const [key, value] of Object.entries(job.env ?? {})) {
-            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || /^(HOME|TMPDIR|PATH|CODEX_HOME|CLAUDE_CONFIG_DIR|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)$/.test(key) || value.includes('\0'))
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || /^(HOME|TMPDIR|CLAUDE_CODE_TMPDIR|PATH|CODEX_HOME|CLAUDE_CONFIG_DIR|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)$/.test(key) || value.includes('\0'))
                 throw Error(`Reserved or invalid worker environment variable: ${key}`);
         }
         const home = path.join(scratchDir, 'home');
-        const temp = path.join(scratchDir, 'tmp');
         await mkdir(home, { mode: 0o700 });
-        await mkdir(temp, { mode: 0o700 });
         if (job.provider) {
             const source = job.project.runtime.authHomes[job.provider];
             if (!source) throw Error(`Configure a dedicated ${job.provider} subscription auth home`);
@@ -140,15 +154,20 @@ export class LocalRuntime {
             await copyFile(path.join(authRoot, name), path.join(target, name), constants.COPYFILE_EXCL);
             await chmod(path.join(target, name), 0o600);
         }
-        const policy = profile([workspace, policyDir, outputDir, scratchDir, ...tools], [outputDir, scratchDir, ...(job.readOnlySource ? [] : [workspace])], job.network);
-        const command = [sandbox, '-p', policy, executable, ...job.argv.slice(1)];
-        await writeFile(path.join(captureDir, 'invocation.json'), json({ id: job.id, runtime: this.identity, profileDigest: sha(policy), executable, argv: job.argv.slice(1), cwd: workspace, network: job.network, readOnlySource: job.readOnlySource, environmentNames: Object.keys(job.env ?? {}) }), { flag: 'wx', mode: 0o600 });
-        return runProcess({
-            argv: command, cwd: workspace, stdin: job.stdin,
-            env: { ...job.env, PATH: search.join(path.delimiter), HOME: home, TMPDIR: temp, CODEX_HOME: path.join(home, '.codex'), CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
-            stdoutPath: path.join(captureDir, 'stdout.log'), stderrPath: path.join(captureDir, 'stderr.log'),
-            timeoutMs: job.timeoutMs, maxLogBytes: job.maxLogBytes, signal: job.signal, redact: job.redact,
-        });
+        const temp = await mkdtemp('/private/tmp/factory-');
+        try {
+            const policy = sandboxProfile([workspace, policyDir, outputDir, scratchDir, temp, ...tools], [outputDir, scratchDir, temp, ...(job.readOnlySource ? [] : [workspace])], job.network, temp);
+            const command = [sandbox, '-p', policy, executable, ...job.argv.slice(1)];
+            await writeFile(path.join(captureDir, 'invocation.json'), json({ id: job.id, runtime: this.identity, profileDigest: sha(policy), executable, argv: job.argv.slice(1), cwd: workspace, network: job.network, readOnlySource: job.readOnlySource, environmentNames: Object.keys(job.env ?? {}) }), { flag: 'wx', mode: 0o600 });
+            return await runProcess({
+                argv: command, cwd: workspace, stdin: job.stdin,
+                env: { ...job.env, PATH: search.join(path.delimiter), HOME: home, TMPDIR: temp, CLAUDE_CODE_TMPDIR: temp, CODEX_HOME: path.join(home, '.codex'), CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+                stdoutPath: path.join(captureDir, 'stdout.log'), stderrPath: path.join(captureDir, 'stderr.log'),
+                timeoutMs: job.timeoutMs, maxLogBytes: job.maxLogBytes, signal: job.signal, redact: job.redact, pause: job.pause, onSpawn: job.onSpawn,
+            });
+        } finally {
+            await rm(temp, { recursive: true, force: true });
+        }
     }
 }
 

@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>Factory | Control room</title>
   <link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script>
+  <script type="module" src="/app.js"></script>
 </head>
 <body>
   <div class="shell">
@@ -38,7 +38,7 @@
       </header>
       <div class="notice-strip" id="global-notice" role="status">
         <span class="notice-icon" aria-hidden="true">i</span>
-        <span>Saved records describe the last known state. Live worker heartbeats and execution controls are unavailable.</span>
+        <span>Each run has Start, Pause and Stop controls for its own supervisor. Other figures come from saved run records and refresh every 5 seconds.</span>
         <button type="button" class="notice-dismiss" aria-label="Dismiss notice">×</button>
       </div>
       <div id="page-content" class="page-content" aria-live="polite" aria-busy="true">

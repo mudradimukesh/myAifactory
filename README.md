@@ -2,7 +2,7 @@
 
 A subscription-based development factory in progress. Native Codex and Claude Code workers run through a restricted local macOS runtime and submit candidates for independent review and runner-executed checks.
 
-The repository contains a local operator dashboard and execution library modules. An execution coordinator and automated acceptance workflow remain unimplemented. Live-provider verification remains outstanding.
+The repository contains a local operator dashboard, an execution coordinator, and isolated worker execution. The coordinator records candidate-specific review and checks before a handoff. Live-provider verification and human visual approval remain separate requirements.
 
 `LocalRuntime` requires macOS and `/usr/bin/sandbox-exec`. It fails closed when required sandbox capabilities are unavailable. Worker source, policy, proposals, capture and scratch use separate canonical directories. Reviewer source is read-only; proposals and scratch are writable; runner capture is inaccessible to workers. Each attempt receives a fresh HOME and a whole validated subscription credential file in its own provider home, allowing local refresh without exposing the ordinary user home. Provider calls still need a dedicated subscription login.
 
@@ -22,11 +22,31 @@ Use **Project setup** to save a GitHub URL, brief, recipient, and model assignme
 
 Settings apply to future configuration. They do not rewrite existing runs or dispatch workers. Application spending is a planning allocation, not a provider-enforced cap. Subscription quota and dollar charges are unavailable. Unknown token usage remains unknown.
 
-The overview shows recorded attempts, checks, events, and recommendations. A saved `running` status is not proof of a live process. Recovery downloads preserve the candidate identity and counters for a fresh coordinator context. They are not accepted release handoffs. Suspend and cancel controls record pending requests; no coordinator currently consumes them or stops a process.
+The overview shows recorded attempts, checks, events, recommendations, approved specifications, architect tickets, and question batches. Select a run to use **Start**, **Pause**, and **Stop**. Start launches its supervisor or resumes paused work. Pause suspends the worker process group and prevents new work. Stop cancels the run and terminates its owned processes. The dashboard checks recorded process identities before signalling them and reports incomplete cleanup. Recovery downloads preserve candidate identity and counters. They are not accepted release handoffs.
 
 Credentials are stored in private files under the selected state root. The UI returns only credential presence, never saved values. API keys belong to the software being built and do not replace native subscription authentication. Saving a GitHub token does not validate repository access or clone a repository. Keep the state directory outside version control and do not expose this local server through a public proxy.
 
-Claude login can use macOS Keychain, while this runtime requires a dedicated credential file. The connection check reports this limitation rather than extracting tokens. Follow the [Claude authentication documentation](https://code.claude.com/docs/en/authentication) for native sign-in. No dashboard check establishes live model access.
+Claude integration is paused at the operator's request. The partial login dialog and backend are retained, but their real authentication flow is unverified. Workers still require a dedicated credential file. No dashboard check establishes live model access.
+
+## Specifications, tickets, and questions
+
+The coordinator records approved specifications, architect tickets, and question batches through `Store.recordCollaboration(run, { expectedRevision, specifications, tickets, questionBatches })`. The schemas in `src/contracts.ts` define these records. Approved revisions include content digests and named approval evidence. A changed specification needs a new ID; previous revisions and surfaced questions remain in the record.
+
+Select a run to read its specifications and ticket progress. Ticket status follows linked worker attempts and affected questions. Worker completion alone does not mark a ticket done. Recorded review and checks must match the current candidate and specification.
+
+Answer every question in a batch, enter your name, and select **Send answers to factory**. The server saves the whole batch in run state. A stale revision requires refreshing and reviewing before retry. Answers remain decision input until the coordinator reconciles them; they do not approve a new specification or resume execution.
+
+**Sync tickets to GitHub** creates or updates issues in the run's HTTPS GitHub repository using the token saved under **Connections**. Issue bodies include linked approved specifications and architect progress. A run/ticket marker identifies owned issues for retry recovery. Sync is explicit; local worker progress does not trigger automatic GitHub writes. The token needs issue-write access to that repository. GitHub's [issue API](https://docs.github.com/en/rest/issues/issues) defines these operations.
+
+## Headroom for factory workers
+
+The free `headroom-ai` CLI 0.38.0 is installed on this workstation. Start the factory's dedicated local proxy with `npm run headroom` before dispatching workers. It listens on `127.0.0.1:8791` and writes private state under `.factory/headroom`; it does not change the existing proxy on port 8787 or user-wide Codex settings.
+
+New CLI runs default to `headroom: { "baseUrl": "http://127.0.0.1:8791/v1" }` in the project profile. Workers receive an explicit process-local route even though they ignore user configuration. They retain native subscription authentication. No API key or desktop Headroom app is required. Existing persisted profiles remain unchanged. A saved profile without Headroom cannot dispatch workers. Create a new routed run instead of rewriting the old profile. Claude workers get `ANTHROPIC_BASE_URL` set to the Headroom base without its trailing `/v1`.
+
+The launch command selects the general profile, lossless compression, and no retrieval markers. It disables lossy ML compression, user/system message compression, semantic response caching, memory, learning, and telemetry. Original prompts and captured evidence remain intact. The runner checks effective proxy settings before dispatch and stops when the configured service is unavailable or mismatched. Worker permissions remain limited to their isolated source, scratch, and loopback networking; the proxy state is outside their allowed files.
+
+Inspect `http://127.0.0.1:8791/health` and `/stats` for effective settings and measured request savings. Savings depend on the request; an optimization flag is not evidence of a reduction. The installed [Headroom proxy](https://docs.headroomlabs.ai/docs/proxy) handles the routing and compression directly.
 
 ## Development
 

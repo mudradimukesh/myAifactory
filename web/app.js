@@ -1,3 +1,5 @@
+import { openClaudeLogin } from './claude-login.js';
+
 (() => {
   'use strict';
 
@@ -10,7 +12,8 @@
     ['reviewer', 'Reviewer', 'Checks the candidate against the brief', 'Sol'],
     ['inspector', 'Inspector', 'Runs independent checks and records evidence', 'Luna'],
   ];
-  const state = { csrf: '', data: null, page: 'overview', selectedRun: null, refreshing: false };
+  const state = { csrf: '', data: null, page: 'overview', selectedRun: null, refreshing: false, controlBusy: null };
+  const answerDrafts = new Map();
 
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -133,7 +136,9 @@
     const body = type.includes('application/json') ? await response.json() : await response.text();
     if (!response.ok) {
       const message = typeof body === 'object' && body ? [body.error || body.message, body.recommendation].filter(Boolean).join(' ') : body;
-      throw new Error(message || `Request failed (${response.status})`);
+      const error = new Error(message || `Request failed (${response.status})`);
+      error.status = response.status;
+      throw error;
     }
     return body;
   }
@@ -150,7 +155,9 @@
       state.data = data;
       const runs = Array.isArray(data.runs) ? data.runs : [];
       if (!runs.some(run => run.id === priorSelection)) state.selectedRun = runs[0]?.id || null;
-      $('#runtime-status').textContent = data.capabilities?.execution === false ? 'Monitoring only' : 'Local status';
+      const execution = data.capabilities?.execution === true;
+      $('#runtime-status').textContent = execution ? 'Execution controls on' : 'Monitoring only';
+      $('.status-pill').classList.toggle('monitoring', !execution);
       state.lastRefreshed = data.generatedAt || new Date().toISOString();
       state.refreshError = null;
       $('.refresh-problem', content)?.remove();
@@ -170,7 +177,11 @@
   }
   function isInteractiveFocus() {
     const active = document.activeElement;
-    return Boolean(active && content.contains(active) && active.matches('button, a, input, textarea, select'));
+    return Boolean(active && content.contains(active) && active.matches('button, a, input, textarea, select') && !active.closest('.factory-bar'));
+  }
+  function refocus(key) {
+    const target = key && $(`[data-focus-key="${key}"]`);
+    if (target) (target.disabled ? target.closest('.factory-bar') : target).focus();
   }
   function showRefreshProblem() {
     if (!state.refreshError || state.page !== 'overview') return;
@@ -221,6 +232,7 @@
   }
   function renderOverview() {
     if (!state.data) return;
+    const focusKey = document.activeElement?.dataset?.focusKey;
     content.replaceChildren();
     const data = state.data;
     const runs = Array.isArray(data.runs) ? data.runs : [];
@@ -259,7 +271,8 @@
     const teamList = node('div', 'team-list');
     roles.forEach((role, index) => teamList.append(roleNode(role, data, index)));
     org.append(teamList);
-    const caveat = node('p', 'panel-note', 'These roles describe the workflow. This dashboard cannot confirm a worker is currently running.');
+    org.append(node('p', 'panel-note', 'Business Analyst and Domain Architect responsibilities cover approved requirements and domain rules. The coordinator may perform these roles. The Technical Architect owns ticket progress against worker evidence.'));
+    const caveat = node('p', 'panel-note', 'These roles describe the workflow. The control bar of the selected run shows whether its supervisor and worker are running.');
     org.append(caveat);
     rail.append(org);
     const issueCard = card('Recommended next steps', `${issues.length} item${issues.length === 1 ? '' : 's'} to review`, 'recommendation-panel');
@@ -269,6 +282,7 @@
     overview.append(mainGrid);
     content.replaceChildren(overview);
     content.setAttribute('aria-busy', 'false');
+    refocus(focusKey);
   }
   function runRow(run) {
     const selected = run.id === state.selectedRun;
@@ -290,10 +304,8 @@
     append(title, node('span', 'eyebrow', 'SELECTED RUN'), node('h2', '', run.id));
     const actions = node('div', 'detail-actions');
     actions.append(button('Recovery packet', 'secondary small', () => downloadRecovery(run.id)));
-    actions.append(button('Request suspend', 'quiet small', () => controlRun(run, 'suspend')));
-    actions.append(button('Request cancel', 'quiet small', () => controlRun(run, 'cancel')));
     append(head, title, actions);
-    detail.append(head);
+    append(detail, head, factoryBar(run));
     const stats = node('div', 'run-stat-strip');
     const attemptCount = Array.isArray(run.attempts) ? run.attempts.length : Number(run.attemptCount) || 0;
     const passedChecks = Number(run.checks?.passed);
@@ -310,7 +322,7 @@
     if (coordinatorProvider || coordinatorModel) detail.append(node('p', 'run-model-note', `Coordinator for this run: ${coordinatorProvider || 'Provider unknown'} · ${coordinatorModel || 'Model unknown'}`));
     if (run.candidate) detail.append(node('p', 'candidate-note', `Candidate ${String(run.candidate).slice(0, 12)}`));
     if (run.unknownUsage) detail.append(node('p', 'inline-warning', 'Token usage is incomplete. Unknown usage is not counted as zero.'));
-    if (run.controlPending) detail.append(node('p', 'pending-banner', `${run.controlPending} has been requested. This is a saved request, not confirmation that a worker stopped.`));
+    detail.append(questionSection(run), specificationSection(run), ticketSection(run));
     const lower = node('div', 'history-grid');
     const attempts = node('div', 'history-column');
     attempts.append(node('h3', '', 'Attempts'));
@@ -325,6 +337,158 @@
     append(lower, attempts, events);
     detail.append(lower);
     return detail;
+  }
+  function workflowSection(title, description) {
+    const section = node('section', 'workflow-section');
+    append(section, node('h3', '', title), node('p', 'workflow-description', description));
+    return section;
+  }
+  function specificationSection(run) {
+    const section = workflowSection('Approved specifications', 'Business and domain decisions approved for this run.');
+    if (!run.specifications?.length) section.append(node('p', 'muted', 'No approved specifications recorded.'));
+    for (const spec of run.specifications || []) {
+      const disclosure = node('details', 'specification');
+      append(disclosure, node('summary', '', `${spec.kind === 'business' ? 'Business Analyst' : 'Domain Architect'}: ${spec.title} · revision ${spec.revision}`),
+        node('p', 'workflow-meta', `Approved by ${spec.approval.owner} · ${escDate(spec.approval.approvedAt)}`),
+        node('p', '', spec.approval.statement), node('pre', 'specification-content', spec.content),
+        node('p', 'workflow-meta', `Requirements: ${spec.requirements.join(', ') || 'None recorded'}`),
+        node('p', 'workflow-meta', `Digest: ${spec.digest}`));
+      section.append(disclosure);
+    }
+    return section;
+  }
+  function ticketSection(run) {
+    const section = workflowSection('GitHub tickets', 'The architect records progress against worker evidence. Sync publishes these records to GitHub.');
+    if (!run.tickets?.length) section.append(node('p', 'muted', 'No architect-owned tickets recorded.'));
+    for (const ticket of run.tickets || []) {
+      const item = node('article', 'ticket');
+      const heading = node('div', 'ticket-heading');
+      append(heading, node('h4', '', ticket.title), badge(ticket.status));
+      append(item, heading, node('p', '', ticket.architectNote || 'No architect progress note recorded.'),
+        node('p', 'workflow-meta', `Requirements: ${ticket.requirements.join(', ') || 'None'} · Specifications: ${ticket.specificationIds.join(', ') || 'None'}`),
+        node('p', 'workflow-meta', `Worker attempts: ${ticket.attemptIds.join(', ') || 'None recorded'} · Updated ${escDate(ticket.updatedAt)}`));
+      if (ticket.github && /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/issues\/\d+$/.test(ticket.github.url)) {
+        const link = node('a', 'text-link', `Open GitHub issue #${ticket.github.number}`);
+        link.href = ticket.github.url;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        append(item, link, node('p', 'workflow-meta', `Last synced ${escDate(ticket.github.syncedAt)}`));
+      } else item.append(node('p', 'workflow-meta', 'Not synced to GitHub.'));
+      section.append(item);
+    }
+    if (run.tickets?.length) {
+      const status = node('p', 'form-status');
+      status.setAttribute('role', 'status');
+      const sync = button('Sync tickets to GitHub', 'secondary small', async () => {
+        sync.disabled = true;
+        status.textContent = 'Syncing tickets…';
+        try {
+          const result = await api(`/api/runs/${encodeURIComponent(run.id)}/tickets/sync`, { method: 'POST', body: JSON.stringify({ expectedRevision: run.revision }) });
+          setStatus(result.message || 'Tickets synced to GitHub.', 'success');
+          await loadData();
+        } catch (error) { status.textContent = error.message; status.className = 'form-status error-text'; }
+        finally { sync.disabled = false; }
+      });
+      append(section, sync, status);
+    }
+    return section;
+  }
+  function questionSection(run) {
+    const section = workflowSection('Consequential questions', 'Review the impact and recommendation, then send the complete batch to the factory.');
+    if (!run.questionBatches?.length) section.append(node('p', 'muted', 'No consequential questions recorded.'));
+    for (const batch of run.questionBatches || []) {
+      const form = node(batch.answer ? 'details' : 'form', 'question-batch');
+      if (batch.answer) form.append(node('summary', '', `${batch.title} · answered by ${batch.answer.owner}`));
+      if (!batch.answer) append(form, node('h4', '', batch.title), badge('awaiting_input'));
+      const key = `${run.id}/${batch.id}`;
+      const canAnswer = !['cancelled', 'failed', 'handoff_ready'].includes(run.status) && !batch.questions.some(question => question.visualEvidenceStale);
+      const draft = answerDrafts.get(key) || { owner: '', answers: {}, expectedRevision: run.revision };
+      if (!batch.answer) answerDrafts.set(key, draft);
+      for (const question of batch.questions) {
+        const group = node('fieldset', 'question');
+        append(group, node('legend', '', question.prompt), node('p', '', `Impact: ${question.impact}`),
+          node('p', '', `Recommendation: ${question.recommendation}`),
+          node('p', 'workflow-meta', `Decision owner: ${question.owner} · Affected tickets: ${question.affectedTicketIds.join(', ') || 'None'}`));
+        if (question.visualEvidence?.length) {
+          group.append(node('p', 'visual-intro', `Review ${question.visualEvidence.length} render${question.visualEvidence.length === 1 ? '' : 's'}. Open any image for its full size.`));
+          const gallery = node('div', 'visual-gallery');
+          for (const evidence of question.visualEvidence) {
+            const figure = node('figure', 'visual-item');
+            const link = node('a', 'visual-image-link');
+            link.href = evidence.url;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.setAttribute('aria-label', `Open full image: ${evidence.label}, source ${evidence.sourceId}`);
+            const thumbnail = node('img', 'visual-thumbnail');
+            thumbnail.src = evidence.url;
+            thumbnail.alt = `${evidence.label}, source ${evidence.sourceId}`;
+            thumbnail.loading = 'lazy';
+            thumbnail.decoding = 'async';
+            link.append(thumbnail);
+            append(figure, link, node('figcaption', 'visual-caption', `${evidence.label} · Source ${evidence.sourceId}`));
+            gallery.append(figure);
+          }
+          group.append(gallery);
+        }
+        if (question.visualEvidenceStale) group.append(node('p', 'inline-warning', 'These images belong to an earlier candidate. Review the current run before answering.'));
+        if (batch.answer) group.append(node('p', 'saved-answer', batch.answer.answers.find(answer => answer.questionId === question.id)?.value || 'No answer recorded.'));
+        else {
+          const optionLabel = option => option === 'approve' ? 'Approve renders' : option === 'request_changes' ? 'Request changes' : option;
+          const answer = question.options.length
+            ? select(question.id, draft.answers[question.id] || '', [['', 'Choose an answer'], ...question.options.map(option => [option, optionLabel(option)])])
+            : textarea(question.id, draft.answers[question.id], 3, 'Enter your answer');
+          answer.required = true;
+          answer.disabled = !canAnswer;
+          answer.maxLength = 10000;
+          answer.addEventListener('input', () => { draft.answers[question.id] = answer.value; });
+          group.append(field('Your answer', answer));
+        }
+        form.append(group);
+      }
+      if (batch.answer) form.append(node('p', 'workflow-meta', `Sent by ${batch.answer.owner} · ${escDate(batch.answer.answeredAt)}. Answers are saved for the coordinator; this does not confirm execution resumed.`));
+      else {
+        const owner = input('owner', draft.owner, 'text', { required: true });
+        owner.maxLength = 300;
+        owner.disabled = !canAnswer;
+        owner.addEventListener('input', () => { draft.owner = owner.value; });
+        form.append(field('Your name', owner));
+        const footer = submitRow('Send answers to factory');
+        footer.submit.disabled = !canAnswer;
+        if (!canAnswer) footer.status.textContent = 'This run no longer accepts answers.';
+        footer.status.setAttribute('role', 'status');
+        form.append(footer.row);
+        form.addEventListener('submit', async event => {
+          event.preventDefault();
+          if (!form.reportValidity()) return;
+          footer.submit.disabled = true;
+          footer.status.textContent = 'Sending answers…';
+          try {
+            const result = await api(`/api/runs/${encodeURIComponent(run.id)}/answers`, { method: 'POST', body: JSON.stringify({
+              expectedRevision: draft.expectedRevision, batchId: batch.id, owner: draft.owner,
+              answers: batch.questions.map(question => ({ questionId: question.id, value: draft.answers[question.id] || '' })),
+            }) });
+            answerDrafts.delete(key);
+            setStatus(result.message || 'Answers saved for the factory coordinator.', 'success');
+            state.needsRender = true;
+            await loadData();
+            render();
+          } catch (error) {
+            footer.status.textContent = error.message;
+            footer.status.className = 'form-status error-text';
+            if (error.status === 409 && !$('.review-latest', form)) {
+              form.append(button('Refresh and review latest run', 'secondary small review-latest', async () => {
+                await loadData();
+                const latest = state.data.runs.find(item => item.id === run.id);
+                if (latest) draft.expectedRevision = latest.revision;
+                render();
+              }));
+            }
+          } finally { footer.submit.disabled = !canAnswer; }
+        });
+      }
+      section.append(form);
+    }
+    return section;
   }
   function smallStat(label, value) {
     const item = node('div', 'run-stat');
@@ -389,16 +553,94 @@
       setStatus('Recovery packet downloaded. It records saved evidence and does not restart work.', 'success');
     } catch (error) { setStatus(error.message, 'error'); }
   }
+  const factoryText = {
+    idle: 'No supervisor is running, so no work executes.',
+    starting: 'Launching the supervisor.',
+    pausing: 'Waiting for the supervisor to freeze the worker.',
+    paused: 'Worker processes are stopped with SIGSTOP. No new work starts. A long pause can break the provider connection, and the attempt then records as failed.',
+    resuming: 'Waiting for the supervisor to resume the worker.',
+    stopping: 'Stopping worker process groups.',
+  };
+  const fastPollStates = ['starting', 'pausing', 'resuming', 'stopping'];
+  function factoryBar(run) {
+    const factory = run.factory;
+    const busy = state.controlBusy?.run === run.id ? state.controlBusy.state : null;
+    const current = busy || factory.state;
+    const job = factory.activeJob;
+    const bar = node('div', 'factory-bar');
+    bar.tabIndex = -1;
+    bar.dataset.focusKey = `bar:${run.id}`;
+    bar.setAttribute('aria-busy', String(Boolean(busy)));
+    const status = node('div', 'factory-status');
+    status.setAttribute('role', 'status');
+    const text = current === 'running' ? (job ? `Running the ${job.kind} job since ${escDate(job.startedAt)}.` : 'The supervisor is running. No worker job is active.')
+      : current === 'exited' ? factory.reason || 'The supervisor exited.'
+      : current === 'terminal' ? `This run is ${String(run.status).replaceAll('_', ' ')}.`
+      : factoryText[current];
+    const meta = [
+      factory.supervisor && `Supervisor pid ${factory.supervisor.pid}, launched ${escDate(factory.supervisor.launchedAt)}`,
+      current !== 'running' && job && `${job.kind} job since ${escDate(job.startedAt)}${job.frozen ? ', frozen' : ''}`,
+      current !== 'exited' && factory.reason,
+    ].filter(Boolean).join(' · ');
+    append(status, badge(current === 'terminal' ? 'Finished' : current), node('span', 'factory-text', text), meta ? node('span', 'factory-meta', meta) : null);
+    if (factory.orphans.length) status.append(node('span', 'factory-warning', `Processes ${factory.orphans.join(', ')} outlived their job leader. The factory cannot prove it owns them, so it does not signal them. Inspect them with ps.`));
+    const actions = node('div', 'factory-actions');
+    append(actions,
+      controlButton(run, 'start', factory.startLabel, 'primary', factory.canStart && !busy),
+      controlButton(run, 'pause', 'Pause', 'secondary', factory.canPause && !busy),
+      controlButton(run, 'stop', 'Stop', 'secondary stop', factory.canStop && !busy));
+    append(bar, status, actions);
+    return bar;
+  }
+  function controlButton(run, action, label, kind, enabled) {
+    const el = button(label, kind, () => action === 'stop' ? confirmStop(run) : controlRun(run, action));
+    el.dataset.focusKey = `${action}:${run.id}`;
+    el.disabled = !enabled;
+    return el;
+  }
+  function confirmStop(run) {
+    const dialog = node('dialog', 'modal');
+    dialog.setAttribute('aria-labelledby', 'stop-title');
+    const title = node('h2', '', `Stop ${run.id}?`);
+    title.id = 'stop-title';
+    const keep = button('Keep run', 'secondary', () => dialog.close());
+    keep.autofocus = true;
+    const stop = button('Stop run', 'danger', () => { dialog.close(); controlRun(run, 'stop'); });
+    const body = node('div', 'modal-body');
+    const actions = node('div', 'modal-actions');
+    append(actions, keep, stop);
+    append(body, title, node('p', '', 'Stop cancels this run permanently and ends its worker processes. A stopped run cannot resume.'),
+      node('p', '', 'To continue this work, create a new run from the same profile.'), actions);
+    dialog.append(body);
+    dialog.addEventListener('close', () => { dialog.remove(); refocus(`stop:${run.id}`); });
+    document.body.append(dialog);
+    dialog.showModal();
+  }
   async function controlRun(run, action) {
-    const ok = window.confirm(`Save a request to ${action} this run? This dashboard cannot confirm the worker stops.`);
-    if (!ok) return;
+    const focusKey = `${action}:${run.id}`;
+    const busyState = { start: run.factory.startLabel === 'Resume' ? 'resuming' : 'starting', pause: 'pausing', stop: 'stopping' }[action];
+    state.controlBusy = { run: run.id, state: busyState };
+    renderOverview();
+    refocus(focusKey);
     try {
       const result = await api(`/api/runs/${encodeURIComponent(run.id)}/control`, {
-        method: 'POST', body: JSON.stringify({ action, expectedRevision: run.revision }),
+        method: 'POST', body: JSON.stringify(action === 'start' ? { action, expectedRevision: run.revision } : { action }),
       });
-      setStatus(result.message || `Request to ${action} was saved. Execution status is not confirmed.`, 'success');
-      await loadData({ quiet: true });
+      setStatus(result.message, 'success');
     } catch (error) { setStatus(error.message, 'error'); }
+    finally {
+      state.controlBusy = null;
+      state.needsRender = true;
+      await loadData({ quiet: true });
+      refocus(focusKey);
+    }
+  }
+  function schedulePoll() {
+    const fast = state.controlBusy || state.data?.runs?.some(run => fastPollStates.includes(run.factory.state));
+    window.setTimeout(async () => {
+      if (state.page === 'overview' && document.visibilityState === 'visible') await loadData({ quiet: true });
+      schedulePoll();
+    }, fast ? 1000 : 5000);
   }
 
   function navigate(page) {
@@ -452,11 +694,32 @@
     codexCheck.addEventListener('click', () => checkAuth('codex', codexCheck));
     form.append(codexCheck);
     form.append(field('Dedicated Codex auth directory', input('codexHome', s.authHomes?.codex, 'text', { placeholder: '/Users/you/.factory-auth/codex' }), 'A path only. The file check does not test live login or model access.'));
-    form.append(providerInfo('Claude Code', s.authHomes?.claude ? 'Dedicated location configured' : 'Needs setup', 'Sign in with claude auth login --claudeai. On macOS, sign-in may use Keychain. The runner needs a supported dedicated credential-file setup and will not extract OAuth tokens.'));
-    const claudeCheck = button('Check credentials', 'secondary small');
-    claudeCheck.addEventListener('click', () => checkAuth('claude', claudeCheck));
-    form.append(claudeCheck);
-    form.append(field('Dedicated Claude auth directory', input('claudeHome', s.authHomes?.claude, 'text', { placeholder: '/Users/you/.factory-auth/claude' }), 'Never paste a password, token, or credential JSON here.'));
+    const claudeInfo = providerInfo('Claude Code', 'Loading sign-in status', 'Sign-in happens on Claude\'s own page. The factory never asks for your password, and the credential file stays in a private folder on this Mac.');
+    const claudeStatus = $('.connection-indicator', claudeInfo);
+    const claudeMessage = node('p', 'provider-status');
+    claudeInfo.append(claudeMessage);
+    const claudeHome = input('claudeHome', s.authHomes?.claude, 'text', { placeholder: '/Users/you/.factory-auth/claude' });
+    const showClaude = view => {
+      claudeStatus.textContent = { signed_out: 'Signed out', awaiting_code: 'Waiting for code', verifying: 'Verifying', ready: 'Ready', failed: 'Sign-in failed' }[view.status];
+      claudeStatus.className = `connection-indicator ${statusClass(view.status)}`;
+      claudeMessage.textContent = [view.message, view.account?.subscriptionType && `Plan ${view.account.subscriptionType}`, view.checkedAt && `Checked ${escDate(view.checkedAt)}`].filter(Boolean).join(' · ');
+      if (view.status === 'ready' && !claudeHome.value) claudeHome.value = view.authHome;
+    };
+    const loadClaude = async (check, trigger) => {
+      if (trigger) trigger.disabled = true;
+      try { showClaude(await api(`/api/auth/claude${check ? '?check=1' : ''}`)); }
+      catch (error) { claudeStatus.textContent = 'Status unavailable'; claudeMessage.textContent = error.message; }
+      finally { if (trigger) trigger.disabled = false; }
+    };
+    const claudeActions = node('div', 'provider-actions');
+    const claudeCheck = button('Check', 'secondary small', () => loadClaude(true, claudeCheck));
+    append(claudeActions, button('Sign in to Claude', 'secondary small', () => openClaudeLogin({ api, settings: settings(), onDone: (view, saved) => {
+      if (saved) { state.data.settings = saved; claudeHome.value = saved.authHomes.claude; }
+      if (view) showClaude(view);
+    } })), claudeCheck);
+    append(form, claudeInfo, claudeActions);
+    loadClaude(false);
+    form.append(field('Dedicated Claude auth directory', claudeHome, 'Sign-in fills this folder when it is empty. Never paste a password, token, or credential JSON here.'));
     const doc = node('p', 'field-help');
     const anchor = node('a', 'text-link', 'Claude authentication details');
     anchor.href = 'https://code.claude.com/docs/en/authentication';
@@ -696,7 +959,7 @@
   $('.notice-dismiss').addEventListener('click', () => $('#global-notice').remove());
   window.addEventListener('hashchange', () => showPage(location.hash.slice(1) || 'overview'));
   window.addEventListener('popstate', () => showPage(location.hash.slice(1) || 'overview'));
-  window.setInterval(() => { if (state.page === 'overview' && document.visibilityState === 'visible') loadData({ quiet: true }); }, 5000);
+  schedulePoll();
   showPage(location.hash.slice(1) || 'overview');
   initialize();
 })();
