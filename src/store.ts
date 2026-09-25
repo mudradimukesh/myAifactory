@@ -124,7 +124,8 @@ export class Store {
         if (!await exists(target))
             await writeFile(target, '', { flag: 'a', mode: 0o600 });
         let compromised: Error | undefined;
-        const release = await lockfile.lock(target, { realpath: false, stale: 10000, update: 2000, retries: wait ? { retries: 40, minTimeout: 25, maxTimeout: 250 } : 0, onCompromised: e => { compromised = e; } });
+        // A writer must outlast the stale window, or a holder killed mid-write fails every record write until the lock ages out.
+        const release = await lockfile.lock(target, { realpath: false, stale: 10000, update: 2000, retries: wait ? { retries: 60, minTimeout: 25, maxTimeout: 250 } : 0, onCompromised: e => { compromised = e; } });
         try {
             const r = await fn();
             if (compromised)

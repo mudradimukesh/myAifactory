@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -95,5 +95,17 @@ test('concurrent updates from two processes both commit without ELOCKED', async 
     assert.equal(state.revision, 21);
     assert.equal(state.history.filter(event => event.type === 'writer_a').length, 10);
     assert.equal(state.history.filter(event => event.type === 'writer_b').length, 10);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('a record writer waits out the lock left by a killed holder', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-store-'));
+  const store = new Store(root);
+  try {
+    await store.create(initial());
+    // A holder killed mid-write leaves a fresh lock directory that only turns stale after the stale window.
+    await mkdir(path.join(root, 'run-fixture.lock'));
+    const state = await store.transition('fixture', 'ready', 'after crashed writer');
+    assert.equal(state.status, 'ready');
   } finally { await rm(root, { recursive: true, force: true }); }
 });

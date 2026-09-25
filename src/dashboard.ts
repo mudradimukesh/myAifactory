@@ -385,7 +385,7 @@ export class Dashboard {
       return done(changed, changed ? 'Pause requested. The supervisor freezes running workers and starts no new work.' : 'The factory is already paused, stopping, or finished.');
     }
     const launchLock = <T>(fn: () => Promise<T>) => this.store.lock(`launch-${run}`, fn).catch((error: unknown) => {
-      if (error instanceof Error && 'code' in error && error.code === 'ELOCKED') throw new FactoryConflict('Another start or stop for this run is in progress.');
+      if (error instanceof Error && 'code' in error && error.code === 'ELOCKED' && 'file' in error && path.basename(String(error.file)) === `launch-${run}`) throw new FactoryConflict('Another start or stop for this run is in progress.');
       throw error;
     });
     if (input.action === 'stop') return launchLock(async () => {
