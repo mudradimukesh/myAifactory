@@ -132,7 +132,8 @@ a.button { text-decoration: none; }
 .factory-meta { overflow-wrap: anywhere; color: #8c9995; font-size: 9px; line-height: 1.45; }
 .factory-warning { padding: 6px 8px; border-radius: 6px; background: #fff7e9; color: #886b39; font-size: 9px; line-height: 1.45; }
 .activity { display: flex; flex-direction: column; gap: 2px; width: 100%; max-width: 100%; margin: 0; padding: 0; list-style: none; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.activity li { max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #6d7b76; font-size: 9px; line-height: 1.4; }
+.activity li { max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #4f5d58; font-size: 11px; line-height: 1.5; }
+.activity-title { display: block; margin-top: 6px; color: #6d7b76; font-size: 11px; font-weight: 600; }
 .factory-actions { display: flex; flex: 0 0 auto; gap: 6px; }
 .factory-actions .button:disabled { cursor: not-allowed; opacity: .45; }
 .factory-bar[aria-busy="true"] .button:disabled { cursor: wait; }

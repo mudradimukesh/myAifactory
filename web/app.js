@@ -643,10 +643,10 @@ import { openClaudeLogin } from './claude-login.js';
     append(status, badge(operatorState === 'terminal' ? 'Finished' : operatorState), node('span', 'factory-text', text), meta ? node('span', 'factory-meta', meta) : null);
     if (factory.orphans.length) status.append(node('span', 'factory-warning', `Processes ${factory.orphans.join(', ')} outlived their job leader. The factory cannot prove it owns them, so it does not signal them. Inspect them with ps.`));
     if (factory.activity && factory.activity.length) {
+      const age = factory.activity[factory.activity.length - 1].ageSeconds;
       const activity = node('ul', 'activity');
-      for (const entry of factory.activity)
-        activity.append(node('li', '', `${entry.job}: ${entry.summary}${entry.ageSeconds === null ? '' : ` (${entry.ageSeconds} s ago)`}`));
-      status.append(activity);
+      for (const entry of factory.activity) activity.append(node('li', '', `${entry.job}: ${entry.summary}`));
+      status.append(node('small', 'activity-title', `Worker activity${age === null ? '' : `, last write ${duration(age * 1000)} ago`}`), activity);
     }
     const actions = node('div', 'factory-actions');
     append(actions,
