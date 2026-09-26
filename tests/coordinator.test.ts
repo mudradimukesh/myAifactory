@@ -49,9 +49,11 @@ class FakeRuntime extends LocalRuntime {
         let text = '';
         if (job.id.startsWith('plan-architect')) text = proposal('developer', job.project.models.developer);
         else if (job.id.startsWith('plan-tester')) text = proposal('reviewer', this.proposedReviewerModel ?? job.project.models.reviewer);
+        else if (job.id.startsWith('clarify-developer')) text = JSON.stringify({ schemaVersion: 1, questions: [{ id: 'q1', prompt: 'Which module owns this?', assumption: 'src/app.txt' }] });
+        else if (job.id.startsWith('answer-architect')) text = JSON.stringify({ schemaVersion: 1, answers: [{ id: 'q1', verdict: 'correct' }] });
         else if (job.id.startsWith('developer-')) {
-            await mkdir(path.join(job.workspace, 'src'));
-            await writeFile(path.join(job.workspace, 'src', 'app.txt'), 'fixed\n');
+            await mkdir(path.join(job.workspace, 'src'), { recursive: true });
+            await appendFile(path.join(job.workspace, 'src', 'app.txt'), 'fixed\n');
             await git(job.workspace, ['add', '.']);
             await git(job.workspace, ['commit', '-m', 'Fix approved behavior']);
             text = 'Implemented and committed';
@@ -309,6 +311,7 @@ test('a stalled hand-off ends after exactly two invocations', { timeout: 10000 }
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
         const runtime = new HandoffRuntime(() => t.mock.timers.tick(2000), 0, true);
         await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
+        await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
         const pending = stepRun(f.store, 'run', runtime);
         let done = false;
         void pending.then(() => { done = true; }, () => { done = true; });
@@ -316,7 +319,7 @@ test('a stalled hand-off ends after exactly two invocations', { timeout: 10000 }
         while (!done && performance.now() < deadline) { t.mock.timers.tick(2000); await settle(); }
         const state = await pending;
         assert.deepEqual(runtime.calls.filter(id => id.startsWith('developer-')), ['developer-1', 'developer-1']);
-        assert.deepEqual(state.attempts[2].segments?.map(segment => [segment.kind, segment.reason]), [['work', 'context_limit'], ['handoff', 'stall_start']]);
+        assert.deepEqual(state.attempts[4].segments?.map(segment => [segment.kind, segment.reason]), [['work', 'context_limit'], ['handoff', 'stall_start']]);
         assert.equal(state.status, 'awaiting_input');
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
@@ -337,6 +340,7 @@ test('known final usage does not rework a stalled developer', { timeout: 10000 }
             await writeFile(path.join(job.captureDir, 'stdout.log'), codexOutput('waiting'));
             return result;
         };
+        await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
         await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
         const pending = stepRun(f.store, 'run', runtime); await runtime.ready; await tickUntilAborted(t, runtime);
         const state = await pending;
@@ -527,14 +531,14 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
         const runtime = new FakeRuntime();
         const final = await runRun(f.store, 'run', runtime);
         assert.equal(final.status, 'handoff_ready');
-        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'developer-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
-        assert.deepEqual([...runtime.schemas.keys()], ['plan-architect', 'plan-tester', 'review-1']);
+        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'developer-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
+        assert.deepEqual([...runtime.schemas.keys()], ['plan-architect', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'review-1']);
         assert.deepEqual(JSON.parse(runtime.schemas.get('plan-architect')!).required, ['schemaVersion', 'tasks']);
         assert.ok(JSON.parse(runtime.schemas.get('review-1')!).required.includes('verdict'));
         assert.doesNotMatch(runtime.schemas.get('plan-architect')!, /minLength|minItems|maximum|\$schema/);
-        assert.equal(final.attempts.length, 4);
+        assert.equal(final.attempts.length, 6);
         assert.equal(final.checks.length, 2);
-        assert.equal(final.reportedTokens, 80);
+        assert.equal(final.reportedTokens, 120);
         assert.equal(final.review?.record.candidate, final.candidate);
         assert.equal(await git(path.join(f.store.dir('run'), 'candidates.git'), ['rev-parse', `refs/candidates/${final.candidate}`]), final.candidate);
         const reviewPrompt = runtime.prompts.get('review-1')!;
@@ -543,6 +547,135 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
         assert.match(reviewPrompt, /id=artifact/);
         assert.match(reviewPrompt, /You have no shell/);
         assert.match(reviewPrompt, /capture\/stdout\.log/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('developer clarification runs clarify then answer before dispatch, in order', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FakeRuntime();
+        assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
+        assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
+        const clarified = await stepRun(f.store, 'run', runtime);
+        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'clarify-developer-1']);
+        assert.deepEqual(clarified.clarification?.developer, { round: 1, clarifyAttemptId: 'clarify-developer-1', admitted: false });
+        const answered = await stepRun(f.store, 'run', runtime);
+        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'clarify-developer-1', 'answer-architect-1']);
+        assert.equal(answered.clarification?.developer?.admitted, true);
+        assert.equal(answered.clarification?.developer?.answerAttemptId, 'answer-architect-1');
+        const dispatched = await stepRun(f.store, 'run', runtime);
+        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'developer-1']);
+        assert.equal(dispatched.status, 'candidate');
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('a repeat clarification round still unresolved ends in awaiting_input', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        class WrongAnswerRuntime extends FakeRuntime {
+            override async execute(job: Job) {
+                const result = await super.execute(job);
+                if (job.id.startsWith('answer-architect')) {
+                    const text = JSON.stringify({ schemaVersion: 1, answers: [{ id: 'q1', verdict: 'wrong', correction: 'Use src/other.txt instead' }] });
+                    await writeFile(path.join(job.captureDir, 'stdout.log'), codexOutput(text));
+                }
+                return result;
+            }
+        }
+        const runtime = new WrongAnswerRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'awaiting_input');
+        assert.match(final.reason ?? '', /Clarification unresolved/);
+        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'clarify-developer-r2', 'answer-architect-r2']);
+        assert.equal(final.clarification?.developer?.round, 2);
+        assert.equal(final.clarification?.developer?.admitted, false);
+        const secondClarifyPrompt = runtime.prompts.get('clarify-developer-r2')!;
+        assert.match(secondClarifyPrompt, /Round 1 corrections/);
+        assert.match(secondClarifyPrompt, /Use src\/other\.txt instead/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('the developer dispatch prompt includes the admitted answers', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FakeRuntime();
+        await runRun(f.store, 'run', runtime);
+        const developerPrompt = runtime.prompts.get('developer-1')!;
+        assert.match(developerPrompt, /Clarifications \(approved by architect\)/);
+        assert.match(developerPrompt, /q1/);
+        assert.match(developerPrompt, /correct/);
+        assert.match(developerPrompt, /Which module owns this\?/);
+        assert.match(developerPrompt, /src\/app\.txt/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('clarify and answer jobs are dispatched with a read-only source checkout', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const jobs = new Map<string, Job>();
+        class CaptureRuntime extends FakeRuntime {
+            override async execute(job: Job) { jobs.set(job.id, job); return super.execute(job); }
+        }
+        await runRun(f.store, 'run', new CaptureRuntime());
+        assert.equal(jobs.get('clarify-developer-1')?.readOnlySource, true);
+        assert.equal(jobs.get('answer-architect-1')?.readOnlySource, true);
+        assert.equal(jobs.get('developer-1')?.readOnlySource, false);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('a rework reuses the admitted answer instead of re-clarifying', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        f.project.limits.maxAttempts = 10;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        class ReworkRuntime extends FakeRuntime {
+            reviews = 0;
+            override async execute(job: Job) {
+                const result = await super.execute(job);
+                if (job.id.startsWith('review-') && ++this.reviews === 1) {
+                    const candidate = await git(job.workspace, ['rev-parse', 'HEAD']);
+                    const text = JSON.stringify({ schemaVersion: 1, candidate, specDigest: sha('Fix the behavior'), requirements: ['behavior'], verdict: 'changes_requested', findings: [] });
+                    await writeFile(path.join(job.captureDir, 'stdout.log'), codexOutput(text));
+                }
+                return result;
+            }
+        }
+        const runtime = new ReworkRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'handoff_ready');
+        assert.equal(final.reworks, 1);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-developer')), ['clarify-developer-1']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect')), ['answer-architect-1']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('developer-')), ['developer-1', 'developer-2']);
+        assert.equal(final.clarification?.developer?.clarifyAttemptId, 'clarify-developer-1');
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('maxClarificationJobs stops the exchange with an unresolved clarification budget', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        f.project.limits.maxClarificationJobs = 1;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FakeRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'awaiting_input');
+        assert.match(final.reason ?? '', /Clarification budget exhausted/);
+        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'clarify-developer-1']);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('an old state.json without the clarification field still loads', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        const created = await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        assert.equal('clarification' in JSON.parse(await readFile(path.join(f.store.dir('run'), 'state.json'), 'utf8')), false);
+        const reloaded = await f.store.read('run');
+        assert.equal(reloaded.id, created.id);
+        assert.equal(reloaded.clarification, undefined);
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
@@ -602,7 +735,7 @@ test('reset retries a failed planner with fresh evidence and dispatches the fixt
         const runtime = new FakeRuntime();
         const final = await runRun(f.store, 'run', runtime);
         assert.equal(final.status, 'handoff_ready');
-        assert.deepEqual(runtime.calls, ['plan-architect-2', 'plan-tester', 'developer-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
+        assert.deepEqual(runtime.calls, ['plan-architect-2', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'developer-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
         assert.equal(await readFile(path.join(f.store.dir('run'), 'attempts', 'plan-architect', 'sentinel.txt'), 'utf8'), 'old evidence');
         assert.notEqual(final.attempts.find(attempt => attempt.id === 'plan-architect-2')?.id, 'plan-architect');
         assert.equal(final.reworks, 0);
@@ -646,7 +779,7 @@ test('reset cannot bypass a zero-rework implementation ceiling', { timeout: 1000
         const afterReset = await runRun(f.store, 'run', runtime);
         assert.equal(afterReset.status, 'awaiting_input');
         assert.equal(runtime.calls.some(id => id.startsWith('developer-')), false);
-        assert.equal(afterReset.attempts.filter(attempt => attempt.role === 'developer').length, 1);
+        assert.equal(afterReset.attempts.filter(attempt => attempt.role === 'developer' && !attempt.id.startsWith('clarify-developer')).length, 1);
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
@@ -770,13 +903,15 @@ for (const inputTokens of [150000, 350000]) {
             const runtime = new BudgetRuntime();
             assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
             assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
+            assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
+            assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
             const state = await stepRun(f.store, 'run', runtime);
             const cached = inputTokens - 1000;
             const metered = (inputTokens - cached) + 10 + Math.ceil(cached * 0.1);
             assert.equal(state.status, 'candidate');
-            assert.equal(state.attempts[2].status, 'completed');
-            assert.equal(state.reportedTokens, 40 + metered);
-            assert.equal(state.attempts[2].cachedInputTokens, cached);
+            assert.equal(state.attempts[4].status, 'completed');
+            assert.equal(state.reportedTokens, 80 + metered);
+            assert.equal(state.attempts[4].cachedInputTokens, cached);
             const handoff = state.attempts[0].handoff!;
             const recorded = JSON.parse(await readFile(path.join(f.store.dir('run'), handoff.path), 'utf8'));
             assert.equal(recorded.tasks[0].limits.maxTokens, 600000);
@@ -808,9 +943,11 @@ test('an uncached developer overrun is metered gross and fails with token_limit'
         const runtime = new BudgetRuntime();
         assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
         assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
+        assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
+        assert.equal((await stepRun(f.store, 'run', runtime)).status, 'ready');
         const state = await stepRun(f.store, 'run', runtime);
         assert.equal(state.status, 'changes_requested');
-        assert.equal(state.attempts[2].status, 'failed');
+        assert.equal(state.attempts[4].status, 'failed');
         assert.match(state.reason ?? '', /token_limit/);
         assert.ok(state.history.some(event => event.type === 'job_finished' && (event.detail as { reason?: string }).reason === 'token_limit'));
     } finally { await rm(f.root, { recursive: true, force: true }); }
@@ -918,9 +1055,11 @@ test('a developer over its token allowance is stopped with token_limit and the m
         const budgetRuntime = new BudgetRuntime();
         assert.equal((await stepRun(f.store, 'run', budgetRuntime)).status, 'ready');
         assert.equal((await stepRun(f.store, 'run', budgetRuntime)).status, 'ready');
+        assert.equal((await stepRun(f.store, 'run', budgetRuntime)).status, 'ready');
+        assert.equal((await stepRun(f.store, 'run', budgetRuntime)).status, 'ready');
         const state = await stepRun(f.store, 'run', budgetRuntime);
         assert.equal(state.status, 'changes_requested');
-        const attempt = state.attempts[2];
+        const attempt = state.attempts[4];
         assert.equal(attempt.status, 'failed');
         assert.equal(attempt.result?.reason, 'token_limit');
         assert.equal(state.unknownUsage, false);
@@ -930,7 +1069,7 @@ test('a developer over its token allowance is stopped with token_limit and the m
         assert.deepEqual(segment?.raw, { input_tokens: 5000, cached_input_tokens: 0, output_tokens: 0 });
         assert.equal(segment?.metered, 5000);
         assert.equal(segment?.peakContext, 5000);
-        assert.equal(state.reportedTokens, 40 + 5000);
+        assert.equal(state.reportedTokens, 80 + 5000);
         const meterPath = path.join(f.store.dir('run'), 'attempts', 'developer-1', 'segment-1', 'meter.json');
         const meterRecord = JSON.parse(await readFile(meterPath, 'utf8'));
         assert.equal(meterRecord.source, 'meter');
@@ -961,9 +1100,11 @@ test('a context_limit crossing produces one attempt with three segments and a st
         const runtime = new HandoffRuntime(() => t.mock.timers.tick(2000));
         await stepRun(f.store, 'run', runtime);
         await stepRun(f.store, 'run', runtime);
+        await stepRun(f.store, 'run', runtime);
+        await stepRun(f.store, 'run', runtime);
         const state = await stepRun(f.store, 'run', runtime);
         assert.equal(state.status, 'candidate');
-        const attempts = state.attempts.filter(a => a.role === 'developer');
+        const attempts = state.attempts.filter(a => a.role === 'developer' && a.id.startsWith('developer-'));
         assert.equal(attempts.length, 1);
         const attempt = attempts[0];
         assert.equal(attempt.status, 'completed');
@@ -977,7 +1118,7 @@ test('a context_limit crossing produces one attempt with three segments and a st
         assert.equal(attempt.inputTokens, 4148653);
         assert.equal(attempt.cachedInputTokens, 3927168);
         assert.equal(attempt.outputTokens, 15123);
-        assert.equal(state.reportedTokens, 629365);
+        assert.equal(state.reportedTokens, 629405);
         assert.equal(state.elapsedMs, 6000);
         assert.equal(state.unknownUsage, false);
         assert.equal(state.reworks, 0);
@@ -1004,14 +1145,15 @@ test('a non-zero resume exit fails the attempt with handoff_failed', { timeout: 
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
         const runtime = new HandoffRuntime(() => t.mock.timers.tick(2000), 1);
         await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
+        await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
         const state = await stepRun(f.store, 'run', runtime);
-        const attempt = state.attempts[2];
+        const attempt = state.attempts[4];
         assert.equal(attempt.result?.reason, 'handoff_failed');
         assert.equal(attempt.status, 'failed');
         assert.equal(attempt.segments?.length, 2);
         assert.equal(runtime.jobs.length, 2);
         assert.equal(state.candidate, undefined);
-        assert.equal(state.reportedTokens, 629345);
+        assert.equal(state.reportedTokens, 629385);
         assert.match(await readFile(path.join(f.store.dir('run'), attempt.handoff!.path), 'utf8'), /resume.*exit.*1/i);
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
@@ -1062,8 +1204,9 @@ test(`a handoff ${failure} stops the chain before fresh work`, { timeout: 10000 
         }
         const runtime = new FailedHandoffRuntime(() => t.mock.timers.tick(failure === 'timeout' ? 16000 : 2000));
         await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
+        await stepRun(f.store, 'run', runtime); await stepRun(f.store, 'run', runtime);
         const state = await stepRun(f.store, 'run', runtime);
-        const attempt = state.attempts[2];
+        const attempt = state.attempts[4];
         assert.equal(attempt.result?.reason, failure === 'invalid' || failure === 'absent' ? 'handoff_failed' : failure);
         assert.equal(attempt.status, 'failed');
         assert.equal(runtime.jobs.length, 2);

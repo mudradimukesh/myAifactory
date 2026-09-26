@@ -22,6 +22,7 @@ export const limitsSchema = z.object({
     maxReportedTokens: z.number().int().positive(), verificationReserveAttempts: z.number().int().min(1),
     maxLogBytes: z.number().int().min(1024).max(100000000), handoffContextRatio: z.number().gt(0).max(0.95).optional(),
     workerStartTimeoutMs: z.number().int().positive().max(1800000).optional(), workerIdleTimeoutMs: z.number().int().positive().max(1800000).optional(),
+    maxClarificationJobs: z.number().int().min(1).max(20).optional(),
 }).strict();
 export const projectSchema = z.object({
     schemaVersion: z.literal(2), name: id, repository: z.string().min(1), base: commit,
@@ -63,6 +64,25 @@ export const transitions: Record<Status, Status[]> = {
     awaiting_input: ['draft', 'ready', 'running', 'candidate', 'verifying', 'verified', 'changes_requested', 'handoff_ready', 'cancelled'],
     handoff_ready: ['changes_requested', 'awaiting_input', 'cancelled'], failed: ['ready'], cancelled: ['ready'],
 };
+export const clarificationSchema = z.object({
+    schemaVersion: z.literal(1),
+    questions: z.array(z.object({ id, prompt: z.string().min(1), assumption: z.string().min(1) }).strict()).min(1).max(20),
+}).strict();
+export type Clarification = z.infer<typeof clarificationSchema>;
+export const answerSchema = z.object({
+    schemaVersion: z.literal(1),
+    answers: z.array(z.object({ id, verdict: z.enum(['correct', 'wrong']), correction: z.string().min(1).optional() }).strict()).min(1),
+}).strict().superRefine((v, c) => {
+    for (const a of v.answers)
+        if (a.verdict === 'wrong' && !a.correction)
+            c.addIssue({ code: 'custom', message: `Wrong verdict for ${a.id} requires a correction` });
+});
+export type Answer = z.infer<typeof answerSchema>;
+const clarificationSideSchema = z.object({
+    round: z.union([z.literal(1), z.literal(2)]), clarifyAttemptId: id, answerAttemptId: id.optional(),
+    admitted: z.boolean(), digest: digest.optional(),
+}).strict();
+export type ClarificationSide = z.infer<typeof clarificationSideSchema>;
 export const reviewSchema = z.object({ schemaVersion: z.literal(1), candidate: commit, specDigest: digest, requirements: z.array(id), verdict: z.enum(['pass', 'changes_requested']), findings: z.array(z.object({ severity: z.enum(['blocking', 'minor']), requirement: id, message: z.string().min(1), evidence: z.string().min(1) }).strict()) }).strict();
 export type Review = z.infer<typeof reviewSchema>;
 const timestamp = z.string().datetime();
@@ -150,6 +170,7 @@ const baseStateSchema = z.object({
     activeJob: z.object({ id, runtime: z.literal('macos-sandbox'), kind: z.string().min(1), startedAt: timestamp, process: ownedProcess.optional() }).strict().optional(),
     supervisor: z.object({ launchId: id, process: ownedProcess, launchedAt: timestamp }).strict().optional(),
     specifications: z.array(specificationSchema).optional(), tickets: z.array(ticketSchema).optional(), questionBatches: z.array(questionBatchSchema).optional(),
+    clarification: z.object({ developer: clarificationSideSchema.optional(), tester: clarificationSideSchema.optional() }).strict().optional(),
     lastEvent: eventSchema, history: z.array(eventSchema).min(1),
 }).strict();
 export type State = z.infer<typeof baseStateSchema>;
@@ -192,6 +213,13 @@ export const stateSchema = baseStateSchema.superRefine((v, c) => {
         c.addIssue({ code: 'custom', message: 'State requires a candidate' });
     if (new Set(v.attempts.map(a => a.id)).size !== v.attempts.length)
         c.addIssue({ code: 'custom', message: 'Duplicate attempt identity' });
+    for (const side of [v.clarification?.developer, v.clarification?.tester]) {
+        if (!side) continue;
+        if (!v.attempts.some(a => a.id === side.clarifyAttemptId) || (side.answerAttemptId && !v.attempts.some(a => a.id === side.answerAttemptId)))
+            c.addIssue({ code: 'custom', message: 'Unknown clarification attempt reference' });
+        if (side.admitted && !side.answerAttemptId)
+            c.addIssue({ code: 'custom', message: 'An admitted clarification requires an answer' });
+    }
 });
 export type WorkerChoice = z.infer<typeof choice>;
 export type FileRecord = z.infer<typeof fileRecord>;
