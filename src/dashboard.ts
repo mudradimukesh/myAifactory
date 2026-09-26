@@ -157,7 +157,7 @@ export async function factoryView(state: State, redact: (value: string) => strin
     const summaries = await tailEvents(file);
     let ageSeconds: number | null = null;
     try { ageSeconds = Math.max(0, Math.round((Date.now() - (await lstat(file)).mtimeMs) / 1000)); } catch { /* advisory */ }
-    activity = summaries.map((summary, index) => ({ job: job.id, summary: clip(redact(collapse(summary))), ageSeconds: index === summaries.length - 1 ? ageSeconds : null }));
+    activity = summaries.map((summary, index) => ({ job: job.id, summary: clip(redact(collapse(summary.replace(/\S*\/attempts\/[^/\s]+\/source\//g, '')))), ageSeconds: index === summaries.length - 1 ? ageSeconds : null }));
   }
   return {
     state: factory,
@@ -386,7 +386,7 @@ export class Dashboard {
             } catch (error) { if (!isMissing(error)) throw error; }
           }
         }
-        runs.push(projectRun(state, settings, redact, await factoryView(state, redact), meters));
+        runs.push(projectRun(state, settings, redact, await factoryView(state, redact, this.store.dir(run)), meters));
       }
       catch { issues.push({ code: 'run_corrupt', severity: 'error', message: `Run ${run} cannot be read safely.`, recommendation: 'Inspect state and event records; do not dispatch or overwrite this run.', runId: run }); }
     }
