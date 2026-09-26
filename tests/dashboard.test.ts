@@ -88,7 +88,7 @@ test('snapshot reads active segment meters with current context and preserves un
     await writeFile(path.join(dir, `segment-${index}`, 'meter.json'), JSON.stringify({ ...meter, segment: index }));
   }
   await mkdir(path.join(dir, 'capture'), { recursive: true });
-  await writeFile(path.join(dir, 'capture', 'stdout.log'), JSON.stringify({ type: 'item.started', item: { type: 'command_execution', command: `cat ${dir}/source/src/app.ts` } }) + '\n');
+  await writeFile(path.join(dir, 'capture', 'stdout.log'), JSON.stringify({ type: 'item.started', item: { type: 'command_execution', command: `export PATH=/opt/node/bin:$PATH; cd ${dir}/source && cat ${dir}/source/src/app.ts` } }) + '\n');
   const view = (await dashboard.snapshot()).runs[0]!;
   assert.deepEqual(view.factory!.activity.map(entry => entry.summary), ['running cat src/app.ts']);
   const rows = view.usageByRole[0]!.agents;

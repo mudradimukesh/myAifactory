@@ -157,7 +157,7 @@ export async function factoryView(state: State, redact: (value: string) => strin
     const summaries = await tailEvents(file);
     let ageSeconds: number | null = null;
     try { ageSeconds = Math.max(0, Math.round((Date.now() - (await lstat(file)).mtimeMs) / 1000)); } catch { /* advisory */ }
-    activity = summaries.map((summary, index) => ({ job: job.id, summary: clip(redact(collapse(summary.replace(/\S*\/attempts\/[^/\s]+\/source\//g, '')))), ageSeconds: index === summaries.length - 1 ? ageSeconds : null }));
+    activity = summaries.map((summary, index) => ({ job: job.id, summary: clip(redact(collapse(summary.replace(/export PATH=\S*;\s*/g, '').replace(/cd \S*\/attempts\/[^/\s]+\/source\/?\s*(&&|;)\s*/g, '').replace(/\S*\/attempts\/[^/\s]+\/source\//g, '').replace(/\S*\/attempts\/[^/\s]+\/source\b/g, '.')))), ageSeconds: index === summaries.length - 1 ? ageSeconds : null }));
   }
   return {
     state: factory,
