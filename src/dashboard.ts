@@ -5,7 +5,7 @@ import { constants, mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { choice, id, ticketProgress, meterReadingSchema } from './contracts.ts';
+import { choice, id, ticketProgress, meterReadingSchema, clarificationSchema, answerSchema } from './contracts.ts';
 import type { OwnedProcess, State, Segment, MeterReading } from './contracts.ts';
 import { groupAlive, groupMembers, isOwnedAlive, terminateOwned } from './process.ts';
 import { Store, move, reset, resettable } from './store.ts';
@@ -65,18 +65,22 @@ async function privateJson(file: string, data: unknown) {
 }
 
 export type FactoryState = 'idle' | 'running' | 'pausing' | 'paused' | 'resuming' | 'stopping' | 'exited' | 'terminal';
+export type ClarificationItemView = { id: string; question: string; assumption: string; verdict?: 'correct' | 'wrong'; correction?: string };
+export type ClarificationSideView = { round: 1 | 2; admitted: boolean; items: ClarificationItemView[] };
 export type FactoryView = {
   state: FactoryState; supervisor: { pid: number; launchedAt: string } | null;
   activeJob: { id: string; kind: string; startedAt: string; frozen: boolean } | null;
   canStart: boolean; canPause: boolean; canStop: boolean; canReset: boolean; startLabel: 'Start' | 'Resume';
   reason: string | null; orphans: number[];
   activity: { job: string; summary: string; ageSeconds: number | null }[];
+  clarification: { developer?: ClarificationSideView; tester?: ClarificationSideView };
 };
 const factoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const terminal = (status: State['status']) => status === 'failed' || status === 'cancelled' || status === 'handoff_ready';
 const roles = ['business', 'domain', 'architect', 'developer', 'reviewer', 'tester', 'coordinator'] as const;
 const choiceFor = (state: State, role: typeof roles[number]) => role === 'developer' ? state.project.models.developer
-  : role === 'reviewer' ? state.project.models.reviewer : role === 'coordinator' ? state.project.models.coordinator : state.project.models.inspector;
+  : role === 'reviewer' ? state.project.models.reviewer : role === 'coordinator' ? state.project.models.coordinator
+  : role === 'tester' ? (state.project.models.tester ?? state.project.models.developer) : state.project.models.inspector;
 const exitDetail = z.object({ outcome: z.enum(['waiting', 'finished', 'cancelled', 'error']), message: z.string() }).passthrough();
 
 /** One line per Codex or Claude stream-json event: what ran, never its text, reasoning, tool results, or prompts. */
@@ -131,6 +135,27 @@ async function tailEvents(file: string, maxBytes = 65536): Promise<string[]> {
   } catch { return []; } finally { await handle.close().catch(() => {}); }
 }
 
+/** Read-only view of one side's clarification exchange, joining the clarify questions with the architect's answers by id. Bounded and redacted. */
+async function clarificationSideView(state: State, runDir: string, redact: (value: string) => string, side: 'developer' | 'tester'): Promise<ClarificationSideView | undefined> {
+  const current = state.clarification?.[side];
+  if (!current) return undefined;
+  const clarifyAttempt = state.attempts.find(a => a.id === current.clarifyAttemptId);
+  const answerAttempt = current.answerAttemptId ? state.attempts.find(a => a.id === current.answerAttemptId) : undefined;
+  const items: ClarificationItemView[] = [];
+  if (clarifyAttempt?.handoff) {
+    try {
+      const clarification = clarificationSchema.parse(JSON.parse(await readFile(path.join(runDir, clarifyAttempt.handoff.path), 'utf8')));
+      const answer = answerAttempt?.handoff ? answerSchema.parse(JSON.parse(await readFile(path.join(runDir, answerAttempt.handoff.path), 'utf8'))) : undefined;
+      const answers = new Map((answer?.answers ?? []).map(a => [a.id, a]));
+      for (const q of clarification.questions.slice(0, 20)) {
+        const a = answers.get(q.id);
+        items.push({ id: q.id, question: clip(redact(q.prompt)), assumption: clip(redact(q.assumption)), verdict: a?.verdict, correction: a?.correction ? clip(redact(a.correction)) : undefined });
+      }
+    } catch { /* advisory; malformed or missing evidence just yields no items */ }
+  }
+  return { round: current.round, admitted: current.admitted, items };
+}
+
 /** Derives operator controls from stored facts plus a live ownership check of the recorded supervisor. */
 export async function factoryView(state: State, redact: (value: string) => string = value => value, runDir?: string): Promise<FactoryView> {
   const live = state.supervisor !== undefined && await isOwnedAlive(state.supervisor.process);
@@ -159,6 +184,7 @@ export async function factoryView(state: State, redact: (value: string) => strin
     try { ageSeconds = Math.max(0, Math.round((Date.now() - (await lstat(file)).mtimeMs) / 1000)); } catch { /* advisory */ }
     activity = summaries.map((summary, index) => ({ job: job.id, summary: clip(redact(collapse(summary.replace(/export PATH=\S*;\s*/g, '').replace(/cd \S*\/attempts\/[^/\s]+\/source\/?\s*(&&|;)\s*/g, '').replace(/\S*\/attempts\/[^/\s]+\/source\//g, '').replace(/\S*\/attempts\/[^/\s]+\/source\b/g, '.')))), ageSeconds: index === summaries.length - 1 ? ageSeconds : null }));
   }
+  const clarification = runDir ? { developer: await clarificationSideView(state, runDir, redact, 'developer'), tester: await clarificationSideView(state, runDir, redact, 'tester') } : {};
   return {
     state: factory,
     supervisor: state.supervisor ? { pid: state.supervisor.process.pid, launchedAt: state.supervisor.launchedAt } : null,
@@ -168,7 +194,7 @@ export async function factoryView(state: State, redact: (value: string) => strin
     canStop: factory !== 'terminal' || live || jobLive || orphans.length > 0 || supervisorOrphans.length > 0,
     canReset: resettable(state) && !state.activeJob && !live && !jobLive && !state.control && orphans.length === 0 && supervisorOrphans.length === 0,
     startLabel: state.control === 'suspend' || state.suspended ? 'Resume' : 'Start',
-    reason, orphans, activity,
+    reason, orphans, activity, clarification,
   };
 }
 

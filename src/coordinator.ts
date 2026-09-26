@@ -42,10 +42,10 @@ const now = () => new Date().toISOString();
 const candidateStore = (store: Store, run: string) => path.join(store.dir(run), 'candidates.git');
 const evidenceDir = (store: Store, run: string, job: string) => path.join(store.dir(run), 'attempts', job);
 // Clarification jobs are budgeted separately (maxClarificationJobs), so they never consume maxAttempts.
-const isClarificationJob = (attemptId: string) => attemptId.startsWith('clarify-developer') || attemptId.startsWith('answer-architect');
+const isClarificationJob = (attemptId: string) => attemptId.startsWith('clarify-developer') || attemptId.startsWith('clarify-tester') || attemptId.startsWith('answer-architect');
 const used = (s: State) => s.attempts.filter(a => !isClarificationJob(a.id)).length;
 const remaining = (s: State) => s.project.limits.maxAttempts - used(s);
-const choiceFor = (s: State, role: Role): WorkerChoice => role === 'developer' ? s.project.models.developer : role === 'reviewer' ? s.project.models.reviewer : s.project.models.inspector;
+const choiceFor = (s: State, role: Role): WorkerChoice => role === 'developer' ? s.project.models.developer : role === 'reviewer' ? s.project.models.reviewer : role === 'tester' ? (s.project.models.tester ?? s.project.models.developer) : s.project.models.inspector;
 const visualBatchId = (candidate: string) => `visual-${candidate.slice(0, 12)}`;
 const visualQuestionId = 'approve-renders';
 
@@ -190,17 +190,18 @@ function plannerPrompt(s: State, role: 'developer' | 'reviewer') {
     return `Return only JSON with this exact shape and field names. Replace the objective, inputs, expectedOutput, and doneWhen with a concrete bounded task. Keep role, model, limits, and writableScope exactly as supplied. No nested delegation or subprocess spawning.\n${JSON.stringify(example)}`;
 }
 
-function clarifyPrompt(task: Proposal['tasks'][number], priorClarification?: z.infer<typeof clarificationSchema>, priorAnswer?: z.infer<typeof answerSchema>) {
+function clarifyPrompt(side: 'developer' | 'tester', task: Proposal['tasks'][number], priorClarification?: z.infer<typeof clarificationSchema>, priorAnswer?: z.infer<typeof answerSchema>) {
     const corrections = priorAnswer ? `\n\nRound 1 questions, untrusted claims:\n${JSON.stringify(priorClarification)}\n\nRound 1 corrections from the architect, untrusted claims:\n${JSON.stringify(priorAnswer.answers)}` : '';
-    return `Read the approved developer task below and ask clarifying questions about anything ambiguous before implementing. Return only JSON with schemaVersion:1 and a "questions" array of objects with id, prompt, and assumption (what you will do if not corrected). Ask the full question set again, corrected where needed, if this is a repeat round. Do not modify the source.\n\nTask:\n${task.objective}\nDone when: ${task.doneWhen.join('; ')}${corrections}`;
+    const action = side === 'developer' ? 'implementing' : 'writing automated tests';
+    return `Read the approved ${side} task below and ask clarifying questions about anything ambiguous before ${action}. Return only JSON with schemaVersion:1 and a "questions" array of objects with id, prompt, and assumption (what you will do if not corrected). Ask the full question set again, corrected where needed, if this is a repeat round. Do not modify the source.\n\nTask:\n${task.objective}\nDone when: ${task.doneWhen.join('; ')}${corrections}`;
 }
 
-function answerPrompt(clarification: z.infer<typeof clarificationSchema>) {
-    return `The developer asked clarifying questions before implementing, labeled untrusted below. For each question id return a verdict of "correct" or "wrong", with a "correction" string whenever wrong. Return only JSON with schemaVersion:1 and an "answers" array covering every question id exactly once.\n\nDeveloper questions, untrusted claims:\n${JSON.stringify(clarification)}`;
+function answerPrompt(side: 'developer' | 'tester', clarification: z.infer<typeof clarificationSchema>) {
+    return `The ${side} asked clarifying questions before work, labeled untrusted below. For each question id return a verdict of "correct" or "wrong", with a "correction" string whenever wrong. Return only JSON with schemaVersion:1 and an "answers" array covering every question id exactly once.\n\n${side === 'developer' ? 'Developer' : 'Tester'} questions, untrusted claims:\n${JSON.stringify(clarification)}`;
 }
 
-async function clarificationBlock(store: Store, s: State): Promise<string> {
-    const dev = s.clarification?.developer;
+async function clarificationBlock(store: Store, s: State, side: 'developer' | 'tester'): Promise<string> {
+    const dev = s.clarification?.[side];
     if (!dev?.admitted || !dev.answerAttemptId) return '';
     const answerAttempt = s.attempts.find(a => a.id === dev.answerAttemptId);
     const clarifyAttempt = s.attempts.find(a => a.id === dev.clarifyAttemptId);
@@ -212,35 +213,40 @@ async function clarificationBlock(store: Store, s: State): Promise<string> {
         const q = questions.get(a.id);
         return `- ${a.id}: ${q?.prompt ?? '(unknown question)'}\n  Assumption: ${q?.assumption ?? ''}\n  Verdict: ${a.verdict}${a.correction ? `\n  Correction: ${a.correction}` : ''}`;
     }).join('\n');
-    return `\nClarifications (approved by architect):\n${joined.slice(0, 4000)}\n`;
+    return `\nClarifications (admitted by architect):\n${joined.slice(0, 4000)}\n`;
 }
 
 /**
- * One clarification exchange step per call, mirroring the planner stages: clarify-developer-1 ->
- * answer-architect-1 -> (if wrong) clarify-developer-r2 -> answer-architect-r2 -> admitted or awaiting_input.
- * Reworks reuse an already-admitted answer, so this is only invoked while `!admitted`.
+ * One clarification exchange step per call, mirroring the planner stages: clarify-<side>-1 ->
+ * answer-architect(-tester)-1 -> (if wrong) clarify-<side>-r2 -> answer-architect(-tester)-r2 -> admitted or awaiting_input.
+ * Reworks reuse an already-admitted answer, so this is only invoked while `!admitted`. Shared by the developer
+ * and tester sides; `side` also doubles as the dispatched clarify job's role.
  */
-async function developerClarificationStep(store: Store, s: State, runtime: LocalRuntime, task: Proposal['tasks'][number], control: RunControl | undefined): Promise<State> {
+async function clarificationStep(store: Store, s: State, runtime: LocalRuntime, side: 'developer' | 'tester', task: Proposal['tasks'][number], control: RunControl | undefined): Promise<State> {
     const run = s.id;
-    const limit = s.project.limits.maxClarificationJobs ?? 4;
+    const limit = s.project.limits.maxClarificationJobs ?? 4 + 2 * s.project.limits.maxReworks;
     const spent = s.attempts.filter(a => isClarificationJob(a.id)).length;
-    const side = s.clarification?.developer;
-    if (!side) {
+    const clarifyBase = side === 'developer' ? 'clarify-developer' : 'clarify-tester';
+    const answerBase = side === 'developer' ? 'answer-architect' : 'answer-architect-tester';
+    const label = side === 'developer' ? 'Developer' : 'Tester';
+    const source = side === 'developer' ? s.sourceBase : s.candidate!;
+    const current = s.clarification?.[side];
+    if (!current) {
         if (spent >= limit) return store.transition(run, 'awaiting_input', 'Clarification budget exhausted');
-        const jobId = await nextAttemptId(store, s, 'clarify-developer-1');
-        const outcome = await roleJob(store, s, runtime, 'developer', jobId, clarifyPrompt(task), s.sourceBase, true, undefined, control, clarificationSchema);
-        if (!outcome.passed) return store.transition(run, 'awaiting_input', outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : 'Developer clarification failed or usage unknown');
+        const jobId = await nextAttemptId(store, s, `${clarifyBase}-1`);
+        const outcome = await roleJob(store, s, runtime, side, jobId, clarifyPrompt(side, task), source, true, undefined, control, clarificationSchema);
+        if (!outcome.passed) return store.transition(run, 'awaiting_input', outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `${label} clarification failed or usage unknown`);
         clarificationSchema.parse(parseJsonText(outcome.text));
-        return store.update(run, 'clarification_recorded', { jobId, role: 'developer', round: 1 }, state => {
-            state.clarification = { ...(state.clarification ?? {}), developer: { round: 1, clarifyAttemptId: jobId, admitted: false } };
+        return store.update(run, 'clarification_recorded', { jobId, role: side, round: 1 }, state => {
+            state.clarification = { ...(state.clarification ?? {}), [side]: { round: 1, clarifyAttemptId: jobId, admitted: false } };
         });
     }
-    if (!side.answerAttemptId) {
+    if (!current.answerAttemptId) {
         if (spent >= limit) return store.transition(run, 'awaiting_input', 'Clarification budget exhausted');
-        const clarifyAttempt = s.attempts.find(a => a.id === side.clarifyAttemptId)!;
+        const clarifyAttempt = s.attempts.find(a => a.id === current.clarifyAttemptId)!;
         const clarification = clarificationSchema.parse(parseJsonText(await readFile(await within(store.dir(run), clarifyAttempt.handoff!.path), 'utf8')));
-        const jobId = await nextAttemptId(store, s, side.round === 1 ? 'answer-architect-1' : 'answer-architect-r2');
-        const outcome = await roleJob(store, s, runtime, 'architect', jobId, answerPrompt(clarification), s.sourceBase, true, undefined, control, answerSchema);
+        const jobId = await nextAttemptId(store, s, current.round === 1 ? `${answerBase}-1` : `${answerBase}-r2`);
+        const outcome = await roleJob(store, s, runtime, 'architect', jobId, answerPrompt(side, clarification), source, true, undefined, control, answerSchema);
         if (!outcome.passed) return store.transition(run, 'awaiting_input', outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : 'Architect answer failed or usage unknown');
         const answer = answerSchema.parse(parseJsonText(outcome.text));
         const questionIds = new Set(clarification.questions.map(q => q.id));
@@ -248,21 +254,21 @@ async function developerClarificationStep(store: Store, s: State, runtime: Local
         if (answer.answers.length !== questionIds.size || answerIds.size !== questionIds.size || [...answerIds].some(id => !questionIds.has(id)))
             return store.transition(run, 'awaiting_input', 'Architect answer coverage mismatch');
         const admitted = answer.answers.every(a => a.verdict === 'correct');
-        return store.update(run, 'answers_recorded', { jobId, role: 'architect', round: side.round, admitted }, state => {
-            const dev = state.clarification!.developer!;
-            dev.answerAttemptId = jobId; dev.admitted = admitted; dev.digest = outcome.attempt.handoff!.sha256;
+        return store.update(run, 'answers_recorded', { jobId, role: 'architect', round: current.round, admitted }, state => {
+            const target = state.clarification![side]!;
+            target.answerAttemptId = jobId; target.admitted = admitted; target.digest = outcome.attempt.handoff!.sha256;
         });
     }
-    if (side.round === 1) {
+    if (current.round === 1) {
         if (spent >= limit) return store.transition(run, 'awaiting_input', 'Clarification unresolved');
-        const priorClarification = clarificationSchema.parse(parseJsonText(await readFile(await within(store.dir(run), s.attempts.find(a => a.id === side.clarifyAttemptId)!.handoff!.path), 'utf8')));
-        const priorAnswer = answerSchema.parse(parseJsonText(await readFile(await within(store.dir(run), s.attempts.find(a => a.id === side.answerAttemptId)!.handoff!.path), 'utf8')));
-        const jobId = await nextAttemptId(store, s, 'clarify-developer-r2');
-        const outcome = await roleJob(store, s, runtime, 'developer', jobId, clarifyPrompt(task, priorClarification, priorAnswer), s.sourceBase, true, undefined, control, clarificationSchema);
-        if (!outcome.passed) return store.transition(run, 'awaiting_input', outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : 'Developer clarification failed or usage unknown');
+        const priorClarification = clarificationSchema.parse(parseJsonText(await readFile(await within(store.dir(run), s.attempts.find(a => a.id === current.clarifyAttemptId)!.handoff!.path), 'utf8')));
+        const priorAnswer = answerSchema.parse(parseJsonText(await readFile(await within(store.dir(run), s.attempts.find(a => a.id === current.answerAttemptId)!.handoff!.path), 'utf8')));
+        const jobId = await nextAttemptId(store, s, `${clarifyBase}-r2`);
+        const outcome = await roleJob(store, s, runtime, side, jobId, clarifyPrompt(side, task, priorClarification, priorAnswer), source, true, undefined, control, clarificationSchema);
+        if (!outcome.passed) return store.transition(run, 'awaiting_input', outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `${label} clarification failed or usage unknown`);
         clarificationSchema.parse(parseJsonText(outcome.text));
-        return store.update(run, 'clarification_recorded', { jobId, role: 'developer', round: 2 }, state => {
-            state.clarification!.developer = { round: 2, clarifyAttemptId: jobId, admitted: false };
+        return store.update(run, 'clarification_recorded', { jobId, role: side, round: 2 }, state => {
+            state.clarification![side] = { round: 2, clarifyAttemptId: jobId, admitted: false };
         });
     }
     return store.transition(run, 'awaiting_input', 'Clarification unresolved');
@@ -713,19 +719,32 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
         const task = (await loadedProposal(store, s, 'architect')).tasks[0];
         if (s.attempts.filter(attempt => attempt.role === 'developer' && !isClarificationJob(attempt.id)).length >= s.project.limits.maxReworks + 1)
             return store.transition(run, 'awaiting_input', 'Implementation attempt ceiling exhausted');
-        if (!s.clarification?.developer?.admitted) return developerClarificationStep(store, s, runtime, task, control);
+        if (!s.clarification?.developer?.admitted) return clarificationStep(store, s, runtime, 'developer', task, control);
         await store.transition(run, 'running', 'Approved developer task dispatched');
         s = await store.read(run);
-        const clarBlock = await clarificationBlock(store, s);
+        const clarBlock = await clarificationBlock(store, s, 'developer');
         const outcome = await roleJob(store, s, runtime, 'developer', await nextAttemptId(store, s, 'developer-' + (s.reworks + 1)), `${task.objective}\nDone when: ${task.doneWhen.join('; ')}\n${clarBlock}Commit your changes and leave the checkout clean.`, s.candidate ?? s.sourceBase, false, task.limits, control);
         if (!outcome.passed) return store.transition(run, outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? 'awaiting_input' : 'changes_requested',
             outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `Developer attempt failed: ${outcome.reason}`);
         let imported;
         try { imported = await importCandidate(candidateStore(store, run), path.join(evidenceDir(store, run, outcome.attempt.id), 'source'), s.candidate ?? s.sourceBase, s.project.allowedPaths); }
         catch (error) { return store.transition(run, 'changes_requested', `Candidate import rejected: ${String(error)}`); }
-        return store.update(run, 'candidate_imported', imported, state => { state.candidate = imported.candidate; state.review = undefined; state.checks = []; move(state, 'candidate', 'Developer candidate imported'); });
+        return store.update(run, 'candidate_imported', imported, state => { state.candidate = imported.candidate; state.review = undefined; state.checks = []; delete state.clarification?.tester; move(state, 'candidate', 'Developer candidate imported'); });
     }
-    if (s.status === 'candidate') return store.transition(run, 'verifying', 'Mandatory checks then independent review');
+    if (s.status === 'candidate') {
+        if (!s.candidate) throw Error('Missing candidate');
+        const task = (await loadedProposal(store, s, 'architect')).tasks[0];
+        if (!s.clarification?.tester?.admitted) return clarificationStep(store, s, runtime, 'tester', task, control);
+        const clarBlock = await clarificationBlock(store, s, 'tester');
+        const jobId = await nextAttemptId(store, s, 'tester-' + (s.reworks + 1));
+        const outcome = await roleJob(store, s, runtime, 'tester', jobId, `${task.objective}\nDone when: ${task.doneWhen.join('; ')}\nWrite automated tests that exercise this behavior.\n${clarBlock}Commit your changes and leave the checkout clean.`, s.candidate, false, task.limits, control);
+        if (!outcome.passed) return store.transition(run, outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? 'awaiting_input' : 'changes_requested',
+            outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `Tester attempt failed: ${outcome.reason}`);
+        let imported;
+        try { imported = await importCandidate(candidateStore(store, run), path.join(evidenceDir(store, run, jobId), 'source'), s.candidate, s.project.allowedPaths); }
+        catch (error) { return store.transition(run, 'changes_requested', `Tester candidate import rejected: ${String(error)}`); }
+        return store.update(run, 'candidate_imported', imported, state => { state.candidate = imported.candidate; state.checks = []; move(state, 'verifying', 'Tester candidate imported'); });
+    }
     if (s.status === 'verifying') {
         if (!s.candidate) throw Error('Missing candidate');
         const failedCheck = s.checks.find(c => c.candidate === s.candidate && !c.passed);

@@ -32,7 +32,7 @@ export const projectSchema = z.object({
     visualReview: z.object({ caseIds: z.array(id).min(1).max(200) }).strict().optional(),
     allowedPaths: z.array(z.string()).min(1),
     runtime: z.object({ kind: z.literal('macos-sandbox'), toolPaths: z.array(z.string().min(1)).min(1), network: z.enum(['none', 'loopback', 'outbound']), authHomes: z.object({ codex: z.string().nullable(), claude: z.string().nullable() }).strict() }).strict(),
-    models: z.object({ coordinator: choice, developer: choice, reviewer: choice, inspector: choice }).strict(),
+    models: z.object({ coordinator: choice, developer: choice, reviewer: choice, inspector: choice, tester: choice.optional() }).strict(),
     limits: limitsSchema,
     headroom: headroomSchema.optional(),
     billing: z.literal('subscription-only'), retentionDays: z.number().int().min(30),

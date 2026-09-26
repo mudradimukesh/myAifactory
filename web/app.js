@@ -648,6 +648,17 @@ import { openClaudeLogin } from './claude-login.js';
       for (const entry of factory.activity) activity.append(node('li', '', `${entry.job}: ${entry.summary}`));
       status.append(node('small', 'activity-title', `Worker activity${age === null ? '' : `, last write ${duration(age * 1000)} ago`}`), activity);
     }
+    const clarification = factory.clarification || {};
+    for (const side of ['developer', 'tester']) {
+      const view = clarification[side];
+      if (!view || !view.items.length) continue;
+      const list = node('ul', 'clarification');
+      for (const item of view.items) {
+        const verdict = item.verdict ? ` - ${item.verdict}${item.correction ? `: ${item.correction}` : ''}` : ' - awaiting answer';
+        list.append(node('li', '', `${item.question} (assumption: ${item.assumption})${verdict}`));
+      }
+      status.append(node('small', 'clarification-title', `${side === 'developer' ? 'Developer' : 'Tester'} clarification, round ${view.round}${view.admitted ? ', admitted' : ''}`), list);
+    }
     const actions = node('div', 'factory-actions');
     append(actions,
       controlButton(run, 'start', factory.startLabel, 'primary', factory.canStart && !busy),

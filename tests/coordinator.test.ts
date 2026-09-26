@@ -49,7 +49,9 @@ class FakeRuntime extends LocalRuntime {
         let text = '';
         if (job.id.startsWith('plan-architect')) text = proposal('developer', job.project.models.developer);
         else if (job.id.startsWith('plan-tester')) text = proposal('reviewer', this.proposedReviewerModel ?? job.project.models.reviewer);
+        else if (job.id.startsWith('clarify-tester')) text = JSON.stringify({ schemaVersion: 1, questions: [{ id: 'tq1', prompt: 'Which behavior should the test cover?', assumption: 'The happy path in src/app.txt' }] });
         else if (job.id.startsWith('clarify-developer')) text = JSON.stringify({ schemaVersion: 1, questions: [{ id: 'q1', prompt: 'Which module owns this?', assumption: 'src/app.txt' }] });
+        else if (job.id.startsWith('answer-architect-tester')) text = JSON.stringify({ schemaVersion: 1, answers: [{ id: 'tq1', verdict: 'correct' }] });
         else if (job.id.startsWith('answer-architect')) text = JSON.stringify({ schemaVersion: 1, answers: [{ id: 'q1', verdict: 'correct' }] });
         else if (job.id.startsWith('developer-')) {
             await mkdir(path.join(job.workspace, 'src'), { recursive: true });
@@ -57,6 +59,12 @@ class FakeRuntime extends LocalRuntime {
             await git(job.workspace, ['add', '.']);
             await git(job.workspace, ['commit', '-m', 'Fix approved behavior']);
             text = 'Implemented and committed';
+        } else if (job.id.startsWith('tester-')) {
+            await mkdir(path.join(job.workspace, 'src'), { recursive: true });
+            await appendFile(path.join(job.workspace, 'src', 'app.test.txt'), `test for ${job.id}\n`);
+            await git(job.workspace, ['add', '.']);
+            await git(job.workspace, ['commit', '-m', 'Add tests']);
+            text = 'Tests written and committed';
         } else if (job.id.startsWith('review-')) {
             const candidate = await git(job.workspace, ['rev-parse', 'HEAD']);
             text = JSON.stringify({ schemaVersion: 1, candidate, specDigest: sha('Fix the behavior'), requirements: ['behavior'], verdict: 'pass', findings: [] });
@@ -180,7 +188,7 @@ async function fixture(visual = false) {
         ...(visual ? { visualReview: { caseIds: ['case-1'] } } : {}),
         runtime: { kind: 'macos-sandbox', toolPaths: ['/usr/bin'], network: 'none', authHomes: { codex: null, claude: null } },
         models: { coordinator: model, developer: model, reviewer: model, inspector: model },
-        limits: { maxAttempts: 6, maxReworks: 1, attemptTimeoutMs: 30000, maxWallMs: 300000,
+        limits: { maxAttempts: 7, maxReworks: 1, attemptTimeoutMs: 30000, maxWallMs: 300000,
             maxReportedTokens: 10000, verificationReserveAttempts: 2, maxLogBytes: 16384 }, billing: 'subscription-only', retentionDays: 30 };
     return { root, project, store: new Store(path.join(root, 'state')) };
 }
@@ -531,14 +539,14 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
         const runtime = new FakeRuntime();
         const final = await runRun(f.store, 'run', runtime);
         assert.equal(final.status, 'handoff_ready');
-        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'developer-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
-        assert.deepEqual([...runtime.schemas.keys()], ['plan-architect', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'review-1']);
+        assert.deepEqual(runtime.calls, ['plan-architect', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'developer-1', 'clarify-tester-1', 'answer-architect-tester-1', 'tester-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
+        assert.deepEqual([...runtime.schemas.keys()], ['plan-architect', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'clarify-tester-1', 'answer-architect-tester-1', 'review-1']);
         assert.deepEqual(JSON.parse(runtime.schemas.get('plan-architect')!).required, ['schemaVersion', 'tasks']);
         assert.ok(JSON.parse(runtime.schemas.get('review-1')!).required.includes('verdict'));
         assert.doesNotMatch(runtime.schemas.get('plan-architect')!, /minLength|minItems|maximum|\$schema/);
-        assert.equal(final.attempts.length, 6);
+        assert.equal(final.attempts.length, 9);
         assert.equal(final.checks.length, 2);
-        assert.equal(final.reportedTokens, 120);
+        assert.equal(final.reportedTokens, 180);
         assert.equal(final.review?.record.candidate, final.candidate);
         assert.equal(await git(path.join(f.store.dir('run'), 'candidates.git'), ['rev-parse', `refs/candidates/${final.candidate}`]), final.candidate);
         const reviewPrompt = runtime.prompts.get('review-1')!;
@@ -604,11 +612,17 @@ test('the developer dispatch prompt includes the admitted answers', { timeout: 1
         const runtime = new FakeRuntime();
         await runRun(f.store, 'run', runtime);
         const developerPrompt = runtime.prompts.get('developer-1')!;
-        assert.match(developerPrompt, /Clarifications \(approved by architect\)/);
+        assert.match(developerPrompt, /Clarifications \(admitted by architect\)/);
         assert.match(developerPrompt, /q1/);
         assert.match(developerPrompt, /correct/);
         assert.match(developerPrompt, /Which module owns this\?/);
         assert.match(developerPrompt, /src\/app\.txt/);
+        const testerPrompt = runtime.prompts.get('tester-1')!;
+        assert.match(testerPrompt, /Clarifications \(admitted by architect\)/);
+        assert.match(testerPrompt, /Which behavior should the test cover\?/);
+        assert.match(testerPrompt, /Candidate base: [a-f0-9]{40}/);
+        assert.match(runtime.prompts.get('clarify-tester-1')!, /approved tester task/);
+        assert.match(runtime.prompts.get('answer-architect-tester-1')!, /The tester asked/);
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
@@ -624,13 +638,16 @@ test('clarify and answer jobs are dispatched with a read-only source checkout', 
         assert.equal(jobs.get('clarify-developer-1')?.readOnlySource, true);
         assert.equal(jobs.get('answer-architect-1')?.readOnlySource, true);
         assert.equal(jobs.get('developer-1')?.readOnlySource, false);
+        assert.equal(jobs.get('clarify-tester-1')?.readOnlySource, true);
+        assert.equal(jobs.get('answer-architect-tester-1')?.readOnlySource, true);
+        assert.equal(jobs.get('tester-1')?.readOnlySource, false);
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a rework reuses the admitted answer instead of re-clarifying', { timeout: 10000 }, async () => {
+test('a rework reuses developer clarification and renews candidate-bound tester clarification', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
-        f.project.limits.maxAttempts = 10;
+        f.project.limits.maxAttempts = 12;
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
         class ReworkRuntime extends FakeRuntime {
             reviews = 0;
@@ -649,9 +666,15 @@ test('a rework reuses the admitted answer instead of re-clarifying', { timeout: 
         assert.equal(final.status, 'handoff_ready');
         assert.equal(final.reworks, 1);
         assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-developer')), ['clarify-developer-1']);
-        assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect')), ['answer-architect-1']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect') && !id.includes('tester')), ['answer-architect-1']);
         assert.deepEqual(runtime.calls.filter(id => id.startsWith('developer-')), ['developer-1', 'developer-2']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-tester')), ['clarify-tester-1', 'clarify-tester-1-2']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect-tester')), ['answer-architect-tester-1', 'answer-architect-tester-1-2']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('tester-')), ['tester-1', 'tester-2']);
         assert.equal(final.clarification?.developer?.clarifyAttemptId, 'clarify-developer-1');
+        assert.equal(final.clarification?.tester?.clarifyAttemptId, 'clarify-tester-1-2');
+        const importedAfterRework = await git(path.join(f.store.dir('run'), 'candidates.git'), ['merge-base', '--is-ancestor', final.attempts.find(a => a.id === 'developer-2')!.candidate, final.candidate!]);
+        assert.equal(importedAfterRework, '');
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
@@ -735,7 +758,7 @@ test('reset retries a failed planner with fresh evidence and dispatches the fixt
         const runtime = new FakeRuntime();
         const final = await runRun(f.store, 'run', runtime);
         assert.equal(final.status, 'handoff_ready');
-        assert.deepEqual(runtime.calls, ['plan-architect-2', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'developer-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
+        assert.deepEqual(runtime.calls, ['plan-architect-2', 'plan-tester', 'clarify-developer-1', 'answer-architect-1', 'developer-1', 'clarify-tester-1', 'answer-architect-tester-1', 'tester-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
         assert.equal(await readFile(path.join(f.store.dir('run'), 'attempts', 'plan-architect', 'sentinel.txt'), 'utf8'), 'old evidence');
         assert.notEqual(final.attempts.find(attempt => attempt.id === 'plan-architect-2')?.id, 'plan-architect');
         assert.equal(final.reworks, 0);
