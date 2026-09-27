@@ -39,6 +39,12 @@ test('Claude Opus 5.5 hand-off trigger is capped below 60% of its context window
     assert.equal(handoffTrigger(0.6, max, 'claude-opus-5-5'), 350000);
 });
 
+test('Claude Opus 5 uses a 200K window, set by the operator', () => {
+    const max = contextMax('claude', 'claude-opus-5', null);
+    assert.equal(max, 200000);
+    assert.equal(handoffTrigger(0.6, max, 'claude-opus-5'), 120000);
+});
+
 test('an unverified Claude model throws instead of guessing a context window', () => {
     for (const model of ['claude-haiku-9', 'constructor', 'toString'])
         assert.throws(() => contextMax('claude', model, null), /No verified context window/);

@@ -3,6 +3,8 @@
 export const claudeContextWindows: Record<string, number> = {
     'claude-sonnet-5': 200000,
     'claude-opus-5-5': 1000000,
+    // Operator-set, not measured: treat Opus 5 like Sonnet 5.
+    'claude-opus-5': 200000,
 };
 
 // Opus degrades past about 40% of its window, so its hand-off trigger is capped
