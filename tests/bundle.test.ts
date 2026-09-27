@@ -38,3 +38,10 @@ test('every role loads the shared worker skills', async () => {
     for (const name of ['unslop', 'bro', 'principle-guard-the-context-window', 'principle-never-block-on-the-human'])
       assert.ok(text.includes(`Resource home/.agents/skills/${name}/SKILL.md\n`), `${role} lacks ${name}`);
 });
+
+test('coordinator handoffs have the writing-for-agents skill and its reference', async () => {
+  const loaded = await bundle();
+  assert.ok(loaded.roles.roles.coordinator?.skills.includes('writing-for-agents'));
+  assert.match(loaded.content.coordinator ?? '', /Resource home\/\.agents\/skills\/writing-for-agents\/SKILL\.md/);
+  assert.match(loaded.content.coordinator ?? '', /Resource home\/\.agents\/skills\/writing-for-agents\/SKILL-MECHANICS\.md/);
+});

@@ -1,5 +1,25 @@
 # Factory review status
 
+## Reference screenshots and goal-complete shutdown, 2026-09-27
+
+Project setup accepts up to five PNG or JPEG reference screenshots of at most 5,000,000 bytes each. New runs freeze the selected screenshots, and the run Overview shows their thumbnails. When a run reaches `handoff_ready` after verification, the coordinator stops the processes it owns, writes the handoff, and the supervisor exits. The factory bar shows finishing, cleanup blocked, or finished. Retry cleanup appears only when cleanup is blocked. Chat stays disabled with a stated reason, and the Run handoff button remains visible.
+
+Review finding 10 is fixed. Run creation now writes `skills.json` through a temporary file with fsync and rename, so a partial snapshot left by a crash is replaced on retry while the run is still uncommitted. Reference publication removes its own leftover `<name>.<uuid>.tmp` link before it checks the destination, so a crash between link and unlink no longer blocks retry. A foreign hard link to the destination is still rejected. Both crash-state tests failed with `Reference file is unsafe` before the fix and pass after it.
+
+Playwright drove Chrome at 1440x900 through the real UI: PNG and JPEG upload, thumbnails after reload, keyboard removal, per-file errors for a GIF and a 5,000,001-byte PNG, a run created with a selected reference showing its thumbnail in Overview, and seeded `handoff_ready` runs in the stopping, blocked and complete shutdown phases. Fixes from this pass: the sidebar background now reaches the bottom of long pages, the refresh toast sits in the empty topbar centre instead of over the Coordinator card, reference-card controls align with the card header, an oversized file reports the byte limit instead of a generic body-size message, and Retry cleanup no longer appears while cleanup is still running without an error.
+
+On the merged tree, TypeScript and JavaScript syntax checks pass. The full suite ran 279 tests: 271 passed, 0 failed, and 8 were cancelled at the 10-second test timeout. Seven of those pass when rerun alone. `a rework reuses developer and tester clarification on the new candidate` takes about 11 seconds even alone, with or without this pass's changes. The cached Git fixture in `tests/coordinator.test.ts` did not bring coordinator tests under the timeout.
+
+Open live gaps: no one has verified that real Codex or Claude workers read the images through Headroom; a real Claude chat reply is unverified; goal-complete shutdown has not run on a real run.
+
+## Reference-image review fixes, 2026-09-27
+
+Focused Node 24.19.0 tests cover private reference directories and manifests, rejection of `read:false` passing reviews, and retry of an uncommitted run with existing identical files. Each test failed when its corresponding guard was temporarily removed. TypeScript checking passes. These fixtures do not prove that a subscription worker actually read an image or compared an application screen with it. Routed live image acceptance remains open.
+
+## Project role controls, 2026-09-27
+
+Project setup now saves an enabled set for seven roles. New runs snapshot that set. The coordinator skips disabled architect, developer, tester, and reviewer stages; mandatory checks still run. The existing business, domain, and coordinator roles have no separate worker dispatch in this coordinator. A run without a reviewer reports an independent-review warning. Two coordinator fixture runs, settings persistence checks, a browser save/reload check, TypeScript, and JavaScript syntax passed. No subscription worker run or application acceptance was exercised.
+
 ## CLI supervision and pause, 2026-09-25
 
 Steps 14 and 15 use one CLI supervision path for run, resume and supervise, reject dashboard Pause for live unsupervised workers, and update the budget copy and ADRs. The supervisor, dashboard and coordinator suites pass 65 tests on Node 24.19.0 with zero failures or skips. New tests first reproduced missing supervisor events, conflict exit code 1, false pause success and misleading idle copy. TypeScript, JavaScript syntax, bundle loading and diff whitespace checks pass.

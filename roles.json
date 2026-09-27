@@ -117,6 +117,7 @@
     },
     "coordinator": {
       "skills": [
+        "writing-for-agents",
         "factory-coordinate",
         "factory-communicate",
         "principle-prove-it-works",

@@ -356,7 +356,17 @@ async function groupGone(pgid: number, ms: number): Promise<boolean> {
  */
 export async function terminateOwned(p: OwnedProcess, graceMs: number): Promise<'gone' | 'not_owned' | 'survived'> {
     if (!await isOwnedAlive(p))
-        return await groupAlive(p.pgid) ? 'not_owned' : 'gone';
+        return p.pid !== p.pgid || !await groupAlive(p.pgid) ? 'gone' : 'not_owned';
+    if (p.pid !== p.pgid) {
+        try { process.kill(p.pid, 'SIGTERM'); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+        const deadline = Date.now() + graceMs;
+        while (await isOwnedAlive(p) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+        if (!await isOwnedAlive(p)) return 'gone';
+        try { process.kill(p.pid, 'SIGKILL'); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+        const killDeadline = Date.now() + 2000;
+        while (await isOwnedAlive(p) && Date.now() < killDeadline) await new Promise(resolve => setTimeout(resolve, 50));
+        return await isOwnedAlive(p) ? 'survived' : 'gone';
+    }
     const signal = (name: NodeJS.Signals) => {
         try { process.kill(-p.pgid, name); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
@@ -369,4 +379,20 @@ export async function terminateOwned(p: OwnedProcess, graceMs: number): Promise<
         return 'gone';
     signal('SIGKILL');
     return await groupGone(p.pgid, 2000) ? 'gone' : 'survived';
+}
+export async function terminateOwnedBatch(processes: OwnedProcess[], graceMs: number) {
+    const seen = new Set<string>();
+    const results: { process: OwnedProcess; result: 'gone' | 'not_owned' | 'survived' }[] = [];
+    for (const process of processes) {
+        const key = `${process.pid}:${process.pgid}:${process.started}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (process.pid === globalThis.process.pid) {
+            results.push({ process, result: 'not_owned' });
+            continue;
+        }
+        try { results.push({ process, result: await terminateOwned(process, graceMs) }); }
+        catch { results.push({ process, result: 'survived' }); }
+    }
+    return results;
 }

@@ -3,6 +3,7 @@ export const id = z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/);
 export const digest = z.string().regex(/^[a-f0-9]{64}$/);
 export const commit = z.string().regex(/^[a-f0-9]{40}$/);
 export const role = z.enum(['business', 'domain', 'architect', 'developer', 'reviewer', 'tester', 'coordinator']);
+export const isClarificationJob = (attemptId: string) => attemptId.startsWith('clarify-developer') || attemptId.startsWith('clarify-tester') || attemptId.startsWith('answer-architect');
 export const choice = z.object({ provider: z.enum(['codex', 'claude']), model: z.string().min(1), effort: z.enum(['low', 'medium', 'high', 'xhigh']) }).strict();
 export const check = z.object({
     id, argv: z.array(z.string()).min(1), cwd: z.string().default('.'), timeoutMs: z.number().int().positive().max(1800000),
@@ -15,6 +16,11 @@ export const headroomSchema = z.object({
     }, 'Headroom must use an explicit loopback port and a /v1 endpoint'),
 }).strict();
 export type Headroom = z.infer<typeof headroomSchema>;
+export const referenceImageSchema = z.object({
+    sha256: digest, mimeType: z.enum(['image/png', 'image/jpeg']), bytes: z.number().int().positive().max(5_000_000),
+    path: z.string().regex(/^references\/[a-f0-9]{64}\.(?:png|jpg)$/),
+}).strict();
+export type ReferenceImage = z.infer<typeof referenceImageSchema>;
 // handoffContextRatio is optional; callers default to 0.6 of the effective max context where they read it.
 export const limitsSchema = z.object({
     maxAttempts: z.number().int().min(1).max(100), maxReworks: z.number().int().min(0).max(10),
@@ -25,14 +31,18 @@ export const limitsSchema = z.object({
     maxClarificationJobs: z.number().int().min(1).max(20).optional(),
 }).strict();
 export const projectSchema = z.object({
+    factoryId: id.optional(),
     schemaVersion: z.literal(2), name: id, repository: z.string().min(1), base: commit,
+    enabledRoles: z.array(role).max(role.options.length).refine(values => new Set(values).size === values.length, 'Role names must be unique').optional(),
     recipient: z.string().min(1), brief: z.string().min(1), policies: z.array(z.string()).min(1),
     requirements: z.array(id).min(1), checks: z.array(check).min(1),
     artifact: z.string().min(1), artifactCheck: check,
     visualReview: z.object({ caseIds: z.array(id).min(1).max(200) }).strict().optional(),
+    referenceImages: z.array(referenceImageSchema).max(5).refine(images => new Set(images.map(image => image.sha256)).size === images.length, 'Reference hashes must be unique').optional(),
     allowedPaths: z.array(z.string()).min(1),
     runtime: z.object({ kind: z.literal('macos-sandbox'), toolPaths: z.array(z.string().min(1)).min(1), network: z.enum(['none', 'loopback', 'outbound']), authHomes: z.object({ codex: z.string().nullable(), claude: z.string().nullable() }).strict() }).strict(),
-    models: z.object({ coordinator: choice, developer: choice, reviewer: choice, inspector: choice, tester: choice.optional() }).strict(),
+    models: z.object({ coordinator: choice, developer: choice, reviewer: choice, inspector: choice, tester: choice.optional(),
+        roles: z.object({ business: choice, domain: choice, architect: choice, developer: choice, reviewer: choice, tester: choice, coordinator: choice }).strict().optional() }).strict(),
     limits: limitsSchema,
     headroom: headroomSchema.optional(),
     billing: z.literal('subscription-only'), retentionDays: z.number().int().min(30),
@@ -58,7 +68,7 @@ export type Role = z.infer<typeof role>;
 export const states = ['draft', 'ready', 'running', 'candidate', 'verifying', 'verified', 'changes_requested', 'awaiting_input', 'handoff_ready', 'failed', 'cancelled'] as const;
 export type Status = typeof states[number];
 export const transitions: Record<Status, Status[]> = {
-    draft: ['ready', 'awaiting_input', 'cancelled'], ready: ['running', 'awaiting_input', 'cancelled'], running: ['candidate', 'changes_requested', 'awaiting_input', 'failed', 'cancelled'],
+    draft: ['ready', 'awaiting_input', 'cancelled'], ready: ['running', 'candidate', 'awaiting_input', 'cancelled'], running: ['candidate', 'changes_requested', 'awaiting_input', 'failed', 'cancelled'],
     candidate: ['verifying', 'changes_requested', 'awaiting_input', 'cancelled'], verifying: ['verified', 'changes_requested', 'awaiting_input', 'failed', 'cancelled'],
     verified: ['handoff_ready', 'changes_requested', 'awaiting_input', 'cancelled'], changes_requested: ['ready', 'awaiting_input', 'failed', 'cancelled'],
     awaiting_input: ['draft', 'ready', 'running', 'candidate', 'verifying', 'verified', 'changes_requested', 'handoff_ready', 'cancelled'],
@@ -83,12 +93,18 @@ const clarificationSideSchema = z.object({
     admitted: z.boolean(), digest: digest.optional(),
 }).strict();
 export type ClarificationSide = z.infer<typeof clarificationSideSchema>;
-export const reviewSchema = z.object({ schemaVersion: z.literal(1), candidate: commit, specDigest: digest, requirements: z.array(id), verdict: z.enum(['pass', 'changes_requested']), findings: z.array(z.object({ severity: z.enum(['blocking', 'minor']), requirement: id, message: z.string().min(1), evidence: z.string().min(1) }).strict()) }).strict();
+export const reviewSchema = z.object({ schemaVersion: z.literal(1), candidate: commit, specDigest: digest, referenceImageHashes: z.array(digest).max(5).optional(), referenceObservations: z.array(z.object({ sha256: digest, read: z.boolean(), observation: z.string().trim().min(1) }).strict()).max(5).optional(), requirements: z.array(id), verdict: z.enum(['pass', 'changes_requested']), findings: z.array(z.object({ severity: z.enum(['blocking', 'minor']), requirement: id, message: z.string().min(1), evidence: z.string().min(1) }).strict()) }).strict();
 export type Review = z.infer<typeof reviewSchema>;
 const timestamp = z.string().datetime();
 // `started` is the exact `ps -o lstart= -p <pid>` text. PID plus start time proves identity; a PID alone can be reused.
 export const ownedProcess = z.object({ pid: z.number().int().positive(), pgid: z.number().int().positive(), started: z.string().min(1) }).strict();
 export type OwnedProcess = z.infer<typeof ownedProcess>;
+const shutdownSchema = z.object({
+    candidate: commit, specDigest: digest, phase: z.enum(['stopping', 'handoff', 'complete']),
+    startedAt: timestamp, completedAt: timestamp.optional(), error: z.string().max(1000).optional(),
+}).strict();
+export type Shutdown = z.infer<typeof shutdownSchema>;
+const ownedProcessRecordSchema = z.object({ jobId: id, segment: z.number().int().positive(), process: ownedProcess }).strict();
 const count = z.number().int().nonnegative();
 const fileRecord = z.object({ path: z.string().min(1), sha256: digest }).strict();
 const eventSchema = z.object({ sequence: z.number().int().positive(), at: timestamp, type: z.string().min(1), detail: z.unknown() }).strict();
@@ -96,7 +112,7 @@ const resultSchema = z.object({
     id, kind: z.enum(['check', 'worker', 'artifact']), candidate: commit, specDigest: digest, definitionDigest: digest,
     runtime: z.string().min(1), startedAt: timestamp, endedAt: timestamp, exitCode: z.number().int().nullable(),
     signal: z.string().nullable(), reason: z.string().min(1), stdout: fileRecord, stderr: fileRecord,
-    passed: z.boolean(), sourceUnchanged: z.boolean(), argv: z.array(z.string()).min(1), cwd: z.string().min(1),
+    passed: z.boolean(), sourceUnchanged: z.boolean(), referenceImageHashes: z.array(digest).max(5).optional(), argv: z.array(z.string()).min(1), cwd: z.string().min(1),
 }).strict().superRefine((v, c) => {
     if (v.passed && (v.exitCode !== 0 || v.signal !== null || v.reason !== 'completed' || !v.sourceUnchanged))
         c.addIssue({ code: 'custom', message: 'Passing evidence requires successful execution and unchanged source' });
@@ -158,10 +174,11 @@ export const questionBatchSchema = z.object({
         answers: z.array(z.object({ questionId: id, value: z.string().trim().min(1).max(10000) }).strict()).min(1) }).strict().optional(),
 }).strict();
 const baseStateSchema = z.object({
+    skillSnapshot: fileRecord.optional(),
     schemaVersion: z.literal(1), id, revision: z.number().int().positive(), status: z.enum(states),
     priorStatus: z.enum(states).optional(), reason: z.string().optional(), project: projectSchema,
     specDigest: digest, profileDigest: digest, bundleDigest: digest, policyDigest: digest,
-    sourceBase: commit, candidate: commit.optional(), createdAt: timestamp, updatedAt: timestamp,
+    sourceBase: commit, candidate: commit.optional(), candidateReferences: z.object({ candidate: commit, referenceImageHashes: z.array(digest).max(5) }).strict().optional(), createdAt: timestamp, updatedAt: timestamp,
     approval: z.object({ owner: z.string().min(1), statement: z.string().min(1) }).strict(),
     attempts: z.array(attemptSchema), checks: z.array(resultSchema),
     review: z.object({ attemptId: id, record: reviewSchema, file: fileRecord }).strict().optional(),
@@ -169,6 +186,7 @@ const baseStateSchema = z.object({
     unknownUsage: z.boolean(), elapsedMs: count, control: z.enum(['cancel', 'suspend']).optional(), suspended: z.boolean(),
     activeJob: z.object({ id, runtime: z.literal('macos-sandbox'), kind: z.string().min(1), startedAt: timestamp, process: ownedProcess.optional() }).strict().optional(),
     supervisor: z.object({ launchId: id, process: ownedProcess, launchedAt: timestamp }).strict().optional(),
+    shutdown: shutdownSchema.optional(), ownedProcesses: z.array(ownedProcessRecordSchema).optional(),
     specifications: z.array(specificationSchema).optional(), tickets: z.array(ticketSchema).optional(), questionBatches: z.array(questionBatchSchema).optional(),
     clarification: z.object({ developer: clarificationSideSchema.optional(), tester: clarificationSideSchema.optional() }).strict().optional(),
     lastEvent: eventSchema, history: z.array(eventSchema).min(1),

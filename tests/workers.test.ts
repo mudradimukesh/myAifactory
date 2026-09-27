@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { meteredTokens, normalize, parseWorkerOutput, workerCommand, UsageMeter } from '../src/workers.ts';
 
@@ -30,6 +30,19 @@ test('resume argv for codex and claude', () => {
     '--json-schema', schema.json, '--resume', claudeSession]);
   assert.deepEqual(claude.env, { CLAUDE_STREAM_IDLE_TIMEOUT_MS: '120000', DISABLE_AUTO_COMPACT: '1',
     DISABLE_COMPACT: '1', ANTHROPIC_BASE_URL: 'http://127.0.0.1:8791' });
+});
+
+test('worker reference arguments use the supplied path', () => {
+  const image = { sha256: 'a'.repeat(64), mimeType: 'image/png' as const, bytes: 24,
+    path: '/tmp/run/attempts/review/policy/references/' + 'a'.repeat(64) + '.png' };
+  const route = { baseUrl: 'http://127.0.0.1:8791/v1' };
+  const codex = workerCommand({ provider: 'codex', model: 'fixture', effort: 'low' },
+    'reviewer', '/tmp/source', 'Inspect image', 'Policy', route, undefined, undefined, [image]);
+  assert.equal(codex.args[codex.args.indexOf('--image') + 1], image.path);
+  const claude = workerCommand({ provider: 'claude', model: 'fixture', effort: 'low' },
+    'reviewer', '/tmp/source', `Inspect ${image.path}`, 'Policy', route, undefined, undefined, [image]);
+  assert.equal(claude.args[claude.args.indexOf('--add-dir') + 1], dirname(image.path));
+  assert.equal(claude.stdin, `Inspect ${image.path}`);
 });
 
 test('Claude result retains context windows by model', () => {

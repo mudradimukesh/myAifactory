@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -8,6 +9,7 @@ import { promisify } from 'node:util';
 import { createRun } from '../src/coordinator.ts';
 import type { OwnedProcess, Project, State } from '../src/contracts.ts';
 import { Dashboard, FactoryConflict, StopIncomplete, factoryView } from '../src/dashboard.ts';
+import { createDashboardServer } from '../src/dashboard-server.ts';
 import { git } from '../src/git.ts';
 import { identify, terminateOwned } from '../src/process.ts';
 import { move } from '../src/store.ts';
@@ -101,7 +103,8 @@ for (const command of ['run', 'resume']) test(`CLI ${command} records supervisor
   const state = await f.read();
   const events = state.history.filter(event => event.type.startsWith('supervisor_'));
   assert.deepEqual(events.map(event => event.type), ['supervisor_started', 'supervisor_exited']);
-  assert.equal(state.supervisor, undefined);
+  assert.ok(state.supervisor);
+  assert.equal(gone(state.supervisor.process.pid), true);
   assert.equal(stderr, '');
   assert.equal(stdout, JSON.stringify({ run: state.id, status: state.status, revision: state.revision - 1,
     attempts: state.attempts.length, candidate: state.candidate ?? null,
@@ -173,6 +176,28 @@ test('the dashboard starts, pauses, resumes and stops one supervised run', async
   assert.equal(await f.dashboard.store.holder(), null);
 });
 
+test('Stop releases a non-leader supervisor without killing its unrelated group leader', async t => {
+  const f = await fixture(t);
+  const groupLeader = spawn(process.execPath, ['-e', `const {spawn}=require('node:child_process'); const child=spawn(process.execPath,['-e','process.stdout.write(String(process.pid));setInterval(()=>{},1000)'],{stdio:['ignore','pipe','ignore']}); child.stdout.pipe(process.stdout); setInterval(()=>{},1000);`], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  assert.ok(groupLeader.pid);
+  try {
+    const childPid = Number((await once(groupLeader.stdout!, 'data'))[0].toString());
+    const nonLeader = await identify(childPid);
+    const leader = await identify(groupLeader.pid);
+    assert.ok(nonLeader && leader && nonLeader.pid !== nonLeader.pgid);
+    await f.dashboard.store.update('run', 'fixture_non_leader_supervisor', {}, state => {
+      state.supervisor = { launchId: 'fixture', process: nonLeader, launchedAt: state.createdAt };
+    });
+    await f.dashboard.store.execution('run', async () => {});
+    const stopped = await f.dashboard.control('run', { action: 'stop' });
+    assert.equal(stopped.changed, true);
+    assert.equal(await f.dashboard.store.holder(), null);
+    assert.equal(await until(async () => !gone(leader.pid), value => value), true);
+  } finally {
+    if (groupLeader.pid) { try { process.kill(-groupLeader.pid, 'SIGKILL'); } catch {} }
+  }
+});
+
 test('a killed supervisor shows as exited and Stop recovers the orphaned job', async t => {
   const f = await fixture(t);
   await f.dashboard.control('run', { action: 'start', expectedRevision: f.created.revision });
@@ -221,6 +246,47 @@ test('Start succeeds when the supervisor reaches its waiting point before the fi
   assert.equal((await f.read()).status, 'awaiting_input');
   await until(f.view, v => v.state === 'idle');
   assert.deepEqual(await f.supervisorPids(), []);
+});
+
+test('HTTP run reaches Finished only after supervisor exit and serves its handoff', async t => {
+  const f = await fixture(t);
+  const server = createDashboardServer(f.dashboard.store.root, f.dashboard);
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const base = `http://127.0.0.1:${address.port}`;
+  const { csrfToken } = await (await fetch(`${base}/api/session`)).json();
+  const post = (url: string, body: unknown) => fetch(`${base}${url}`, { method: 'POST', headers: { Origin: base, 'X-CSRF-Token': csrfToken }, body: JSON.stringify(body) });
+  const created = await post('/api/runs', { id: 'handoff', project: f.created.project, approval: f.created.approval });
+  assert.equal(created.status, 201);
+  const verified = await f.dashboard.store.update('handoff', 'fixture_verified', {}, state => {
+    state.status = 'verified'; state.candidate = state.sourceBase;
+  });
+  const started = await post('/api/runs/handoff/control', { action: 'start', expectedRevision: verified.revision });
+  assert.equal(started.status, 200);
+  const finished = await until(async () => {
+    const response = await fetch(`${base}/api/dashboard`);
+    return (await response.json()).runs.find((run: { id: string }) => run.id === 'handoff');
+  }, run => run?.factory?.state === 'terminal');
+  assert.equal(finished.status, 'handoff_ready');
+  const state = await f.dashboard.store.read('handoff');
+  assert.equal(state.shutdown?.phase, 'complete');
+  assert.equal(state.supervisor ? gone(state.supervisor.process.pid) : true, true);
+  for (const owned of state.ownedProcesses ?? []) assert.equal(gone(owned.process.pid), true);
+  const handoff = await fetch(`${base}/api/runs/handoff/handoff.md`);
+  assert.equal(handoff.status, 200);
+  assert.match(await handoff.text(), /Status: handoff_ready/);
+});
+
+test('worker spawn persists a segment identity before the active job ends', async t => {
+  const f = await fixture(t);
+  await f.dashboard.control('run', { action: 'start', expectedRevision: f.created.revision });
+  const { leader } = await f.job();
+  const state = await f.read();
+  assert.deepEqual(state.ownedProcesses?.map(record => ({ jobId: record.jobId, segment: record.segment, pid: record.process.pid })),
+    [{ jobId: 'plan-architect', segment: 1, pid: leader.pid }]);
+  await f.dashboard.control('run', { action: 'stop' });
 });
 
 test('Start rejects an orphaned worker group and Stop preserves ownership until every member exits', async t => {

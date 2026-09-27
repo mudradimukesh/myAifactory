@@ -77,6 +77,21 @@ test('holds the state-root reservation across execution calls until explicitly r
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('a concurrent release cannot remove a newer reservation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-store-'));
+  const store = new Store(root);
+  try {
+    await store.execution('first', async () => {});
+    for (let i = 0; i < 20; i++) {
+      await Promise.all([store.release('first'), store.release('first')]);
+      await store.execution('second', async () => {});
+      assert.equal(await store.holder(), 'second');
+      await store.release('second');
+      await store.execution('first', async () => {});
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('concurrent updates from two processes both commit without ELOCKED', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'factory-store-'));
   const store = new Store(root);

@@ -7,7 +7,7 @@ import test from 'node:test';
 import { createRun, registerVisualReview, runRun, stepRun } from '../src/coordinator.ts';
 import { meterReadingSchema } from '../src/contracts.ts';
 import type { Project, WorkerChoice } from '../src/contracts.ts';
-import { git } from '../src/git.ts';
+import { createStore, git } from '../src/git.ts';
 import { LocalRuntime, workerHome } from '../src/runtime.ts';
 import type { Job } from '../src/runtime.ts';
 import { Store, json, sha } from '../src/store.ts';
@@ -34,6 +34,8 @@ class FakeRuntime extends LocalRuntime {
     readonly schemas = new Map<string, string>();
     readonly prompts = new Map<string, string>();
     proposedReviewerModel?: WorkerChoice;
+    reviewReferenceHashes?: string[];
+    reviewObservations?: { sha256: string; read: boolean; observation: string }[];
     override async preflight() { return []; }
     override async execute(job: Job): Promise<Awaited<ReturnType<LocalRuntime['execute']>>> {
         this.calls.push(job.id);
@@ -67,7 +69,9 @@ class FakeRuntime extends LocalRuntime {
             text = 'Tests written and committed';
         } else if (job.id.startsWith('review-')) {
             const candidate = await git(job.workspace, ['rev-parse', 'HEAD']);
-            text = JSON.stringify({ schemaVersion: 1, candidate, specDigest: sha('Fix the behavior'), requirements: ['behavior'], verdict: 'pass', findings: [] });
+            const hashes = job.project.referenceImages?.map(image => image.sha256) ?? [];
+            text = JSON.stringify({ schemaVersion: 1, candidate, specDigest: hashes.length ? sha(json({ brief: job.project.brief, referenceImageHashes: hashes.sort() })) : sha('Fix the behavior'),
+                ...(hashes.length ? { referenceImageHashes: this.reviewReferenceHashes ?? hashes, ...(this.reviewObservations ? { referenceObservations: this.reviewObservations } : {}) } : {}), requirements: ['behavior'], verdict: 'pass', findings: [] });
         }
         await writeFile(path.join(job.captureDir, 'stdout.log'), job.id.startsWith('check-') ? 'check passed\n' : job.provider === 'claude' ? claudeOutput(text) : codexOutput(text));
         await writeFile(path.join(job.captureDir, 'stderr.log'), '');
@@ -170,17 +174,23 @@ class HandoffRuntime extends FakeRuntime {
     }
 }
 
-async function fixture(visual = false) {
-    const root = await mkdtemp(path.join(tmpdir(), 'factory-coordinator-'));
-    const source = path.join(root, 'source');
-    await mkdir(source);
+const fixtureSource = (async () => {
+    const source = await mkdtemp(path.join(tmpdir(), 'factory-coordinator-source-'));
     await git(source, ['init']);
     await git(source, ['config', 'user.name', 'Fixture']);
     await git(source, ['config', 'user.email', 'fixture@localhost']);
     await writeFile(path.join(source, 'README.md'), 'base\n');
     await git(source, ['add', '.']);
     await git(source, ['commit', '-m', 'Base']);
-    const base = await git(source, ['rev-parse', 'HEAD']);
+    return { source, base: await git(source, ['rev-parse', 'HEAD']) };
+})();
+
+async function fixture(visual = false) {
+    const root = await mkdtemp(path.join(tmpdir(), 'factory-coordinator-'));
+    const source = path.join(root, 'source');
+    const cached = await fixtureSource;
+    await cp(cached.source, source, { recursive: true });
+    const base = cached.base;
     const check = { id: 'unit', argv: ['node', '--version'], cwd: '.', timeoutMs: 1000, requirements: ['behavior'], outputPaths: [] };
     const project: Project = { schemaVersion: 2, name: 'fixture', repository: source, base,
         recipient: 'operator', brief: 'Fix the behavior', policies: ['No arbitrary subprocesses'], requirements: ['behavior'],
@@ -192,6 +202,120 @@ async function fixture(visual = false) {
             maxReportedTokens: 10000, verificationReserveAttempts: 2, maxLogBytes: 16384 }, billing: 'subscription-only', retentionDays: 30 };
     return { root, project, store: new Store(path.join(root, 'state')) };
 }
+
+test('review with another reference hash cannot approve the candidate', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
+        const draft = await f.store.addReference(png, 'image/png', 0);
+        f.project.referenceImages = draft.images;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief and reference' });
+        const runtime = new FakeRuntime();
+        runtime.reviewReferenceHashes = ['b'.repeat(64)];
+        const final = await runRun(f.store, 'run', runtime);
+        assert.notEqual(final.status, 'handoff_ready');
+        assert.equal(final.review, undefined);
+        assert.match(JSON.stringify(final.history), /Review identity or reference coverage mismatch/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('worker prompts use copied attempt-local reference paths', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
+        f.project.referenceImages = (await f.store.addReference(png, 'image/png', 0)).images;
+        f.project.models.roles = { business: model, domain: model, architect: { provider: 'claude', model: 'claude-sonnet-5', effort: 'low' }, developer: model, tester: model, reviewer: model, coordinator: model };
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved reference' });
+        const runtime = new FakeRuntime();
+        await stepRun(f.store, 'run', runtime);
+        const prompt = runtime.prompts.values().next().value as string;
+        const copied = path.join(f.store.dir('run'), 'attempts', 'plan-architect', 'policy', f.project.referenceImages[0].path);
+        assert.match(prompt, new RegExp(sha(png)));
+        assert.ok(prompt.includes(copied), `prompt did not name copied image: ${prompt}`);
+        assert.deepEqual(await readFile(copied), png);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('hash-only passing review is rejected', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
+        f.project.referenceImages = (await f.store.addReference(png, 'image/png', 0)).images;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved reference' });
+        const final = await runRun(f.store, 'run', new FakeRuntime());
+        assert.equal(final.review, undefined);
+        assert.match(JSON.stringify(final.history), /Review identity or reference coverage mismatch/);
+        assert.notEqual(final.status, 'handoff_ready');
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('passing review rejects a reported reference read failure', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
+        f.project.referenceImages = (await f.store.addReference(png, 'image/png', 0)).images;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved reference' });
+        const runtime = new FakeRuntime();
+        runtime.reviewObservations = [{ sha256: sha(png), read: false, observation: 'Could not read this image' }];
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.review, undefined);
+        assert.match(JSON.stringify(final.history), /reference coverage mismatch|Independent review failed/);
+        assert.notEqual(final.status, 'handoff_ready');
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('run creation stages references before files and retries an uncommitted run', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
+        const image = (await f.store.addReference(png, 'image/png', 0)).images[0];
+        f.project.referenceImages = [image];
+        const draftFile = path.join(f.store.root, '.dashboard', 'reference-images', `${image.sha256}.png`);
+        await writeFile(draftFile, png.subarray(0, 12));
+        const approval = { owner: 'operator', statement: 'Approved reference' };
+        await assert.rejects(createRun(f.store, 'run', f.project, approval), /unsafe|mismatch/i);
+        await assert.rejects(readFile(path.join(f.store.dir('run'), 'skills.json')), { code: 'ENOENT' });
+        await writeFile(draftFile, png);
+        const created = await createRun(f.store, 'run', f.project, approval);
+        assert.equal(created.status, 'ready');
+        assert.deepEqual((await f.store.readRunReference('run', image)).bytes, png);
+        await assert.rejects(createRun(f.store, 'run', f.project, approval), /Run already exists/);
+        const resume = f.store.dir('resume');
+        await mkdir(path.join(resume, 'references'), { recursive: true, mode: 0o700 });
+        await createStore(f.project.repository, path.join(resume, 'candidates.git'), f.project.base);
+        await cp(path.join(f.store.dir('run'), 'skills.json'), path.join(resume, 'skills.json'));
+        const existingCopy = path.join(resume, image.path);
+        await cp(path.join(f.store.dir('run'), image.path), existingCopy);
+        const inode = (await fsPromises.stat(existingCopy)).ino;
+        assert.equal((await createRun(f.store, 'resume', f.project, approval)).status, 'ready');
+        assert.equal((await fsPromises.stat(existingCopy)).ino, inode);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('run creation retries after a crash left a partial skill snapshot', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await mkdir(f.store.dir('run'), { recursive: true, mode: 0o700 });
+        await writeFile(path.join(f.store.dir('run'), 'skills.json'), '{', { mode: 0o600 });
+        const created = await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved' });
+        assert.equal(created.status, 'ready');
+        JSON.parse(await readFile(path.join(f.store.dir('run'), 'skills.json'), 'utf8'));
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('project role model overrides select the configured role model for coordinator work', async () => {
+    const f = await fixture();
+    try {
+        const architect = { provider: 'claude' as const, model: 'claude-sonnet-5', effort: 'low' as const };
+        f.project.models.roles = {
+            business: model, domain: model, architect, developer: model, reviewer: model, tester: model, coordinator: model,
+        };
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        await stepRun(f.store, 'run', new FakeRuntime());
+        const state = await f.store.read('run');
+        assert.deepEqual(state.attempts[0].model, architect);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
 
 async function runStall(t: { mock: { timers: { enable: Function; tick: Function; reset: Function } } }, mode: StallFixtureRuntime, pause?: PauseGate) {
     const f = await fixture();
@@ -558,6 +682,33 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
+test('disabled planner and test roles are skipped while enabled workers run', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        f.project.enabledRoles = ['developer', 'reviewer'];
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FakeRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'handoff_ready');
+        assert.deepEqual(runtime.calls, ['developer-1', 'check-unit-1', 'check-artifact-1', 'review-1']);
+        assert.equal(final.candidate !== final.sourceBase, true);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('disabling every agent verifies the source through mandatory checks only', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        f.project.enabledRoles = [];
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FakeRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'handoff_ready');
+        assert.equal(final.candidate, final.sourceBase);
+        assert.deepEqual(runtime.calls, ['check-unit-1', 'check-artifact-1']);
+        assert.equal(final.review, undefined);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
 test('developer clarification runs clarify then answer before dispatch, in order', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
@@ -605,6 +756,33 @@ test('a repeat clarification round still unresolved ends in awaiting_input', { t
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
+test('a rejected tester assumption stops after one clarification round', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        f.project.limits.maxClarificationJobs = 8;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        class WrongTesterAnswerRuntime extends FakeRuntime {
+            override async execute(job: Job) {
+                const result = await super.execute(job);
+                if (job.id.startsWith('answer-architect-tester')) {
+                    const text = JSON.stringify({ schemaVersion: 1, answers: [{ id: 'tq1', verdict: 'wrong', correction: 'Cover the failure case too' }] });
+                    await writeFile(path.join(job.captureDir, 'stdout.log'), codexOutput(text));
+                }
+                return result;
+            }
+        }
+        const runtime = new WrongTesterAnswerRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'awaiting_input');
+        assert.equal(final.reason, 'Clarification unresolved');
+        assert.equal(final.clarification?.tester?.admitted, false);
+        assert.equal(final.clarification?.tester?.round, 1);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-tester')), ['clarify-tester-1']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect-tester')), ['answer-architect-tester-1']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('tester-')), []);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
 test('the developer dispatch prompt includes the admitted answers', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
@@ -632,7 +810,16 @@ test('clarify and answer jobs are dispatched with a read-only source checkout', 
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
         const jobs = new Map<string, Job>();
         class CaptureRuntime extends FakeRuntime {
-            override async execute(job: Job) { jobs.set(job.id, job); return super.execute(job); }
+            override async execute(job: Job) {
+                jobs.set(job.id, job);
+                const result = await super.execute(job);
+                if (job.id === 'developer-1') {
+                    const skillPath = path.join(job.policyDir, 'skills', 'developer', 'home/.agents/skills/factory-tdd/SKILL.md');
+                    assert.equal(await readFile(skillPath, 'utf8'), await readFile(new URL('../home/.agents/skills/factory-tdd/SKILL.md', import.meta.url), 'utf8'));
+                    assert.ok(this.prompts.get(job.id)!.includes(skillPath));
+                }
+                return result;
+            }
         }
         await runRun(f.store, 'run', new CaptureRuntime());
         assert.equal(jobs.get('clarify-developer-1')?.readOnlySource, true);
@@ -644,15 +831,20 @@ test('clarify and answer jobs are dispatched with a read-only source checkout', 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a rework reuses developer clarification and renews candidate-bound tester clarification', { timeout: 10000 }, async () => {
+// Two full rounds spawn about 400 git processes; one round alone takes about 7s on the host.
+test('a rework reuses developer and tester clarification on the new candidate', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxAttempts = 12;
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
         class ReworkRuntime extends FakeRuntime {
             reviews = 0;
+            testerBases = new Map<string, string>();
+            developerCandidates = new Map<string, string>();
             override async execute(job: Job) {
+                if (job.id.startsWith('tester-')) this.testerBases.set(job.id, await git(job.workspace, ['rev-parse', 'HEAD']));
                 const result = await super.execute(job);
+                if (job.id.startsWith('developer-')) this.developerCandidates.set(job.id, await git(job.workspace, ['rev-parse', 'HEAD']));
                 if (job.id.startsWith('review-') && ++this.reviews === 1) {
                     const candidate = await git(job.workspace, ['rev-parse', 'HEAD']);
                     const text = JSON.stringify({ schemaVersion: 1, candidate, specDigest: sha('Fix the behavior'), requirements: ['behavior'], verdict: 'changes_requested', findings: [] });
@@ -668,12 +860,20 @@ test('a rework reuses developer clarification and renews candidate-bound tester 
         assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-developer')), ['clarify-developer-1']);
         assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect') && !id.includes('tester')), ['answer-architect-1']);
         assert.deepEqual(runtime.calls.filter(id => id.startsWith('developer-')), ['developer-1', 'developer-2']);
-        assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-tester')), ['clarify-tester-1', 'clarify-tester-1-2']);
-        assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect-tester')), ['answer-architect-tester-1', 'answer-architect-tester-1-2']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-tester')), ['clarify-tester-1']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect-tester')), ['answer-architect-tester-1']);
         assert.deepEqual(runtime.calls.filter(id => id.startsWith('tester-')), ['tester-1', 'tester-2']);
         assert.equal(final.clarification?.developer?.clarifyAttemptId, 'clarify-developer-1');
-        assert.equal(final.clarification?.tester?.clarifyAttemptId, 'clarify-tester-1-2');
-        const importedAfterRework = await git(path.join(f.store.dir('run'), 'candidates.git'), ['merge-base', '--is-ancestor', final.attempts.find(a => a.id === 'developer-2')!.candidate, final.candidate!]);
+        assert.equal(final.clarification?.tester?.clarifyAttemptId, 'clarify-tester-1');
+        for (const round of [1, 2]) {
+            const candidate = runtime.developerCandidates.get(`developer-${round}`);
+            assert.ok(candidate);
+            assert.equal(runtime.testerBases.get(`tester-${round}`), candidate);
+            assert.ok(runtime.prompts.get(`tester-${round}`)!.includes(`Candidate base: ${candidate}`));
+            assert.match(runtime.prompts.get(`tester-${round}`)!, /Which behavior should the test cover\?/);
+        }
+        assert.notEqual(runtime.testerBases.get('tester-1'), runtime.testerBases.get('tester-2'));
+        const importedAfterRework = await git(path.join(f.store.dir('run'), 'candidates.git'), ['merge-base', '--is-ancestor', runtime.developerCandidates.get('developer-2')!, final.candidate!]);
         assert.equal(importedAfterRework, '');
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });

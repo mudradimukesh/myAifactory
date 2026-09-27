@@ -4,12 +4,71 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
 import { request } from 'node:http';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { createDashboardServer } from '../src/dashboard-server.ts';
 import type { State } from '../src/contracts.ts';
 import { Store, sha } from '../src/store.ts';
-import { Dashboard, FactoryConflict, projectRun, factoryView } from '../src/dashboard.ts';
+import { Dashboard, FactoryConflict, projectRun, factoryView, privateJson } from '../src/dashboard.ts';
 import { meterReadingSchema, type Segment } from '../src/contracts.ts';
-import { identify } from '../src/process.ts';
+import { identify, PauseGate } from '../src/process.ts';
+import { AgentChat, ChatUnavailable } from '../src/agent-chat.ts';
+import { LocalRuntime, type Job } from '../src/runtime.ts';
+import { buildRunHandoff } from '../src/run-handoff.ts';
+import { finishRun, stepRun, superviseRun } from '../src/coordinator.ts';
+
+test('Claude chat uses no tools, persists turns, and leaves the run unchanged', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-chat-')); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  state.status = 'ready';
+  state.project.headroom = { baseUrl: 'http://127.0.0.1:8791/v1' };
+  delete state.activeJob;
+  state.project.models.developer = { provider: 'claude', model: 'claude-sonnet-5', effort: 'medium' };
+  state.project.runtime.authHomes.claude = path.join(root, 'auth');
+  await dashboard.store.create(state);
+  const before = await readFile(path.join(dashboard.store.dir(state.id), 'state.json'), 'utf8');
+  const jobs: Job[] = [];
+  class FakeRuntime extends LocalRuntime {
+    override async execute(job: Job) {
+      jobs.push(job);
+      await writeFile(path.join(job.captureDir, 'stdout.log'), JSON.stringify({ type: 'result', subtype: 'success', is_error: false,
+        result: `Reply ${jobs.length}`, usage: { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 2 } }) + '\n');
+      return { exitCode: 0, signal: null, reason: 'completed' as const, startedAt: state.createdAt, endedAt: state.createdAt, pausedMs: 0 };
+    }
+  }
+  const chat = new AgentChat(dashboard, new FakeRuntime());
+  const first = await chat.send(state.id, { role: 'developer', text: 'First question' });
+  assert.deepEqual(first.messages.map(item => item.text), ['First question', 'Reply 1']);
+  const second = await chat.send(state.id, { role: 'developer', text: 'Second question' });
+  assert.deepEqual(second.messages.map(item => item.text), ['First question', 'Reply 1', 'Second question', 'Reply 2']);
+  assert.match(jobs[1]!.stdin!, /Operator: First question[\s\S]*Agent: Reply 1[\s\S]*Operator: Second question/);
+  assert.deepEqual(jobs.map(job => job.argv.slice(job.argv.indexOf('--tools'), job.argv.indexOf('--tools') + 2)), [['--tools', ''], ['--tools', '']]);
+  assert.ok(jobs.every(job => job.argv[job.argv.indexOf('--allowedTools') + 1] === '' && job.argv.includes('--strict-mcp-config')));
+  assert.ok(jobs.every(job => job.readOnlySource && job.argv.includes('--restricted')));
+  assert.deepEqual((await new AgentChat(new Dashboard(root)).read(state.id, 'developer')).messages, second.messages);
+  assert.equal(await readFile(path.join(dashboard.store.dir(state.id), 'state.json'), 'utf8'), before);
+  await assert.rejects(chat.send(state.id, { role: 'coordinator', text: 'Unsupported provider' }), ChatUnavailable);
+  assert.equal(jobs.length, 2);
+  const chatFile = path.join(dashboard.privateDir, `chat-${state.id}-developer.json`);
+  const outside = path.join(root, 'outside-chat.json');
+  await writeFile(outside, JSON.stringify(second));
+  await rm(chatFile);
+  await symlink(outside, chatFile);
+  await assert.rejects(chat.read(state.id, 'developer'));
+  await assert.rejects(chat.send(state.id, { role: 'developer', text: 'Read symlink' }));
+  assert.equal(jobs.length, 2);
+
+  const otherRoot = await mkdtemp(path.join(tmpdir(), 'factory-chat-parent-')); roots.push(otherRoot);
+  const otherDashboard = new Dashboard(otherRoot);
+  await otherDashboard.store.create(state);
+  const outsideDirectory = path.join(otherRoot, 'outside-private');
+  await mkdir(outsideDirectory);
+  await writeFile(path.join(outsideDirectory, `chat-${state.id}-developer.json`), JSON.stringify(second));
+  await symlink(outsideDirectory, otherDashboard.privateDir);
+  await assert.rejects(new AgentChat(otherDashboard).read(state.id, 'developer'));
+  await assert.rejects(privateJson(path.join(otherDashboard.privateDir, `chat-${state.id}-reviewer.json`), second));
+  assert.equal(await readFile(path.join(outsideDirectory, `chat-${state.id}-developer.json`), 'utf8'), JSON.stringify(second));
+});
 
 test('segment projection preserves counters and sums role and run usage', () => {
   const state = runState();
@@ -87,8 +146,8 @@ test('snapshot reads active segment meters with current context and preserves un
     await mkdir(path.join(dir, `segment-${index}`), { recursive: true });
     await writeFile(path.join(dir, `segment-${index}`, 'meter.json'), JSON.stringify({ ...meter, segment: index }));
   }
-  await mkdir(path.join(dir, 'capture'), { recursive: true });
-  await writeFile(path.join(dir, 'capture', 'stdout.log'), JSON.stringify({ type: 'item.started', item: { type: 'command_execution', command: `export PATH=/opt/node/bin:$PATH; cd ${dir}/source && cat ${dir}/source/src/app.ts` } }) + '\n');
+  await mkdir(path.join(dir, 'segment-2', 'capture'), { recursive: true });
+  await writeFile(path.join(dir, 'segment-2', 'capture', 'stdout.log'), JSON.stringify({ type: 'item.started', item: { type: 'command_execution', command: `export PATH=/opt/node/bin:$PATH; cd ${dir}/source && cat ${dir}/source/src/app.ts` } }) + '\n');
   const view = (await dashboard.snapshot()).runs[0]!;
   assert.deepEqual(view.factory!.activity.map(entry => entry.summary), ['running cat src/app.ts']);
   const rows = view.usageByRole[0]!.agents;
@@ -124,6 +183,134 @@ async function openDashboard() {
   if (!address || typeof address === 'string') throw new Error('Dashboard did not bind a TCP port');
   return { root, base: `http://127.0.0.1:${address.port}`, close: () => new Promise<void>(resolve => server.close(() => resolve())) };
 }
+
+test('startup repairs a complete handoff with missing files and a dead supervisor record', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-shutdown-recovery-')); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  state.status = 'handoff_ready'; state.candidate = state.sourceBase; state.activeJob = undefined;
+  state.shutdown = { candidate: state.candidate, specDigest: state.specDigest, phase: 'complete', startedAt: state.createdAt, completedAt: state.updatedAt };
+  state.supervisor = { launchId: 'old', process: { pid: 999999, pgid: 999999, started: 'fixture' }, launchedAt: state.createdAt };
+  await dashboard.store.create(state);
+  await dashboard.store.execution(state.id, async () => {});
+  await rm(path.join(dashboard.store.dir(state.id), 'HANDOFF.md'));
+  await rm(path.join(dashboard.store.dir(state.id), 'handoff.json'));
+  await dashboard.recoverPendingShutdowns();
+  assert.equal((await dashboard.store.read(state.id)).supervisor, undefined);
+  assert.equal(await dashboard.store.holder(), null);
+  assert.match(await readFile(path.join(dashboard.store.dir(state.id), 'HANDOFF.md'), 'utf8'), /Status: handoff_ready/);
+  assert.equal(JSON.parse(await readFile(path.join(dashboard.store.dir(state.id), 'handoff.json'), 'utf8')).shutdown.phase, 'complete');
+  assert.equal((await dashboard.snapshot()).runs[0]?.factory?.state, 'terminal');
+});
+
+test('restart recovery with a dead supervisor and surviving group members', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-orphan-recovery-')); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  const leader = spawn(process.execPath, ['-e', `const {spawn}=require('node:child_process'); spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); process.stdout.write('ready\\n'); setInterval(()=>{},1000);`], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  try {
+    assert.ok(leader.pid);
+    await once(leader.stdout!, 'data');
+    const owned = await identify(leader.pid!);
+    assert.ok(owned);
+    state.status = 'handoff_ready'; state.candidate = state.sourceBase; state.activeJob = undefined;
+    state.shutdown = { candidate: state.candidate, specDigest: state.specDigest, phase: 'complete', startedAt: state.createdAt, completedAt: state.updatedAt };
+    state.supervisor = { launchId: 'old', process: owned, launchedAt: state.createdAt };
+    await dashboard.store.create(state);
+    await dashboard.store.execution(state.id, async () => {});
+    process.kill(leader.pid!, 'SIGKILL');
+    await once(leader, 'exit');
+    await dashboard.recoverPendingShutdowns();
+    assert.equal((await dashboard.store.read(state.id)).supervisor?.launchId, 'old');
+    assert.equal(await dashboard.store.holder(), state.id);
+    assert.equal((await factoryView(await dashboard.store.read(state.id), value => value, dashboard.store.dir(state.id))).state, 'exited');
+  } finally {
+    if (leader.pid) { try { process.kill(-leader.pid, 'SIGKILL'); } catch { /* already gone */ } }
+  }
+});
+
+test('partial owned-process cleanup retires identities confirmed gone', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-partial-cleanup-')); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  const leader = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+  try {
+    assert.ok(leader.pid);
+    state.status = 'handoff_ready'; state.candidate = state.sourceBase; state.activeJob = undefined;
+    state.ownedProcesses = [
+      { jobId: 'gone', segment: 1, process: { pid: 999999, pgid: 999999, started: 'fixture' } },
+      { jobId: 'blocked', segment: 1, process: { pid: leader.pid!, pgid: leader.pid!, started: 'fixture' } },
+    ];
+    await dashboard.store.create(state);
+    const after = await finishRun(dashboard.store, state.id);
+    assert.equal(after.shutdown?.phase, 'stopping');
+    assert.deepEqual(after.ownedProcesses?.map(record => record.jobId), ['blocked']);
+  } finally {
+    if (leader.pid) { try { process.kill(-leader.pid, 'SIGKILL'); } catch { /* already gone */ } }
+  }
+});
+
+test('CLI completion and repeated cleanup reservation assertions', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-cleanup-holder-')); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  state.status = 'handoff_ready'; state.candidate = state.sourceBase; state.activeJob = undefined;
+  await dashboard.store.create(state);
+  await stepRun(dashboard.store, state.id);
+  assert.equal(await dashboard.store.holder(), null);
+  await dashboard.control(state.id, { action: 'cleanup' });
+  assert.equal(await dashboard.store.holder(), null);
+  await dashboard.control(state.id, { action: 'cleanup' });
+  assert.equal(await dashboard.store.holder(), null);
+  const cliState = { ...state, id: 'cli-run' };
+  await dashboard.store.create(cliState);
+  const finished = await superviseRun(dashboard.store, cliState.id, 'cli-fixture', new LocalRuntime(), { signal: new AbortController().signal, pause: new PauseGate() });
+  assert.equal(finished.shutdown?.phase, 'complete');
+  assert.equal((await dashboard.store.read(cliState.id)).supervisor?.launchId, 'cli-fixture');
+  assert.equal(await dashboard.store.holder(), null);
+});
+
+test('restart recovery with stale existing HANDOFF.md and handoff.json', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-stale-handoff-')); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  state.status = 'handoff_ready'; state.candidate = state.sourceBase; state.activeJob = undefined;
+  state.shutdown = { candidate: state.candidate, specDigest: state.specDigest, phase: 'complete', startedAt: state.createdAt, completedAt: state.updatedAt };
+  await dashboard.store.create(state);
+  await writeFile(path.join(dashboard.store.dir(state.id), 'HANDOFF.md'), 'Previous revision\n');
+  await writeFile(path.join(dashboard.store.dir(state.id), 'handoff.json'), '{"revision":0}\n');
+  assert.equal((await factoryView(state, value => value, dashboard.store.dir(state.id))).state, 'exited');
+  await dashboard.store.execution(state.id, async () => {});
+  await dashboard.recoverPendingShutdowns();
+  const expected = await buildRunHandoff(dashboard.store, await dashboard.store.read(state.id));
+  assert.equal(await readFile(path.join(dashboard.store.dir(state.id), 'HANDOFF.md'), 'utf8'), expected.markdown);
+  assert.equal(JSON.parse(await readFile(path.join(dashboard.store.dir(state.id), 'handoff.json'), 'utf8')).revision, state.revision);
+  assert.equal(await dashboard.store.holder(), null);
+  assert.equal((await factoryView(await dashboard.store.read(state.id), value => value, dashboard.store.dir(state.id))).state, 'terminal');
+});
+
+test('unrouted legacy Claude chat rejects before runtime invocation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-unrouted-chat-')); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  state.status = 'ready'; state.activeJob = undefined; state.project.headroom = undefined;
+  state.project.models.developer = { provider: 'claude', model: 'claude-sonnet-5', effort: 'medium' };
+  state.project.runtime.authHomes.claude = path.join(root, 'auth');
+  await dashboard.store.create(state);
+  let calls = 0;
+  class FakeRuntime extends LocalRuntime {
+    override async execute(_job: Job): Promise<Awaited<ReturnType<LocalRuntime['execute']>>> {
+      calls++;
+      throw Error('Unrouted provider invocation');
+    }
+  }
+  await assert.rejects(new AgentChat(dashboard, new FakeRuntime()).send(state.id, { role: 'developer', text: 'Question' }), /Headroom route/);
+  assert.equal(calls, 0);
+});
+
+test('handoff next-step output for default enabled roles and completed status', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-handoff-roles-')); roots.push(root);
+  const store = new Store(root), state = runState();
+  state.status = 'handoff_ready'; state.candidate = state.sourceBase; state.activeJob = undefined;
+  delete state.project.enabledRoles;
+  const handoff = await buildRunHandoff(store, state);
+  assert.equal(handoff.difficulties.some(item => item.text.includes('reviewer is disabled')), false);
+  assert.deepEqual(handoff.next.map(item => item.text), ['The candidate is ready for operator handoff.']);
+});
 
 test('empty dashboard reports execution controls as available', async () => {
   const app = await openDashboard();
@@ -168,6 +355,81 @@ test('settings accept a Claude developer', async () => {
   } finally { await app.close(); }
 });
 
+test('project settings default all seven role models to low effort', async () => {
+  const app = await openDashboard();
+  try {
+    const initial = await (await fetch(`${app.base}/api/dashboard`)).json();
+    assert.deepEqual(Object.keys(initial.settings.models).sort(), [
+      'architect', 'business', 'coordinator', 'developer', 'domain', 'reviewer', 'tester',
+    ]);
+    for (const model of Object.values(initial.settings.models) as { effort: string }[])
+      assert.equal(model.effort, 'low');
+    assert.deepEqual(initial.settings.enabledRoles, ['business', 'domain', 'architect', 'developer', 'reviewer', 'tester', 'coordinator']);
+  } finally { await app.close(); }
+});
+
+test('project settings persist disabled roles without erasing their model choices', async () => {
+  const app = await openDashboard();
+  try {
+    const { csrfToken } = await (await fetch(`${app.base}/api/session`)).json();
+    const initial = await (await fetch(`${app.base}/api/dashboard`)).json();
+    const saved = await fetch(`${app.base}/api/settings`, { method: 'PUT',
+      headers: { Origin: app.base, 'X-CSRF-Token': csrfToken },
+      body: JSON.stringify({ ...initial.settings, enabledRoles: ['developer', 'reviewer'] }) });
+    assert.equal(saved.status, 200);
+    const after = await (await fetch(`${app.base}/api/dashboard`)).json();
+    assert.deepEqual(after.settings.enabledRoles, ['developer', 'reviewer']);
+    assert.deepEqual(after.settings.models.architect, initial.settings.models.architect);
+  } finally { await app.close(); }
+});
+
+test('legacy four-slot settings migrate to seven role choices without changing existing choices', async () => {
+  const app = await openDashboard();
+  try {
+    const file = path.join(app.root, '.dashboard', 'settings.json');
+    const dashboard = new Dashboard(app.root);
+    const current = await dashboard.settings();
+    const { modelCatalog: _modelCatalog, ...settings } = current;
+    const choices = {
+      coordinator: { provider: 'codex', model: 'old-coordinator', effort: 'high' },
+      developer: { provider: 'codex', model: 'old-developer', effort: 'medium' },
+      reviewer: { provider: 'claude', model: 'old-reviewer', effort: 'high' },
+      inspector: { provider: 'codex', model: 'old-inspector', effort: 'low' },
+    };
+    await writeFile(file, JSON.stringify({ ...settings, models: choices }), { mode: 0o600 });
+    const migrated = await dashboard.settings();
+    assert.deepEqual(migrated.models, {
+      business: choices.inspector, domain: choices.inspector, architect: choices.inspector,
+      developer: choices.developer, reviewer: choices.reviewer, tester: choices.developer, coordinator: choices.coordinator,
+    });
+  } finally { await app.close(); }
+});
+
+test('project settings save a local folder and independent model choices for every role', async () => {
+  const app = await openDashboard();
+  try {
+    const { csrfToken } = await (await fetch(`${app.base}/api/session`)).json();
+    const initial = await (await fetch(`${app.base}/api/dashboard`)).json();
+    const roles = ['business', 'domain', 'architect', 'developer', 'reviewer', 'tester', 'coordinator'];
+    const models = Object.fromEntries(roles.map((role, index) => [role, {
+      provider: index % 2 ? 'claude' : 'codex', model: `custom-${role}-model`, effort: 'low',
+    }]));
+    const modelCatalog = { ...initial.settings.modelCatalog,
+      codex: [...initial.settings.modelCatalog.codex, 'custom-developer-model'],
+      claude: [...initial.settings.modelCatalog.claude, 'custom-domain-model'],
+    };
+    const settings = { ...initial.settings, repositoryUrl: '/Users/operator/work/project', models, modelCatalog };
+    const response = await fetch(`${app.base}/api/settings`, {
+      method: 'PUT', headers: { Origin: app.base, 'X-CSRF-Token': csrfToken }, body: JSON.stringify(settings),
+    });
+    assert.equal(response.status, 200, await response.text());
+    const after = await (await fetch(`${app.base}/api/dashboard`)).json();
+    assert.equal(after.settings.repositoryUrl, '/Users/operator/work/project');
+    assert.deepEqual(after.settings.models, models);
+    assert.deepEqual(after.settings.modelCatalog, modelCatalog);
+  } finally { await app.close(); }
+});
+
 test('credentials remain private and concurrent application key writes preserve both keys', async () => {
   const app = await openDashboard();
   try {
@@ -206,6 +468,20 @@ test('planted private settings symlink is rejected without reading or overwritin
   } finally { await app.close(); }
 });
 
+test('clarification jobs do not trigger ordinary attempt budget warnings', () => {
+  const state = runState();
+  state.project.limits.maxAttempts = 4;
+  state.project.limits.verificationReserveAttempts = 2;
+  const attempt = state.attempts[0]!;
+  state.attempts = ['developer-1', 'clarify-developer-1', 'answer-architect-1', 'clarify-tester-1', 'answer-architect-tester-1'].map(id => ({ ...attempt, id }));
+  const budgetWarnings = () => projectRun(state).issues.filter(issue => ['attempt_limit', 'verification_reserve'].includes(issue.code)).map(issue => issue.code);
+  assert.deepEqual(budgetWarnings(), []);
+  state.attempts.push({ ...attempt, id: 'tester-1' });
+  assert.deepEqual(budgetWarnings(), ['verification_reserve']);
+  state.attempts.push({ ...attempt, id: 'review-1' }, { ...attempt, id: 'developer-2' });
+  assert.deepEqual(budgetWarnings(), ['attempt_limit', 'verification_reserve']);
+});
+
 function runState(): State {
   const at = '2026-09-23T00:00:00.000Z';
   const model = { provider: 'codex' as const, model: 'gpt-6-sol', effort: 'high' as const };
@@ -240,6 +516,17 @@ async function activityRunDir(content: string | null, jobId = 'job-one') {
   if (content !== null) await writeFile(path.join(dir, 'stdout.log'), content);
   return root;
 }
+
+test('activity follows the latest worker segment instead of the original capture', async () => {
+  const event = (command: string) => JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command, exit_code: 0 } }) + '\n';
+  const root = await activityRunDir(event('first-segment'));
+  for (const index of [2, 10]) {
+    const directory = path.join(root, 'attempts/job-one', `segment-${index}`, 'capture');
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, 'stdout.log'), event(`segment-${index}`));
+  }
+  assert.deepEqual((await factoryView(runState(), value => value, root)).activity.map(entry => entry.summary), ['ran segment-10 (exit 0)']);
+});
 
 test('activity summarizes a Codex capture log without showing message text or reasoning', async () => {
   const log = [
@@ -395,7 +682,7 @@ test('control takes the start, pause and stop body and projects a factory view',
     const initial = (await (await fetch(`${app.base}/api/dashboard`)).json()).runs[0];
     assert.equal('controlPending' in initial, false);
     assert.deepEqual(initial.factory, { state: 'idle', supervisor: null, activeJob: { id: 'job-one', kind: 'worker', startedAt: '2026-09-23T00:00:00.000Z', frozen: false },
-      canStart: true, canPause: true, canStop: true, canReset: false, startLabel: 'Start', reason: null, orphans: [], activity: [] });
+      canStart: true, canPause: true, canStop: true, canReset: false, startLabel: 'Start', reason: null, orphans: [], activity: [], clarification: {} });
     const paused = await control({ action: 'pause' });
     assert.equal(paused.status, 200);
     const pausedBody = await paused.json();

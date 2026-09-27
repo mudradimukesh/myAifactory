@@ -5,19 +5,38 @@ import { constants, mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { choice, id, ticketProgress, meterReadingSchema, clarificationSchema, answerSchema } from './contracts.ts';
+import { choice, id, role, ticketProgress, meterReadingSchema, clarificationSchema, answerSchema } from './contracts.ts';
 import type { OwnedProcess, State, Segment, MeterReading } from './contracts.ts';
 import { groupAlive, groupMembers, isOwnedAlive, terminateOwned } from './process.ts';
-import { Store, move, reset, resettable } from './store.ts';
+import { Store, json, move, reset, resettable, ReferenceConflict } from './store.ts';
 import { validateAuthHome } from './runtime.ts';
+import { FactoryProfiles, runFactory, skillLibrary } from './factory-profiles.ts';
+import { projectSchema, isClarificationJob } from './contracts.ts';
+import { observedSkillReads } from './skill-activity.ts';
+import { buildRunHandoff, saveRunHandoff } from './run-handoff.ts';
+import { within, verifyFile } from './store.ts';
 
 const finite = z.number().finite().nonnegative();
 const positive = z.number().int().safe().positive();
 const githubUrl = z.string().refine(value => /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(value) && !value.includes('..'), 'Use an HTTPS GitHub owner/repository URL without credentials');
-export const settingsSchema = z.object({
-  repositoryUrl: z.union([z.literal(''), githubUrl]), brief: z.string().max(10000), recipient: z.string().max(300),
+const repositoryLocation = z.string().refine(value => githubUrl.safeParse(value).success || (path.isAbsolute(value) && !value.split(path.sep).includes('..')), 'Use an absolute local folder path or an HTTPS GitHub owner/repository URL');
+const roleModels = z.object({ business: choice, domain: choice, architect: choice, developer: choice, reviewer: choice, tester: choice, coordinator: choice }).strict();
+const enabledRolesSchema = z.array(role).max(role.options.length).refine(values => new Set(values).size === values.length, 'Role names must be unique');
+const modelCatalogSchema = z.object({ codex: z.array(z.string().min(1).max(120)).max(200), claude: z.array(z.string().min(1).max(120)).max(200) }).strict();
+const legacySettingsSchema = z.object({
+  factoryId: id.optional(), repositoryUrl: z.union([z.literal(''), githubUrl]), brief: z.string().max(10000), recipient: z.string().max(300),
   authHomes: z.object({ codex: z.string().max(1000), claude: z.string().max(1000) }).strict(),
   models: z.object({ coordinator: choice, developer: choice, reviewer: choice, inspector: choice }).strict(),
+  enabledRoles: enabledRolesSchema.optional(),
+  budget: z.object({ maxReportedTokens: positive, maxAttempts: positive.max(100), verificationReserveAttempts: positive.max(100),
+    maxWallMinutes: positive.max(Math.floor(Number.MAX_SAFE_INTEGER / 60000)), attemptTimeoutMinutes: positive.max(30), applicationBudgetUsd: finite }).strict(),
+  recovery: z.object({ staleMinutes: positive, maxFailures: positive, contextTokenThreshold: positive }).strict(),
+}).strict();
+export const settingsSchema = z.object({
+  factoryId: id.optional(),
+  repositoryUrl: z.union([z.literal(''), repositoryLocation]), brief: z.string().max(10000), recipient: z.string().max(300),
+  authHomes: z.object({ codex: z.string().max(1000), claude: z.string().max(1000) }).strict(),
+  models: roleModels, enabledRoles: enabledRolesSchema.default([...role.options]), modelCatalog: modelCatalogSchema,
   budget: z.object({ maxReportedTokens: positive, maxAttempts: positive.max(100), verificationReserveAttempts: positive.max(100),
     maxWallMinutes: positive.max(Math.floor(Number.MAX_SAFE_INTEGER / 60000)), attemptTimeoutMinutes: positive.max(30), applicationBudgetUsd: finite }).strict(),
   recovery: z.object({ staleMinutes: positive, maxFailures: positive, contextTokenThreshold: positive }).strict(),
@@ -25,15 +44,32 @@ export const settingsSchema = z.object({
   if (value.budget.verificationReserveAttempts >= value.budget.maxAttempts) ctx.addIssue({ code: 'custom', path: ['budget', 'verificationReserveAttempts'], message: 'Verification reserve must be smaller than total attempts' });
   if (value.budget.attemptTimeoutMinutes > value.budget.maxWallMinutes) ctx.addIssue({ code: 'custom', path: ['budget', 'attemptTimeoutMinutes'], message: 'Attempt timeout exceeds wall budget' });
 });
+export function migrateLegacySettings(value: unknown): Settings | null {
+  const parsed = legacySettingsSchema.safeParse(value);
+  if (!parsed.success) return null;
+  const old = parsed.data;
+  return settingsSchema.parse({ ...old, models: {
+    business: old.models.inspector, domain: old.models.inspector, architect: old.models.inspector,
+    developer: old.models.developer, reviewer: old.models.reviewer, tester: old.models.developer, coordinator: old.models.coordinator,
+  }, enabledRoles: old.enabledRoles ?? [...role.options], modelCatalog: defaultSettings.modelCatalog });
+}
 export type Settings = z.infer<typeof settingsSchema>;
 export type Issue = { code: string; severity: 'warning' | 'error' | 'info'; message: string; recommendation: string; runId?: string };
 export const defaultSettings: Settings = {
   repositoryUrl: '', brief: '', recipient: '', authHomes: { codex: '', claude: '' },
   models: {
-    coordinator: { provider: 'codex', model: 'gpt-6-astra', effort: 'high' },
-    developer: { provider: 'codex', model: 'gpt-6-sol', effort: 'high' },
-    reviewer: { provider: 'codex', model: 'gpt-6-sol', effort: 'high' },
-    inspector: { provider: 'codex', model: 'gpt-6-luna', effort: 'medium' },
+    business: { provider: 'codex', model: 'gpt-6-luna', effort: 'low' },
+    domain: { provider: 'codex', model: 'gpt-6-luna', effort: 'low' },
+    architect: { provider: 'codex', model: 'gpt-6-luna', effort: 'low' },
+    developer: { provider: 'codex', model: 'gpt-6-sol', effort: 'low' },
+    reviewer: { provider: 'codex', model: 'gpt-6-sol', effort: 'low' },
+    tester: { provider: 'codex', model: 'gpt-6-luna', effort: 'low' },
+    coordinator: { provider: 'codex', model: 'gpt-6-astra', effort: 'low' },
+  },
+  enabledRoles: [...role.options],
+  modelCatalog: {
+    codex: ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-reserve', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
+    claude: ['claude-opus-5-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-haiku-4-5-20251001', 'claude-opus-5', 'claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6'],
   },
   budget: { maxReportedTokens: 200000, maxAttempts: 6, verificationReserveAttempts: 2, maxWallMinutes: 240, attemptTimeoutMinutes: 30, applicationBudgetUsd: 0 },
   recovery: { staleMinutes: 15, maxFailures: 3, contextTokenThreshold: 160000 },
@@ -44,7 +80,7 @@ async function privateDirectory(directory: string) {
   const info = await lstat(directory);
   if (!info.isDirectory() || info.mode & 0o077) throw new Error('Private directory is unsafe');
 }
-async function privateRead(file: string) {
+export async function privateRead(file: string) {
   await privateDirectory(path.dirname(file));
   const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
@@ -53,7 +89,7 @@ async function privateRead(file: string) {
     return await handle.readFile({ encoding: 'utf8' });
   } finally { await handle.close(); }
 }
-async function privateJson(file: string, data: unknown) {
+export async function privateJson(file: string, data: unknown) {
   await privateDirectory(path.dirname(file));
   try { const info = await lstat(file); if (!info.isFile()) throw new Error('Private file is unsafe'); }
   catch (error) { if (!isMissing(error)) throw error; }
@@ -72,15 +108,18 @@ export type FactoryView = {
   activeJob: { id: string; kind: string; startedAt: string; frozen: boolean } | null;
   canStart: boolean; canPause: boolean; canStop: boolean; canReset: boolean; startLabel: 'Start' | 'Resume';
   reason: string | null; orphans: number[];
+  shutdown?: { phase: 'stopping' | 'handoff' | 'complete'; error?: string };
   activity: { job: string; summary: string; ageSeconds: number | null }[];
+  skillReads?: { name: string; path: string }[];
   clarification: { developer?: ClarificationSideView; tester?: ClarificationSideView };
 };
 const factoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const terminal = (status: State['status']) => status === 'failed' || status === 'cancelled' || status === 'handoff_ready';
 const roles = ['business', 'domain', 'architect', 'developer', 'reviewer', 'tester', 'coordinator'] as const;
-const choiceFor = (state: State, role: typeof roles[number]) => role === 'developer' ? state.project.models.developer
-  : role === 'reviewer' ? state.project.models.reviewer : role === 'coordinator' ? state.project.models.coordinator
-  : role === 'tester' ? (state.project.models.tester ?? state.project.models.developer) : state.project.models.inspector;
+const choiceFor = (state: State, role: typeof roles[number]) => state.project.models.roles?.[role]
+  ?? (role === 'developer' ? state.project.models.developer : role === 'reviewer' ? state.project.models.reviewer
+    : role === 'coordinator' ? state.project.models.coordinator : role === 'tester' ? state.project.models.tester ?? state.project.models.developer
+      : state.project.models.inspector);
 const exitDetail = z.object({ outcome: z.enum(['waiting', 'finished', 'cancelled', 'error']), message: z.string() }).passthrough();
 
 /** One line per Codex or Claude stream-json event: what ran, never its text, reasoning, tool results, or prompts. */
@@ -144,8 +183,12 @@ async function clarificationSideView(state: State, runDir: string, redact: (valu
   const items: ClarificationItemView[] = [];
   if (clarifyAttempt?.handoff) {
     try {
-      const clarification = clarificationSchema.parse(JSON.parse(await readFile(path.join(runDir, clarifyAttempt.handoff.path), 'utf8')));
-      const answer = answerAttempt?.handoff ? answerSchema.parse(JSON.parse(await readFile(path.join(runDir, answerAttempt.handoff.path), 'utf8'))) : undefined;
+      const readHandoff = async (record: { path: string; sha256: string }) => {
+        await verifyFile(runDir, record);
+        return JSON.parse((await readFile(await within(runDir, record.path), 'utf8')).trim().replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, ''));
+      };
+      const clarification = clarificationSchema.parse(await readHandoff(clarifyAttempt.handoff));
+      const answer = answerAttempt?.handoff ? answerSchema.parse(await readHandoff(answerAttempt.handoff)) : undefined;
       const answers = new Map((answer?.answers ?? []).map(a => [a.id, a]));
       for (const q of clarification.questions.slice(0, 20)) {
         const a = answers.get(q.id);
@@ -159,17 +202,32 @@ async function clarificationSideView(state: State, runDir: string, redact: (valu
 /** Derives operator controls from stored facts plus a live ownership check of the recorded supervisor. */
 export async function factoryView(state: State, redact: (value: string) => string = value => value, runDir?: string): Promise<FactoryView> {
   const live = state.supervisor !== undefined && await isOwnedAlive(state.supervisor.process);
-  const factory: FactoryState = terminal(state.status) ? 'terminal'
+  const lastStart = state.history.findLast(event => event.type === 'supervisor_started');
+  const lastExit = state.history.findLast(event => event.type === 'supervisor_exited');
+  const cleanExit = !live && Boolean(lastExit && (!lastStart || lastExit.sequence > lastStart.sequence));
+  let handoffFiles = false;
+  if (runDir && state.shutdown?.phase === 'complete') {
+    const expected = await buildRunHandoff(new Store(path.dirname(runDir)), state);
+    const files = await Promise.all([['HANDOFF.md', expected.markdown], ['handoff.json', json(expected)]].map(async ([file, content]) =>
+      (await lstat(path.join(runDir, file)).then(info => info.isFile()).catch(() => false)) &&
+      (await readFile(path.join(runDir, file), 'utf8').then(actual => actual === content).catch(() => false))));
+    handoffFiles = files.every(Boolean);
+  }
+  const supervisorOrphans = state.supervisor && !live && state.supervisor.process.pid === state.supervisor.process.pgid
+    ? await groupMembers(state.supervisor.process.pgid) : [];
+  const factory: FactoryState = state.shutdown?.phase === 'stopping' ? 'stopping'
+    : state.shutdown?.phase === 'handoff' ? 'exited'
+    : state.status === 'handoff_ready' && state.shutdown?.phase === 'complete' && !live && !supervisorOrphans.length && handoffFiles ? 'terminal'
+    : state.status === 'handoff_ready' && state.shutdown?.phase === 'complete' ? 'exited'
+    : (state.status === 'failed' || state.status === 'cancelled') && !live ? 'terminal'
     : state.control === 'cancel' ? 'stopping'
-    : !live ? (state.supervisor ? 'exited' : 'idle')
+    : !live ? (state.supervisor && !cleanExit ? 'exited' : 'idle')
     : state.control === 'suspend' && state.suspended ? 'paused'
     : state.control === 'suspend' ? 'pausing'
     : state.suspended ? 'resuming' : 'running';
   const job = state.activeJob;
   const jobLive = job?.process !== undefined && await isOwnedAlive(job.process);
   const orphans = job?.process && !jobLive ? await groupMembers(job.process.pgid) : [];
-  const supervisorOrphans = state.supervisor && !live ? await groupMembers(state.supervisor.process.pgid) : [];
-  const lastExit = state.history.findLast(event => event.type === 'supervisor_exited');
   const exit = lastExit ? exitDetail.safeParse(lastExit.detail) : null;
   const reason = factory === 'exited' ? 'The supervisor process ended without recording its exit. Start clears the stale record.'
     : factory === 'idle' && exit?.success && exit.data.outcome === 'error' ? redact(exit.data.message)
@@ -178,7 +236,15 @@ export async function factoryView(state: State, redact: (value: string) => strin
   const startable = factory === 'idle' || factory === 'exited' || factory === 'pausing' || factory === 'paused';
   let activity: FactoryView['activity'] = [];
   if (runDir && job && job.kind !== 'check') {
-    const file = path.join(runDir, 'attempts', job.id, 'capture', 'stdout.log');
+    const attemptRoot = path.join(runDir, 'attempts', job.id);
+    let captureRoot = attemptRoot;
+    try {
+      const segments = (await readdir(attemptRoot, { withFileTypes: true }))
+        .filter(entry => entry.isDirectory() && /^segment-[1-9][0-9]*$/.test(entry.name))
+        .map(entry => Number(entry.name.slice(8))).filter(index => index > 1);
+      if (segments.length) captureRoot = path.join(attemptRoot, `segment-${Math.max(...segments)}`);
+    } catch { /* Activity is advisory when a capture directory is unavailable. */ }
+    const file = path.join(captureRoot, 'capture', 'stdout.log');
     const summaries = await tailEvents(file);
     let ageSeconds: number | null = null;
     try { ageSeconds = Math.max(0, Math.round((Date.now() - (await lstat(file)).mtimeMs) / 1000)); } catch { /* advisory */ }
@@ -195,6 +261,7 @@ export async function factoryView(state: State, redact: (value: string) => strin
     canReset: resettable(state) && !state.activeJob && !live && !jobLive && !state.control && orphans.length === 0 && supervisorOrphans.length === 0,
     startLabel: state.control === 'suspend' || state.suspended ? 'Resume' : 'Start',
     reason, orphans, activity, clarification,
+    ...(state.shutdown ? { shutdown: { phase: state.shutdown.phase, ...(state.shutdown.error ? { error: state.shutdown.error } : {}) } } : {}),
   };
 }
 
@@ -258,6 +325,8 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
     cachedInputTokens: attempt.cachedInputTokens ?? null, reason: safeReason(attempt.result?.reason),
   }));
   const issues: Issue[] = [];
+  if (state.project.enabledRoles && !state.project.enabledRoles.includes('reviewer'))
+    issues.push(issue('reviewer_disabled', 'Independent agent review is disabled for this run.', 'Review the mandatory check evidence before accepting the handoff.', state.id));
   if (state.attempts.some(attempt => attempt.segments?.some(segment => segment.contextWindowMismatch)))
     issues.push(issue('context_window_mismatch', 'A provider reported a different context window than configured.', 'Review the model context configuration before further work.', state.id));
   if (unknownUsage)
@@ -276,9 +345,10 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
     issues.push(issue('token_limit', 'The run has reached its local reported token limit.', 'Review usage and adjust the approved project profile before further work.', state.id));
   if (state.elapsedMs >= state.project.limits.maxWallMs)
     issues.push(issue('wall_limit', 'The run has reached its local wall-time allowance.', 'Review the recovery brief before allocating more time.', state.id));
-  if (state.attempts.length >= state.project.limits.maxAttempts)
+  const ordinaryAttempts = state.attempts.filter(attempt => !isClarificationJob(attempt.id)).length;
+  if (ordinaryAttempts >= state.project.limits.maxAttempts)
     issues.push(issue('attempt_limit', 'The run has used its configured attempt allowance.', 'Review failed evidence and make a new explicit budget decision.', state.id));
-  if (state.attempts.length >= state.project.limits.maxAttempts - state.project.limits.verificationReserveAttempts && !['verifying', 'verified', 'handoff_ready'].includes(state.status))
+  if (ordinaryAttempts >= state.project.limits.maxAttempts - state.project.limits.verificationReserveAttempts && !['verifying', 'verified', 'handoff_ready'].includes(state.status))
     issues.push(issue('verification_reserve', 'The remaining attempt allowance is reserved for verification.', 'Review failed attempts before allocating more implementation work.', state.id));
   if (state.attempts.filter(attempt => attempt.status === 'failed').length >= settings.recovery.maxFailures)
     issues.push(issue('repeated_failures', 'Repeated attempts failed.', 'Review the recovery brief, then consider a smaller task or a different configured model.', state.id));
@@ -299,7 +369,7 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
     id: state.id, status: state.status, revision: state.revision, updatedAt: state.updatedAt,
     repository: redact(state.project.repository), brief: redact(state.project.brief),
     coordinator: { ...state.project.models.coordinator, model: redact(state.project.models.coordinator.model) },
-    roles: roles.map(role => ({ role, provider: choiceFor(state, role).provider, model: redact(choiceFor(state, role).model) })),
+    roles: roles.map(role => ({ role, enabled: state.project.enabledRoles?.includes(role) ?? true, provider: choiceFor(state, role).provider, model: redact(choiceFor(state, role).model) })),
     reportedTokens: state.reportedTokens, unknownUsage, elapsedMs: state.elapsedMs,
     usageByRole, usageTotal: runUsage.total, usageLowerBound: runUsage.lowerBound,
     limits: { maxReportedTokens: state.project.limits.maxReportedTokens, maxAttempts: state.project.limits.maxAttempts,
@@ -307,6 +377,7 @@ export function projectRun(state: State, settings: Settings = defaultSettings, r
       attemptTimeoutMs: state.project.limits.attemptTimeoutMs },
     attempts, events: state.history.map(({ sequence, at, type }) => ({ sequence, at, type: safeEvent(type) })), issues,
     candidate: state.candidate ?? null, checks: { passed: state.checks.filter(check => check.passed).length, total: state.checks.length },
+    referenceImages: (state.project.referenceImages ?? []).map((image, index) => ({ ...image, label: `Reference ${index + 1}`, url: `/api/runs/${state.id}/reference-images/${image.sha256}` })),
     specifications: (state.specifications ?? []).map(spec => ({ ...spec, title: redact(spec.title), content: redact(spec.content),
       approval: { ...spec.approval, owner: redact(spec.approval.owner), statement: redact(spec.approval.statement) } })),
     tickets: (state.tickets ?? []).map(ticket => ({ ...ticket, status: ticketProgress(state, ticket), title: redact(ticket.title), architectNote: redact(ticket.architectNote) })),
@@ -339,11 +410,25 @@ export class Dashboard {
     return result;
   }
   async settings(): Promise<Settings> {
-    try { return settingsSchema.parse(JSON.parse(await privateRead(path.join(this.privateDir, 'settings.json')))); }
+    try {
+      const value = JSON.parse(await privateRead(path.join(this.privateDir, 'settings.json')));
+      const current = settingsSchema.safeParse(value);
+      if (current.success) return {
+        ...current.data,
+        modelCatalog: {
+          codex: [...new Set([...defaultSettings.modelCatalog.codex, ...current.data.modelCatalog.codex])],
+          claude: [...new Set([...defaultSettings.modelCatalog.claude, ...current.data.modelCatalog.claude])],
+        },
+      };
+      const migrated = migrateLegacySettings(value);
+      if (migrated) return migrated;
+      throw new Error('Stored settings unavailable');
+    }
     catch (error) { if (isMissing(error)) return defaultSettings; throw new Error('Stored settings unavailable'); }
   }
   async saveSettings(value: unknown) {
     const settings = settingsSchema.parse(value);
+    if (settings.factoryId) await new FactoryProfiles(this.store).read(settings.factoryId);
     await this.serialized(() => privateJson(path.join(this.privateDir, 'settings.json'), settings));
     return settings;
   }
@@ -356,6 +441,29 @@ export class Dashboard {
   async credentials() {
     const secrets = await this.secrets();
     return { github: Boolean(secrets.github), applicationKeys: Object.keys(secrets.application).sort() };
+  }
+  async referenceImages() {
+    const draft = await this.store.referenceImages();
+    return { revision: draft.revision, images: draft.images.map(image => ({ ...image, url: `/api/reference-images/${image.sha256}` })) };
+  }
+  async addReference(bytes: Buffer, mimeType: 'image/png' | 'image/jpeg', expectedRevision: number) {
+    const draft = await this.store.addReference(bytes, mimeType, expectedRevision);
+    return { revision: draft.revision, images: draft.images.map(image => ({ ...image, url: `/api/reference-images/${image.sha256}` })) };
+  }
+  async removeReference(hash: string, expectedRevision: number) {
+    const draft = await this.store.removeReference(hash, expectedRevision);
+    return { revision: draft.revision, images: draft.images.map(image => ({ ...image, url: `/api/reference-images/${image.sha256}` })) };
+  }
+  async referenceImage(hash: string) {
+    const draft = await this.store.referenceImages();
+    const image = draft.images.find(item => item.sha256 === hash);
+    if (!image) return null;
+    return this.store.readReference(image);
+  }
+  async runReferenceImage(run: string, hash: string) {
+    const state = await this.store.read(run);
+    const image = state.project.referenceImages?.find(item => item.sha256 === hash);
+    return image ? this.store.readRunReference(run, image) : null;
   }
   async saveCredential(value: unknown) {
     const input = z.discriminatedUnion('kind', [
@@ -386,6 +494,85 @@ export class Dashboard {
       ? 'This runtime requires a dedicated .credentials.json file; the normal macOS Keychain login alone is unsupported.'
       : 'Check that the dedicated home contains only the subscription credential file.' }; }
   }
+  async factories() { return new FactoryProfiles(this.store).list(); }
+  async recoverPendingShutdowns() {
+    let entries;
+    try { entries = await readdir(this.store.root, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(entry.name)) continue;
+      let state: State;
+      try { state = await this.store.read(entry.name); } catch { continue; }
+      if (state.shutdown?.phase === 'complete') {
+        const handoff = await buildRunHandoff(this.store, state);
+        const dir = this.store.dir(entry.name);
+        const markdown = await readFile(path.join(dir, 'HANDOFF.md'), 'utf8').catch(() => '');
+        const jsonText = await readFile(path.join(dir, 'handoff.json'), 'utf8').catch(() => '');
+        if (markdown !== handoff.markdown || jsonText !== JSON.stringify(handoff, null, 2) + '\n') await saveRunHandoff(this.store, handoff);
+        const supervisorLive = state.supervisor && await isOwnedAlive(state.supervisor.process);
+        const survivors = state.supervisor && !supervisorLive && state.supervisor.process.pid === state.supervisor.process.pgid ? await groupMembers(state.supervisor.process.pgid) : [];
+        if (!supervisorLive && !survivors.length) {
+          if (state.supervisor) await this.store.update(entry.name, 'stale_supervisor_repaired', {}, current => { current.supervisor = undefined; });
+          await this.store.release(entry.name);
+        }
+        continue;
+      }
+      if (state.status !== 'handoff_ready') continue;
+      if (state.supervisor && await isOwnedAlive(state.supervisor.process)) continue;
+      if (state.supervisor && state.supervisor.process.pid === state.supervisor.process.pgid && (await groupMembers(state.supervisor.process.pgid)).length) continue;
+      try { await this.launch(entry.name, `recovery-${randomUUID()}`); } catch { /* retain state for an explicit retry */ }
+    }
+  }
+  async factory(name: string) { return new FactoryProfiles(this.store).read(name); }
+  async createFactory(input: unknown) { return new FactoryProfiles(this.store).create(input); }
+  async saveFactoryAgent(name: string, agent: string, input: unknown) { return new FactoryProfiles(this.store).saveAgent(name, agent, input); }
+  async skillLibrary() { return skillLibrary(); }
+  async runHandoff(run: string) { return buildRunHandoff(this.store, await this.store.read(run)); }
+  async runSkills(run: string, attemptId?: string) {
+    const state = await this.store.read(run), factory = await runFactory(this.store, state);
+    const observed: { role: string; skills: { name: string; path: string }[] }[] = [];
+    if (!factory) return { factory, observed };
+    for (const agent of factory.agents) {
+      const names = new Set<string>();
+      for (const attempt of state.attempts.filter(attempt => attempt.role === agent.role && (!attemptId || attempt.id === attemptId))) {
+        const root = `attempts/${attempt.id}`;
+        const skills = agent.skills.map(skill => ({ name: skill.name, path: path.join(this.store.dir(run), root, 'policy', 'skills', agent.role, skill.path) }));
+        const files = [`${root}/capture/stdout.log`, ...(attempt.segments ?? []).filter(segment => segment.index > 1).map(segment => `${root}/segment-${segment.index}/capture/stdout.log`)];
+        if (state.activeJob?.id === attempt.id) {
+          try {
+            const entries = await readdir(await within(this.store.dir(run), root));
+            for (const entry of entries.filter(entry => /^segment-[1-9][0-9]*$/.test(entry))) files.push(`${root}/${entry}/capture/stdout.log`);
+          } catch (error) { if (!isMissing(error)) throw error; }
+        }
+        for (const file of new Set(files)) {
+          try {
+            const target = await within(this.store.dir(run), file);
+            if ((await lstat(target)).size > 100000000) throw new Error('Worker transcript exceeds supported limit');
+            for (const name of observedSkillReads(await readFile(target, 'utf8'), skills)) names.add(name);
+          } catch (error) { if (!isMissing(error)) throw error; }
+        }
+      }
+      if (names.size) observed.push({ role: agent.role, skills: agent.skills.filter(skill => names.has(skill.name)).map(skill => ({ name: skill.name, path: skill.path })) });
+    }
+    return { factory, observed };
+  }
+  async createRun(input: unknown) {
+    const value = z.object({ id, project: projectSchema, referenceImageHashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(5).optional(), approval: z.object({ owner: z.string().trim().min(1).max(300), statement: z.string().trim().min(1).max(10000) }).strict() }).strict().parse(input);
+    const settings = await this.settings();
+    value.project.factoryId ??= settings.factoryId;
+    if (settings.repositoryUrl) value.project.repository = settings.repositoryUrl;
+    value.project.models.roles = settings.models;
+    value.project.enabledRoles = settings.enabledRoles;
+    return this.store.lock('reference-images', async () => {
+      const draft = await this.store.referenceImages();
+      if (draft.images.length && value.referenceImageHashes === undefined) throw new ReferenceConflict('Explicit reference image selection is required');
+      const selected = value.referenceImageHashes ?? [];
+      if (new Set(selected).size !== selected.length || selected.some(hash => !draft.images.some(image => image.sha256 === hash))) throw new ReferenceConflict('Unknown reference image selection');
+      value.project.referenceImages = draft.images.filter(image => selected.includes(image.sha256));
+      const { createRun } = await import('./coordinator.ts');
+      const run = await createRun(this.store, value.id, value.project, value.approval);
+      return { id: run.id, referenceImageHashes: selected };
+    }, true);
+  }
   async snapshot() {
     const [settings, credentials, ids] = await Promise.all([this.settings(), this.credentials(), this.store.runs()]);
     const secrets = await this.secrets();
@@ -412,19 +599,19 @@ export class Dashboard {
             } catch (error) { if (!isMissing(error)) throw error; }
           }
         }
-        runs.push(projectRun(state, settings, redact, await factoryView(state, redact, this.store.dir(run)), meters));
+        const factory = await factoryView(state, redact, this.store.dir(run));
+        if (state.activeJob && state.skillSnapshot) {
+          const reads = await this.runSkills(run, state.activeJob.id);
+          factory.skillReads = reads.observed.flatMap(agent => agent.skills);
+        }
+        runs.push(projectRun(state, settings, redact, factory, meters));
       }
       catch { issues.push({ code: 'run_corrupt', severity: 'error', message: `Run ${run} cannot be read safely.`, recommendation: 'Inspect state and event records; do not dispatch or overwrite this run.', runId: run }); }
     }
     runs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     const safeSettings: Settings = { ...settings, repositoryUrl: redact(settings.repositoryUrl), brief: redact(settings.brief),
       recipient: redact(settings.recipient), authHomes: { codex: redact(settings.authHomes.codex), claude: redact(settings.authHomes.claude) },
-      models: {
-        coordinator: { ...settings.models.coordinator, model: redact(settings.models.coordinator.model) },
-        developer: { ...settings.models.developer, model: redact(settings.models.developer.model) },
-        reviewer: { ...settings.models.reviewer, model: redact(settings.models.reviewer.model) },
-        inspector: { ...settings.models.inspector, model: redact(settings.models.inspector.model) },
-      } };
+      models: Object.fromEntries(Object.entries(settings.models).map(([role, model]) => [role, { ...model, model: redact(model.model) }])) as Settings['models'] };
     return { generatedAt: new Date().toISOString(), capabilities: { execution: true, liveHeartbeat: false, githubSync: true },
       settings: safeSettings, credentials, runs, issues };
   }
@@ -534,9 +721,10 @@ export class Dashboard {
       z.object({ action: z.literal('start'), expectedRevision: positive }).strict(),
       z.object({ action: z.literal('pause') }).strict(),
       z.object({ action: z.literal('stop') }).strict(),
+      z.object({ action: z.literal('cleanup') }).strict(),
       z.object({ action: z.literal('reset') }).strict(),
     ]).parse(value);
-    const done = async (changed: boolean, message: string) => ({ factory: await factoryView(await this.store.read(run)), changed, message });
+    const done = async (changed: boolean, message: string) => ({ factory: await factoryView(await this.store.read(run), value => value, this.store.dir(run)), changed, message });
     if (input.action === 'reset') return this.store.lock(`launch-${run}`, async () => {
       const state = await this.store.read(run);
       if (!resettable(state)) throw new FactoryConflict('Only failed, cancelled, or execution-stage awaiting runs can be reset.');
@@ -551,6 +739,10 @@ export class Dashboard {
         current.activeJob = undefined; current.supervisor = undefined; current.control = undefined; current.suspended = false; current.priorStatus = undefined;
       });
       return done(true, 'The run was reset and is ready to start.');
+    });
+    const launchLock = <T>(fn: () => Promise<T>) => this.store.lock(`launch-${run}`, fn).catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'ELOCKED' && 'file' in error && path.basename(String(error.file)) === `launch-${run}`) throw new FactoryConflict('Another start or stop for this run is in progress.');
+      throw error;
     });
     if (input.action === 'pause') {
       let changed = false;
@@ -569,9 +761,14 @@ export class Dashboard {
         ? 'Pause requested. The supervisor freezes running workers and starts no new work.'
         : 'Paused. Nothing was running.' : 'The factory is already paused, stopping, or finished.');
     }
-    const launchLock = <T>(fn: () => Promise<T>) => this.store.lock(`launch-${run}`, fn).catch((error: unknown) => {
-      if (error instanceof Error && 'code' in error && error.code === 'ELOCKED' && 'file' in error && path.basename(String(error.file)) === `launch-${run}`) throw new FactoryConflict('Another start or stop for this run is in progress.');
-      throw error;
+    if (input.action === 'cleanup') return launchLock(async () => {
+      const state = await this.store.read(run);
+      if (state.status !== 'handoff_ready') throw new FactoryConflict('Cleanup retry is available only for a completed run.');
+      const { finishRun } = await import('./coordinator.ts');
+      const before = state.revision;
+      const after = await this.store.execution(run, () => finishRun(this.store, run));
+      if (after.shutdown?.phase === 'complete') await this.store.release(run);
+      return done(after.revision !== before, after.shutdown?.error ? 'Cleanup remains blocked.' : 'Cleanup completed.');
     });
     if (input.action === 'stop') return launchLock(async () => {
       const before = await this.store.read(run);
@@ -615,7 +812,12 @@ export class Dashboard {
     let exitCode: number | null = null;
     let exited = false;
     const child = spawn(argv[0], argv.slice(1), { cwd: factoryRoot, detached: true, stdio: ['ignore', log.fd, log.fd], env });
-    child.once('exit', code => { exited = true; exitCode = code; });
+    child.once('exit', code => {
+      exited = true; exitCode = code;
+      void this.store.read(run).then(async state => {
+        if (state.shutdown?.phase === 'complete') await this.store.release(run);
+      }).catch(() => { /* Startup recovery can release an interrupted run. */ });
+    });
     child.once('error', () => { exited = true; });
     await log.close();
     child.unref();
@@ -623,7 +825,16 @@ export class Dashboard {
       event.type === 'supervisor_started' && z.object({ launchId: z.string() }).passthrough().safeParse(event.detail).data?.launchId === launchId);
     const deadline = Date.now() + 5000;
     while (!exited && Date.now() < deadline) {
-      if (registered(await this.store.read(run))) return;
+      if (registered(await this.store.read(run))) {
+        const current = await this.store.read(run);
+        if ((current.status === 'awaiting_input' || current.shutdown?.phase === 'complete') && !current.activeJob) {
+          await new Promise<void>(resolve => {
+            if (exited) return resolve();
+            child.once('exit', () => resolve());
+          });
+        }
+        return;
+      }
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     if (registered(await this.store.read(run))) return;
@@ -649,7 +860,9 @@ export class Dashboard {
     if (supervisor) await terminateOwned(supervisor, 0);
     if (job) await terminateOwned(job, 2000);
     const survivors = (await Promise.all([supervisor, job].filter((owned): owned is OwnedProcess => owned !== undefined)
-      .map(async owned => await groupAlive(owned.pgid) ? groupMembers(owned.pgid) : []))).flat();
+      .map(async owned => owned.pid === owned.pgid
+        ? await groupAlive(owned.pgid) ? groupMembers(owned.pgid) : []
+        : await isOwnedAlive(owned) ? [owned.pid] : []))).flat();
     if (survivors.length) throw new StopIncomplete(`Processes still running after Stop: ${survivors.join(', ')}.`);
     const current = await this.store.read(run);
     if (!terminal(current.status) || current.activeJob || current.supervisor || current.control || current.suspended) {

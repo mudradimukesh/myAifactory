@@ -1,12 +1,16 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile, rename, open, realpath, lstat, unlink, readdir } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, open, realpath, lstat, unlink, readdir, link } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import lockfile from 'proper-lockfile';
+import { buildRunHandoff, saveRunHandoff } from './run-handoff.ts';
 import { z } from 'zod';
-import { stateSchema, transitions, id as idSchema, ticketProgress, specificationSchema, ticketSchema, questionBatchSchema, visualEvidenceSchema } from './contracts.ts';
-import type { State, Status, FileRecord, Event, VisualEvidence } from './contracts.ts';
+import { stateSchema, transitions, id as idSchema, ticketProgress, specificationSchema, ticketSchema, questionBatchSchema, visualEvidenceSchema, referenceImageSchema } from './contracts.ts';
+import type { State, Status, FileRecord, Event, VisualEvidence, ReferenceImage } from './contracts.ts';
 export const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 export const json = (value: unknown) => JSON.stringify(value, null, 2) + '\n';
+export class ReferenceConflict extends Error {}
+export class ReferenceImageInvalid extends Error {}
 export async function readJson(file: string): Promise<unknown> { return JSON.parse(await readFile(file, 'utf8')); }
 const reservationSchema = z.object({ run: idSchema }).strict();
 export async function exists(file: string) { try {
@@ -78,9 +82,139 @@ function validImage(bytes: Buffer, mimeType: VisualEvidence['mimeType']) {
         return bytes.length >= 24 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) && bytes.toString('ascii', 12, 16) === 'IHDR';
     return bytes.length >= 4 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 && bytes.at(-2) === 255 && bytes.at(-1) === 217;
 }
+const referenceManifest = z.object({ revision: z.number().int().nonnegative(), images: z.array(referenceImageSchema).max(5) }).strict();
+const referenceRoot = (root: string) => path.join(root, '.dashboard', 'reference-images');
+const referenceManifestPath = (root: string) => path.join(root, '.dashboard', 'reference-images.json');
+async function referenceDirectory(root: string, dir: string, create = false) {
+    const base = path.resolve(root), relative = path.relative(base, path.resolve(dir));
+    if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw Error('Reference path escapes store');
+    let current = base;
+    for (const part of [null, ...relative.split(path.sep).filter(Boolean)]) {
+        if (part) current = path.join(current, part);
+        let info;
+        try { info = await lstat(current); }
+        catch (error) {
+            if (!create || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            await mkdir(current, { mode: 0o700 });
+            info = await lstat(current);
+        }
+        if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o022) || (process.getuid && info.uid !== process.getuid())) throw Error('Reference directory is unsafe');
+    }
+}
+export async function privateFileBytes(root: string, file: string, maxBytes: number, expectedSize?: number) {
+    await referenceDirectory(root, path.dirname(file));
+    const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+        const info = await handle.stat();
+        if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o077) || (process.getuid && info.uid !== process.getuid()) ||
+            info.size > maxBytes || (expectedSize !== undefined && info.size !== expectedSize)) throw Error('Reference file is unsafe');
+        const buffer = Buffer.allocUnsafe((expectedSize ?? maxBytes) + 1);
+        let offset = 0;
+        while (offset < buffer.length) {
+            const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, null);
+            if (!bytesRead) break;
+            offset += bytesRead;
+        }
+        if (offset > maxBytes || offset !== info.size) throw Error('Reference file changed during read');
+        await referenceDirectory(root, path.dirname(file));
+        return buffer.subarray(0, offset);
+    } finally { await handle.close(); }
+}
+export async function referenceBytes(root: string, file: string, expectedSize: number) {
+    return privateFileBytes(root, file, 5_000_000, expectedSize);
+}
+export async function publishReference(root: string, file: string, bytes: Buffer, replaceIncomplete = false) {
+    await referenceDirectory(root, path.dirname(file), true);
+    const ownTemp = new RegExp(`^${path.basename(file).replace(/[.*+?^{}$()|[\]\\]/g, '\\$&')}\\.[0-9a-f-]{36}\\.tmp$`);
+    for (const name of await readdir(path.dirname(file))) if (ownTemp.test(name)) await unlink(path.join(path.dirname(file), name));
+    if (replaceIncomplete && await exists(file)) {
+        const existing = await privateFileBytes(root, file, 5_000_000);
+        if (existing.length === bytes.length && sha(existing) === sha(bytes)) return;
+    }
+    const tmp = `${file}.${randomUUID()}.tmp`;
+    const handle = await open(tmp, 'wx', 0o600);
+    try {
+        try {
+            await handle.writeFile(bytes);
+            await handle.sync();
+        } finally { await handle.close(); }
+        if (replaceIncomplete) await rename(tmp, file);
+        else {
+            try { await link(tmp, file); }
+            catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+                const existing = await referenceBytes(root, file, bytes.length);
+                if (sha(existing) !== sha(bytes)) throw Error('Reference image content mismatch');
+            }
+        }
+        if (await exists(tmp)) await unlink(tmp);
+        const dir = await open(path.dirname(file), 'r'); try { await dir.sync(); } finally { await dir.close(); }
+    } finally { if (await exists(tmp)) await unlink(tmp); }
+}
+function referenceImageValid(bytes: Buffer, mimeType: ReferenceImage['mimeType']) {
+    if (mimeType === 'image/png') return bytes.length >= 24 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) && bytes.toString('ascii', 12, 16) === 'IHDR';
+    return bytes.length >= 4 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 && bytes.at(-2) === 255 && bytes.at(-1) === 217;
+}
 export class Store {
     root: string;
     constructor(root: string) { this.root = path.resolve(root); }
+    async referenceImages(): Promise<{ revision: number; images: ReferenceImage[] }> {
+        try { return referenceManifest.parse(JSON.parse((await privateFileBytes(this.root, referenceManifestPath(this.root), 16_384)).toString('utf8'))); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { revision: 0, images: [] }; throw error; }
+    }
+    async readReference(image: ReferenceImage) {
+        const value = referenceImageSchema.parse(image);
+        const manifest = await this.referenceImages();
+        if (!manifest.images.some(item => item.sha256 === value.sha256)) throw Error('Reference image is not in the draft manifest');
+        const file = path.join(referenceRoot(this.root), value.path.slice('references/'.length));
+        const bytes = await referenceBytes(this.root, file, value.bytes);
+        if (!referenceImageValid(bytes, value.mimeType) || sha(bytes) !== value.sha256) throw Error('Reference image content mismatch');
+        return { bytes, mimeType: value.mimeType, sha256: value.sha256 };
+    }
+    async readRunReference(run: string, image: ReferenceImage) {
+        const value = referenceImageSchema.parse(image);
+        const state = await this.read(run);
+        if (!state.project.referenceImages?.some(item => item.sha256 === value.sha256)) throw Error('Reference image is not in the run manifest');
+        const file = path.join(this.dir(run), value.path);
+        const bytes = await referenceBytes(this.root, file, value.bytes);
+        if (!referenceImageValid(bytes, value.mimeType) || sha(bytes) !== value.sha256) throw Error('Reference image content mismatch');
+        return { bytes, mimeType: value.mimeType, sha256: value.sha256 };
+    }
+    async addReference(bytes: Buffer, mimeType: ReferenceImage['mimeType'], expectedRevision: number) {
+        if (bytes.length === 0 || bytes.length > 5_000_000) throw Error('Reference image exceeds 5,000,000 bytes');
+        if (!referenceImageValid(bytes, mimeType)) throw new ReferenceImageInvalid('Reference image content does not match its MIME type');
+        return this.lock('reference-images', async () => {
+            const manifest = await this.referenceImages();
+            if (manifest.revision !== expectedRevision) throw new ReferenceConflict('Stale reference image revision');
+            const hash = sha(bytes), extension = mimeType === 'image/png' ? 'png' : 'jpg';
+            const image = { sha256: hash, mimeType, bytes: bytes.length, path: `references/${hash}.${extension}` } satisfies ReferenceImage;
+            if (manifest.images.some(item => item.sha256 === hash)) {
+                await this.readReference(image);
+                return manifest;
+            }
+            if (manifest.images.length >= 5) throw new ReferenceConflict('A maximum of 5 reference images is allowed');
+            await referenceDirectory(this.root, referenceRoot(this.root), true);
+            const file = path.join(referenceRoot(this.root), `${hash}.${extension}`);
+            await publishReference(this.root, file, bytes, true);
+            const next = { revision: manifest.revision + 1, images: [...manifest.images, image] };
+            await durable(referenceManifestPath(this.root), json(next));
+            return next;
+        }, true);
+    }
+    async removeReference(hash: string, expectedRevision: number) {
+        if (!/^[a-f0-9]{64}$/.test(hash)) throw Error('Invalid reference image hash');
+        return this.lock('reference-images', async () => {
+            const manifest = await this.referenceImages();
+            if (manifest.revision !== expectedRevision) throw new ReferenceConflict('Stale reference image revision');
+            const image = manifest.images.find(item => item.sha256 === hash);
+            if (!image) throw Error('Reference image not found');
+            const next = { revision: manifest.revision + 1, images: manifest.images.filter(item => item.sha256 !== hash) };
+            await durable(referenceManifestPath(this.root), json(next));
+            await referenceDirectory(this.root, referenceRoot(this.root));
+            try { await unlink(path.join(referenceRoot(this.root), image.path.slice('references/'.length))); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+            return next;
+        }, true);
+    }
     dir(run: string) { idSchema.parse(run); return path.join(this.root, run); }
     async importVisualEvidence(run: string, batchId: string, questionId: string, entries: VisualEvidence[], sourceRoot: string): Promise<VisualEvidence[]> {
         idSchema.parse(batchId);
@@ -136,7 +270,7 @@ export class Store {
             await release();
         }
     }
-    async execution<T>(run: string, fn: () => Promise<T>): Promise<T> {
+    async execution<T>(run: string, fn: () => Promise<T>, wait = false): Promise<T> {
         return this.lock('execution', async () => {
             const reservation = path.join(this.root, 'active.json');
             if (await exists(reservation)) {
@@ -146,12 +280,17 @@ export class Store {
             }
             await durable(reservation, json({ run }));
             return fn();
-        });
+        }, wait);
     }
     /** The run holding the state-root reservation, if any. */
     async holder(): Promise<string | null> { const p = path.join(this.root, 'active.json'); return await exists(p) ? reservationSchema.parse(await readJson(p)).run : null; }
-    async release(run: string) { const p = path.join(this.root, 'active.json'); if (await exists(p) && reservationSchema.parse(await readJson(p)).run === run)
-        await unlink(p); }
+    async release(run: string) {
+        await this.lock('execution', async () => {
+            const p = path.join(this.root, 'active.json');
+            if (await exists(p) && reservationSchema.parse(await readJson(p)).run === run)
+                await unlink(p);
+        }, true);
+    }
     async read(run: string): Promise<State> { const s = stateSchema.parse(await readJson(path.join(this.dir(run), 'state.json'))); if (s.id !== run)
         throw Error('Run identity mismatch'); return s; }
     async reconcile(run: string, s: State) {
@@ -188,9 +327,22 @@ export class Store {
                 await h.close();
             }
         }
+        const stateFile = path.join(this.dir(run), 'state.json');
+        let persistedRevision = 0;
+        try { persistedRevision = stateSchema.parse(JSON.parse(await readFile(stateFile, 'utf8'))).revision; } catch { /* state may be between atomic writes */ }
+        if (persistedRevision === s.revision) {
+            const handoff = await buildRunHandoff(this, s);
+            const files = [path.join(this.dir(run), 'HANDOFF.md'), path.join(this.dir(run), 'handoff.json')];
+            const expected = [handoff.markdown, json(handoff)];
+            for (let i = 0; i < files.length; i++) {
+                let current = '';
+                try { current = await readFile(files[i], 'utf8'); } catch { /* repair below */ }
+                if (current !== expected[i]) await durable(files[i], expected[i]);
+            }
+        }
     }
     async create(s: State) { stateSchema.parse(s); return this.lock('run-' + s.id, async () => { const d = this.dir(s.id); if (await exists(path.join(d, 'state.json')))
-        throw Error('Run already exists'); await mkdir(d, { recursive: true, mode: 0o700 }); await durable(path.join(d, 'state.json'), json(s)); await this.reconcile(s.id, s); }, true); }
+        throw Error('Run already exists'); const handoff = await buildRunHandoff(this, s); await mkdir(d, { recursive: true, mode: 0o700 }); await durable(path.join(d, 'state.json'), json(s)); await this.reconcile(s.id, s); await saveRunHandoff(this, handoff); }, true); }
     async update(run: string, type: string, detail: unknown, fn: (s: State) => void | Promise<void>) {
         return this.lock('run-' + run, async () => {
             const s = await this.read(run);
@@ -205,8 +357,10 @@ export class Store {
             s.lastEvent = { sequence: s.revision, at: s.updatedAt, type, detail };
             s.history.push(s.lastEvent);
             stateSchema.parse(s);
+            const handoff = await buildRunHandoff(this, s);
             await durable(path.join(this.dir(run), 'state.json'), json(s));
             await this.reconcile(run, s);
+            await saveRunHandoff(this, handoff);
             return s;
         }, true);
     }

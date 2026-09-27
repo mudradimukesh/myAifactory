@@ -4,7 +4,7 @@ import { readFile, readdir, lstat, realpath, mkdir, copyFile, cp, chmod, writeFi
 import { constants } from 'node:fs';
 import { homedir, release } from 'node:os';
 import path from 'node:path';
-import { id, projectSchema } from './contracts.ts';
+import { id, projectSchema, role } from './contracts.ts';
 import type { Project } from './contracts.ts';
 import { runProcess } from './process.ts';
 import type { ProcessSpec } from './process.ts';
@@ -86,7 +86,11 @@ export class LocalRuntime {
                 if (contains(tool, await realpath(homedir()))) throw Error('Tool path exposes home');
             } catch { errors.push(`Invalid tool installation directory: ${root}`); }
         }
-        for (const provider of new Set(Object.values(project.models).map(model => model.provider))) {
+        const configuredModels = project.models.roles
+            ? (project.enabledRoles ?? role.options).map(name => project.models.roles![name])
+            : [project.models.coordinator, project.models.developer, project.models.reviewer,
+                project.models.inspector, ...(project.models.tester ? [project.models.tester] : [])];
+        for (const provider of new Set(configuredModels.map(model => model.provider))) {
             const home = project.runtime.authHomes[provider];
             try {
                 if (!home) throw Error(`Configure a dedicated ${provider} subscription auth home`);

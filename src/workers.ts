@@ -1,7 +1,9 @@
 import { z } from 'zod';
+import path from 'node:path';
 import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import { choice as choiceSchema, role as roleSchema, headroomSchema, usageSchema } from './contracts.ts';
-import type { Role, WorkerChoice, Headroom } from './contracts.ts';
+import type { Role, WorkerChoice, Headroom, ReferenceImage } from './contracts.ts';
+export type WorkerReference = Omit<ReferenceImage, 'path'> & { path: string };
 export type WorkerOutput = {
     text: string;
     inputTokens: number | null;
@@ -40,13 +42,14 @@ export function normalize(provider: WorkerChoice['provider'], raw: RawUsage): Us
 const writeRoles = new Set<Role>(['business', 'domain', 'architect', 'developer', 'tester']);
 // Execute these commands only through LocalRuntime. Its outer macOS sandbox
 // owns filesystem permissions; macOS rejects a second nested Seatbelt sandbox.
-export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, prompt: string, policy: string, headroom?: Headroom, outputSchema?: { json: string; file: string }, resume?: { session: string }): {
+export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, prompt: string, policy: string, headroom?: Headroom, outputSchema?: { json: string; file: string }, resume?: { session: string }, references?: WorkerReference[]): {
     executable: string;
     args: string[];
     stdin: string;
     env: Record<string, string>;
 } {
     const routing = headroom === undefined ? undefined : headroomSchema.parse(headroom);
+    if (references?.length && routing === undefined) throw new Error('Reference images require a Headroom route');
     if (choice.provider !== 'codex' && choice.provider !== 'claude') {
         throw new Error('Unknown worker provider');
     }
@@ -76,7 +79,8 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
                 '--sandbox', 'danger-full-access',
                 '-C', cwd,
                 ...(outputSchema ? ['--output-schema', outputSchema.file] : []),
-                ...(resume ? ['resume', resume.session] : []),
+                ...(resume ? ['resume', ...((references ?? []).flatMap(image => ['-i', image.path])), resume.session] : []),
+                ...(!resume ? (references ?? []).flatMap(image => ['--image', image.path]) : []),
                 '-',
             ],
             stdin: `Worker policy:\n${policy}\n\nTask:\n${prompt}`,
@@ -101,6 +105,7 @@ export function workerCommand(choice: WorkerChoice, role: Role, cwd: string, pro
             '--effort', choice.effort,
             '--append-system-prompt', policy,
             ...(outputSchema ? ['--json-schema', outputSchema.json] : []),
+            ...((references?.length ?? 0) > 0 ? ['--add-dir', path.dirname(references![0]!.path)] : []),
             ...(resume ? ['--resume', resume.session] : []),
         ],
         stdin: prompt,

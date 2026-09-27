@@ -1,19 +1,22 @@
 import { openClaudeLogin } from './claude-login.js';
+import { renderFactories, showObservedSkills, showRunHandoff } from './factories.js';
 
 (() => {
   'use strict';
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const content = $('#page-content');
-  const pageNames = { overview: 'Overview', project: 'Project setup', connections: 'Connections', budgets: 'Budgets' };
+  const pageNames = { overview: 'Overview', project: 'Project setup', factories: 'Factories', connections: 'Connections', budgets: 'Budgets' };
   const roles = [
-    ['business', 'Business', 'Owns approved business requirements', 'inspector'], ['domain', 'Domain', 'Owns domain rules', 'inspector'],
-    ['architect', 'Architect', 'Owns ticket progress', 'inspector'], ['developer', 'Developer', 'Implements isolated changes', 'developer'],
-    ['reviewer', 'Reviewer', 'Checks the candidate', 'reviewer'], ['tester', 'Tester', 'Plans independent checks', 'inspector'],
+    ['business', 'Business', 'Owns approved business requirements', 'business'], ['domain', 'Domain', 'Owns domain rules', 'domain'],
+    ['architect', 'Architect', 'Owns ticket progress', 'architect'], ['developer', 'Developer', 'Implements isolated changes', 'developer'],
+    ['reviewer', 'Reviewer', 'Checks the candidate', 'reviewer'], ['tester', 'Tester', 'Plans independent checks', 'tester'],
     ['coordinator', 'Coordinator', 'Plans work and manages handoffs', 'coordinator'],
   ];
   const state = { csrf: '', data: null, page: 'overview', selectedRun: null, refreshing: false, controlBusy: null };
   const answerDrafts = new Map();
+  const chats = new Map();
+  const chatRoles = new Map();
 
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -115,6 +118,7 @@ import { openClaudeLogin } from './claude-login.js';
   function settings() { return state.data?.settings || {}; }
   function showPage(page) {
     if (!pageNames[page]) return;
+    if (state.page !== page) window.scrollTo(0, 0);
     state.page = page;
     $('#page-title').textContent = pageNames[page];
     document.querySelectorAll('.nav-link').forEach(link => {
@@ -129,7 +133,7 @@ import { openClaudeLogin } from './claude-login.js';
   async function api(path, options = {}) {
     const headers = new Headers(options.headers || {});
     headers.set('Accept', 'application/json');
-    if (options.body !== undefined) headers.set('Content-Type', 'application/json');
+    if (options.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
     if (state.csrf) headers.set('X-CSRF-Token', state.csrf);
     const response = await fetch(path, { ...options, headers, credentials: 'same-origin' });
     const type = response.headers.get('content-type') || '';
@@ -210,6 +214,7 @@ import { openClaudeLogin } from './claude-login.js';
     if (state.page === 'project') renderProject();
     if (state.page === 'connections') renderConnections();
     if (state.page === 'budgets') renderBudgets();
+    if (state.page === 'factories') renderFactories({ content, api, settings: settings(), runs: state.data.runs || [], onSettings: value => { state.data.settings = value; }, onRun: async id => { state.selectedRun = id; await loadData({ quiet: true }); navigate('overview'); } });
   }
 
   function metric(label, value, detail, icon) {
@@ -229,7 +234,8 @@ import { openClaudeLogin } from './claude-login.js';
     append(info, node('strong', '', name), node('span', '', detail));
     const tag = node('span', 'model-tag', `${provider} · ${model}`);
     const live = Boolean(selected?.factory?.supervisor && selected.factory.state === 'running' && (selected.attempts || []).some(attempt => attempt.role === key && attempt.status === 'running'));
-    append(person, avatar, info, node('span', `badge role-status ${live ? 'running' : ''}`, live ? 'Live' : 'Idle'), tag);
+    const enabled = selected ? selectedRole?.enabled !== false : (data.settings?.enabledRoles || roles.map(item => item[0])).includes(key);
+    append(person, avatar, info, node('span', `badge role-status ${live ? 'running' : ''}`, enabled ? (live ? 'Live' : 'Idle') : 'Off'), tag);
     if (index > 0) person.dataset.indented = 'true';
     return person;
   }
@@ -256,6 +262,15 @@ import { openClaudeLogin } from './claude-login.js';
       metric('Reported tokens', number(tokens), 'Metered: uncached input + output + cache reads at 1/10', '◈'),
       metric('Open recommendations', number(issues.length), issues.length ? 'Review the suggested next steps' : 'No flagged issues', '✳'));
     overview.append(metrics);
+    if (selectedRun?.referenceImages?.length) {
+      const references = card('Reference screenshots', 'Frozen inputs for this run.', 'reference-panel');
+      const grid = node('div', 'reference-grid');
+      for (const image of selectedRun.referenceImages) {
+        const link = node('a', 'reference-thumb'); link.href = image.url || `/api/runs/${encodeURIComponent(selectedRun.id)}/reference-images/${image.sha256}`; link.target = '_blank';
+        const thumbnail = node('img'); thumbnail.src = link.href; thumbnail.alt = `Reference ${image.sha256.slice(0, 12)}`; thumbnail.loading = 'lazy'; link.append(thumbnail); grid.append(link);
+      }
+      references.append(grid); overview.append(references);
+    }
 
     const mainGrid = node('div', 'overview-grid');
     const activity = card('Run activity', 'Select a run to inspect its attempts and saved event history.', 'run-panel');
@@ -309,8 +324,12 @@ import { openClaudeLogin } from './claude-login.js';
     append(title, node('span', 'eyebrow', 'SELECTED RUN'), node('h2', '', run.id));
     const actions = node('div', 'detail-actions');
     actions.append(button('Recovery packet', 'secondary small', () => downloadRecovery(run.id)));
+    actions.append(button('Skill reads', 'secondary small', () => showObservedSkills(api, run.id)));
+    actions.append(button('Run handoff', 'secondary small', () => showRunHandoff(api, run.id, () => navigate('factories'))));
     append(head, title, actions);
-    append(detail, head, factoryBar(run));
+    const live = node('div', 'run-live-grid');
+    append(live, factoryBar(run), chatPanel(run));
+    append(detail, head, live);
     const stats = node('div', 'run-stat-strip');
     const attemptCount = Array.isArray(run.attempts) ? run.attempts.length : Number(run.attemptCount) || 0;
     const passedChecks = Number(run.checks?.passed);
@@ -342,6 +361,79 @@ import { openClaudeLogin } from './claude-login.js';
     append(lower, attempts, events);
     detail.append(lower);
     return detail;
+  }
+  function chatPanel(run) {
+    const panel = node('section', 'agent-chat');
+    const heading = node('div', 'agent-chat-heading');
+    append(heading, node('h3', '', 'Agent chat'), node('span', 'chat-scope', 'Separate turn'));
+    panel.append(heading);
+    const choices = (run.roles || []).filter(item => item.enabled !== false).map(item => [item.role, `${item.role[0].toUpperCase()}${item.role.slice(1)} · ${item.provider}`]);
+    if (!choices.length) {
+      panel.append(node('p', 'muted', 'No agents are enabled for this run.'));
+      return panel;
+    }
+    const remembered = chatRoles.get(run.id);
+    const selected = choices.some(([name]) => name === remembered) ? remembered : choices.find(([name]) => run.roles.find(item => item.role === name)?.provider === 'claude')?.[0] || choices[0][0];
+    chatRoles.set(run.id, selected);
+    const picker = select('chat-role', selected, choices);
+    picker.setAttribute('aria-label', 'Agent role');
+    picker.addEventListener('change', () => { chatRoles.set(run.id, picker.value); renderOverview(); });
+    panel.append(picker);
+    const role = run.roles.find(item => item.role === selected);
+    const key = `${run.id}:${selected}`;
+    const chat = chats.get(key) || { messages: [], draft: '', loading: false, busy: false };
+    chats.set(key, chat);
+    const transcript = node('div', 'chat-transcript');
+    transcript.setAttribute('role', 'log');
+    transcript.setAttribute('aria-label', `${selected} chat transcript`);
+    if (!chat.messages.length) transcript.append(node('p', 'muted', chat.loading ? 'Loading conversation...' : 'No messages yet.'));
+    for (const item of chat.messages) {
+      const bubble = node('div', `chat-message ${item.by}`);
+      append(bubble, node('strong', '', item.by === 'operator' ? 'You' : selected), node('p', '', item.text));
+      transcript.append(bubble);
+    }
+    panel.append(transcript);
+    const finishing = run.status === 'handoff_ready' || Boolean(run.factory?.shutdown);
+    const available = role?.provider === 'claude' && !finishing && ['idle', 'exited', 'terminal'].includes(run.factory?.state) && !run.factory?.activeJob;
+    const explanation = run.factory?.shutdown?.phase === 'complete' ? 'Chat is closed because the run finished and handed off.'
+      : finishing ? 'Chat is disabled while the run finishes and shuts down.'
+      : role?.provider !== 'claude' ? 'Chat supports Claude roles. Codex chat is unavailable because tool access cannot be disabled.'
+      : !available ? 'A separate chat turn is available after the factory is idle or finished.'
+      : 'The agent receives the saved run brief and this conversation. It cannot inspect files or change the run.';
+    panel.append(node('p', 'chat-note', explanation));
+    const form = node('form', 'chat-compose');
+    const draft = textarea('message', chat.draft, 3, 'Message this agent');
+    draft.maxLength = 4000;
+    draft.setAttribute('aria-label', 'Message this agent');
+    draft.disabled = !available || chat.busy || !chat.loaded;
+    draft.addEventListener('input', () => { chat.draft = draft.value; });
+    const send = node('button', 'button primary small', chat.busy ? 'Sending...' : 'Send');
+    send.type = 'submit';
+    send.disabled = !available || chat.busy || !chat.loaded;
+    append(form, draft, send);
+    if (chat.error) form.append(node('p', 'form-status error-text', chat.error));
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const text = chat.draft.trim();
+      if (!text || chat.busy || !available || !chat.loaded) return;
+      chat.busy = true; chat.error = '';
+      renderOverview();
+      try {
+        const result = await api(`/api/runs/${encodeURIComponent(run.id)}/chat`, { method: 'POST', body: JSON.stringify({ role: selected, text }) });
+        chat.messages = result.messages;
+        chat.draft = '';
+      } catch (error) { chat.error = error.message; }
+      finally { chat.busy = false; renderOverview(); }
+    });
+    panel.append(form);
+    if (!chat.loaded && !chat.loading) {
+      chat.loading = true;
+      api(`/api/runs/${encodeURIComponent(run.id)}/chat/${encodeURIComponent(selected)}`)
+        .then(result => { chat.messages = result.messages; chat.loaded = true; })
+        .catch(error => { chat.error = error.message; chat.loaded = true; })
+        .finally(() => { chat.loading = false; if (state.page === 'overview' && state.selectedRun === run.id) renderOverview(); });
+    }
+    return panel;
   }
   function workflowSection(title, description) {
     const section = node('section', 'workflow-section');
@@ -631,7 +723,7 @@ import { openClaudeLogin } from './claude-login.js';
     bar.setAttribute('aria-busy', String(Boolean(busy)));
     const status = node('div', 'factory-status');
     status.setAttribute('role', 'status');
-    const text = run.status === 'awaiting_input' ? `Awaiting input${stall ? ` after ${stall.code}.` : '.'}` : run.status === 'failed' ? `${String(stall?.code || 'Failed').replaceAll('_', ' ')}.` : current === 'running' ? (job ? `Running the ${job.kind} job since ${escDate(job.startedAt)}.` : 'The supervisor is running. No worker job is active.')
+    const text = current === 'stopping' ? (factory.shutdown?.error ? `Goal achieved; cleanup blocked. ${factory.shutdown.error}` : 'Finishing the goal. Cleaning up owned processes.') : run.status === 'awaiting_input' ? `Awaiting input${stall ? ` after ${stall.code}.` : '.'}` : run.status === 'failed' ? `${String(stall?.code || 'Failed').replaceAll('_', ' ')}.` : current === 'running' ? (job ? `Running the ${job.kind} job since ${escDate(job.startedAt)}.` : 'The supervisor is running. No worker job is active.')
       : current === 'exited' ? factory.reason || 'The supervisor exited.'
       : current === 'terminal' ? `This run is ${String(run.status).replaceAll('_', ' ')}.`
       : factoryText[current];
@@ -647,6 +739,10 @@ import { openClaudeLogin } from './claude-login.js';
       const activity = node('ul', 'activity');
       for (const entry of factory.activity) activity.append(node('li', '', `${entry.job}: ${entry.summary}`));
       status.append(node('small', 'activity-title', `Worker activity${age === null ? '' : `, last write ${duration(age * 1000)} ago`}`), activity);
+    }
+    if (job) {
+      const reads = factory.skillReads || [];
+      status.append(node('small', 'activity-title', reads.length ? `Skills read by current worker: ${reads.map(skill => skill.name).join(', ')}` : 'No explicit skill reads recorded for the current worker.'));
     }
     const clarification = factory.clarification || {};
     for (const side of ['developer', 'tester']) {
@@ -664,7 +760,8 @@ import { openClaudeLogin } from './claude-login.js';
       controlButton(run, 'start', factory.startLabel, 'primary', factory.canStart && !busy),
       controlButton(run, 'pause', 'Pause', 'secondary', factory.canPause && workRunning && !busy),
       controlButton(run, 'reset', 'Reset', 'secondary', factory.canReset && !busy),
-      controlButton(run, 'stop', 'Stop', 'secondary stop', factory.canStop && !busy));
+      controlButton(run, 'stop', 'Stop', 'secondary stop', factory.canStop && !busy),
+      factory.shutdown?.phase === 'stopping' && factory.shutdown.error ? controlButton(run, 'cleanup', 'Retry cleanup', 'secondary', !busy) : null);
     append(bar, status, actions);
     return bar;
   }
@@ -738,26 +835,83 @@ import { openClaudeLogin } from './claude-login.js';
     content.replaceChildren();
     const s = settings();
     const page = node('div', 'settings-page');
-    append(page, sectionHeader('PROJECT PROFILE', 'Project setup', 'Give the coordinator the repository, approved brief, and the person who receives a completed handoff.'));
+    append(page, sectionHeader('PROJECT PROFILE', 'Project setup', 'Give the coordinator a local project folder or GitHub repository, an approved brief, and the handoff recipient.'));
     const panel = card('Project details', 'These settings are stored locally with this dashboard.', 'settings-panel');
     const form = node('form', 'settings-form');
+    form.modelCatalogDraft = structuredClone(s.modelCatalog || { codex: [], claude: [] });
     append(form,
-      field('GitHub repository URL', input('repositoryUrl', s.repositoryUrl, 'url', { placeholder: 'https://github.com/team/project', required: false }), 'Use a public GitHub URL without embedded credentials. This setting does not grant repository access.'),
+      field('Local project folder or GitHub URL', input('repositoryUrl', s.repositoryUrl, 'text', { placeholder: '/Users/you/Projects/project or https://github.com/team/project', required: false }), 'Use an absolute local folder path or a GitHub HTTPS URL. URLs must not contain credentials.'),
       field('Project brief', textarea('brief', s.brief, 8, 'Describe the outcome, users, constraints, and acceptance examples.'), 'Keep product decisions and expected behavior clear. The dashboard does not approve a brief for you.'),
       field('Handoff recipient', input('recipient', s.recipient, 'text', { placeholder: 'Name or team' }), 'The named person or team responsible for reviewing the finished handoff.'));
+    const referencePanel = card('Reference screenshots', 'Optional PNG or JPEG inputs. Uploads do not approve requirements or visual review.', 'reference-panel');
+    const referenceStatus = node('p', 'field-help', 'Loading saved references...');
+    const referenceGrid = node('div', 'reference-grid');
+    const upload = input('referenceImages', undefined, 'file', { required: false }); upload.accept = 'image/png,image/jpeg'; upload.multiple = true;
+    const renderReferences = manifest => {
+      referenceStatus.textContent = manifest.images.length ? `${manifest.images.length} of 5 saved` : 'No screenshots saved'; referenceGrid.replaceChildren();
+      for (const image of manifest.images) {
+        const figure = node('figure', 'reference-thumb'); const thumbnail = node('img'); thumbnail.src = image.url; thumbnail.alt = `Reference ${image.sha256.slice(0, 12)}`;
+        const remove = button('Remove', 'secondary small', async () => { remove.disabled = true; try { const next = await api(`/api/reference-images/${image.sha256}?expectedRevision=${referencePanel.dataset.revision || manifest.revision}`, { method: 'DELETE' }); referencePanel.dataset.revision = next.revision; renderReferences(next); } catch (error) { referenceStatus.textContent = error.message; remove.disabled = false; } });
+        remove.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); remove.click(); } }); append(figure, thumbnail, node('figcaption', '', image.sha256.slice(0, 12)), remove); referenceGrid.append(figure);
+      }
+    };
+    upload.addEventListener('change', async () => { for (const file of upload.files || []) { if (file.size > 5_000_000) { referenceStatus.textContent = `${file.name}: File exceeds 5,000,000 bytes. Choose a smaller screenshot.`; continue; } try { const manifest = await api('/api/reference-images?expectedRevision=' + (referencePanel.dataset.revision || '0'), { method: 'POST', headers: { 'Content-Type': file.type }, body: file }); referencePanel.dataset.revision = manifest.revision; renderReferences(manifest); } catch (error) { referenceStatus.textContent = `${file.name}: ${error.message}`; } } upload.value = ''; });
+    referencePanel.append(field('Upload PNG or JPEG screenshots', upload, 'Maximum 5 files, 5,000,000 bytes per file.'), referenceStatus, referenceGrid); form.append(referencePanel);
+    void api('/api/reference-images').then(manifest => { referencePanel.dataset.revision = manifest.revision; renderReferences(manifest); }).catch(error => { referenceStatus.textContent = error.message; });
     const modelTitle = node('div', 'subsection-heading');
     append(modelTitle, node('h2', '', 'Role models'), node('p', '', 'Choose the provider, model, and effort used for each role.'));
     const modelGrid = node('div', 'model-grid');
-    for (const [key, roleName, detail] of [['coordinator', 'Coordinator', 'Plans and routes work'], ['developer', 'Developer', 'Implements changes'], ['reviewer', 'Reviewer', 'Reviews the candidate'], ['inspector', 'Inspector', 'Runs independent checks']]) {
+    const modelDefaults = { business: 'gpt-6-luna', domain: 'gpt-6-luna', architect: 'gpt-6-luna', developer: 'gpt-6-sol', reviewer: 'gpt-6-sol', tester: 'gpt-6-luna', coordinator: 'gpt-6-astra' };
+    const modelRoles = [['business', 'Business', 'Defines approved requirements'], ['domain', 'Domain', 'Checks domain rules'], ['architect', 'Architect', 'Plans ticket progress'], ['developer', 'Developer', 'Implements changes'], ['reviewer', 'Reviewer', 'Reviews the candidate'], ['tester', 'Tester', 'Plans independent checks'], ['coordinator', 'Coordinator', 'Plans and routes work']];
+    for (const [key, roleName, detail] of modelRoles) {
       const configured = s.models?.[key] || {};
       const modelCard = node('div', 'model-card');
-      append(modelCard, node('strong', '', roleName), node('span', 'model-description', detail));
-      modelCard.append(field('Provider', select(`${key}Provider`, configured.provider || 'codex', [['codex', 'Codex'], ['claude', 'Claude Code']])));
-      modelCard.append(field('Model', input(`${key}Model`, configured.model || ({ coordinator: 'gpt-6-astra', developer: 'gpt-6-sol', reviewer: 'gpt-6-sol', inspector: 'gpt-6-luna' })[key], 'text', { required: true })));
-      modelCard.append(field('Effort', select(`${key}Effort`, configured.effort || 'medium', [['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high']])));
+      const heading = node('div', 'model-card-heading');
+      const toggle = node('label', 'role-toggle');
+      const enabled = node('input', 'role-checkbox');
+      enabled.type = 'checkbox';
+      enabled.name = 'enabledRoles';
+      enabled.value = key;
+      enabled.checked = (s.enabledRoles || modelRoles.map(item => item[0])).includes(key);
+      append(toggle, enabled, node('strong', '', roleName));
+      append(heading, toggle, node('span', 'model-description', detail));
+      modelCard.append(heading);
+      const provider = select(`${key}Provider`, configured.provider || 'codex', [['codex', 'Codex'], ['claude', 'Claude Code']]);
+      const model = select(`${key}Model`, configured.model || modelDefaults[key], []);
+      const refreshModels = (reset = false) => {
+        const catalog = form.modelCatalogDraft[provider.value] || [];
+        const current = reset ? (catalog[0] || modelDefaults[key]) : (model.value || configured.model || modelDefaults[key]);
+        model.replaceChildren();
+        for (const value of [...new Set([...catalog, current])].filter(Boolean)) {
+          const option = node('option', '', value); option.value = value; model.append(option);
+        }
+        model.value = current;
+      };
+      refreshModels();
+      provider.addEventListener('change', () => refreshModels(true));
+      const addModel = button('Add model', 'secondary small', () => {
+        const value = window.prompt(`Add a ${provider.value === 'codex' ? 'Codex' : 'Claude Code'} model ID`);
+        const name = String(value || '').trim();
+        if (!name || name.length > 120) return;
+        form.modelCatalogDraft[provider.value] ||= [];
+        if (!form.modelCatalogDraft[provider.value].includes(name)) form.modelCatalogDraft[provider.value].push(name);
+        refreshModels();
+        model.value = name;
+      });
+      modelCard.append(field('Provider', provider));
+      modelCard.append(field('Model', model));
+      modelCard.append(addModel);
+      const effort = select(`${key}Effort`, configured.effort || 'low', [['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high']]);
+      modelCard.append(field('Effort', effort));
+      const updateEnabled = () => {
+        modelCard.classList.toggle('role-disabled', !enabled.checked);
+        for (const control of [provider, model, addModel, effort]) control.disabled = !enabled.checked;
+      };
+      enabled.addEventListener('change', updateEnabled);
+      updateEnabled();
       modelGrid.append(modelCard);
     }
-    append(form, modelTitle, modelGrid);
+    append(form, modelTitle, modelGrid, node('p', 'field-help', 'Unchecked roles are skipped in new runs. Mandatory checks still run.'), node('p', 'field-help', 'Add newly released provider model IDs to the local dropdown catalog. Live provider model discovery is unavailable.'));
     const footer = submitRow('Save project profile');
     form.append(footer.row);
     form.addEventListener('submit', event => saveSettings(event, form, footer));
@@ -981,7 +1135,10 @@ import { openClaudeLogin } from './claude-login.js';
       next.brief = String(fields.get('brief') || '').trim();
       next.recipient = String(fields.get('recipient') || '').trim();
       next.models = { ...(next.models || {}) };
-      for (const key of ['coordinator', 'developer', 'reviewer', 'inspector']) {
+      next.enabledRoles = fields.getAll('enabledRoles').map(String);
+      next.modelCatalog = structuredClone(form.modelCatalogDraft);
+      for (const key of ['business', 'domain', 'architect', 'developer', 'reviewer', 'tester', 'coordinator']) {
+        if (!next.enabledRoles.includes(key)) continue;
         next.models[key] = {
           ...(next.models[key] || {}),
           provider: String(fields.get(`${key}Provider`)),
