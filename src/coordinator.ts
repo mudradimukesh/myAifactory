@@ -828,7 +828,7 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
         if (!outcome.passed) return store.transition(run, outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? 'awaiting_input' : 'changes_requested',
             outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `Developer attempt failed: ${outcome.reason}`);
         let imported;
-        try { imported = await importCandidate(candidateStore(store, run), path.join(evidenceDir(store, run, outcome.attempt.id), 'source'), s.candidate ?? s.sourceBase, s.project.allowedPaths); }
+        try { imported = await importCandidate(candidateStore(store, run), path.join(evidenceDir(store, run, outcome.attempt.id), 'source'), s.candidate ?? s.sourceBase, s.project.allowedPaths, { commitDirty: true }); }
         catch (error) { return store.transition(run, 'changes_requested', `Candidate import rejected: ${String(error)}`); }
         return store.update(run, 'candidate_imported', imported, state => { state.candidate = imported.candidate; state.candidateReferences = { candidate: imported.candidate, referenceImageHashes: referenceHashes(state) }; state.review = undefined; state.checks = []; move(state, 'candidate', 'Developer candidate imported'); });
     }

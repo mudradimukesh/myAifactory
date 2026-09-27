@@ -179,3 +179,28 @@ test('packed repositories and retention metadata preserve clean candidate import
     assert.equal(await readFile(path.join(root, 'verifier/data'), 'utf8'), 'candidate');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('a developer import commits uncommitted allowed changes instead of rejecting them', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'factory-dirty-commit-'));
+  try {
+    const source = path.join(root, 'source'), store = path.join(root, 'candidates.git');
+    await mkdir(path.join(source, 'src'), { recursive: true });
+    await git(source, ['init']);
+    await git(source, ['config', 'user.name', 'Fixture']);
+    await git(source, ['config', 'user.email', 'fixture@localhost']);
+    await writeFile(path.join(source, 'src/a.txt'), 'base');
+    await git(source, ['add', '.']);
+    await git(source, ['commit', '-m', 'base']);
+    const base = await git(source, ['rev-parse', 'HEAD']);
+    await createStore(source, store, base);
+    await writeFile(path.join(source, 'src/a.txt'), 'edited');
+    await writeFile(path.join(source, 'src/new.txt'), 'added');
+    const imported = await importCandidate(store, source, base, ['src'], { commitDirty: true });
+    assert.notEqual(imported.candidate, base);
+    assert.deepEqual(imported.files.sort(), ['src/a.txt', 'src/new.txt']);
+    assert.equal(await git(store, ['show', `${imported.candidate}:src/a.txt`]), 'edited');
+    assert.equal(await git(store, ['rev-parse', `${imported.candidate}^`]), base);
+    await writeFile(path.join(source, 'outside.txt'), 'stray');
+    await assert.rejects(importCandidate(store, source, base, ['src'], { commitDirty: true }), /disallowed path outside\.txt/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

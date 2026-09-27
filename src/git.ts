@@ -109,10 +109,21 @@ export async function checkout(store: string, target: string, candidate: string)
     await git(target, ['config', 'user.email', 'factory@localhost']);
 }
 export function allowed(file: string, paths: string[]) { return paths.some(p => p === '.' || file === p || file.startsWith(p.replace(/\/$/, '') + '/')); }
-export async function importCandidate(store: string, source: string, base: string, allowedPaths: string[]) {
+export async function importCandidate(store: string, source: string, base: string, allowedPaths: string[], options: { commitDirty?: boolean } = {}) {
     if (!/^[a-f0-9]{40}$/.test(base)) throw Error('Invalid base identity');
-    return snapshot(source, async (trusted, candidate) => {
-        await requireClean(trusted, source, candidate);
+    return snapshot(source, async (trusted, head) => {
+        let candidate = head;
+        try { await requireClean(trusted, source, head); }
+        catch (error) {
+            if (!options.commitDirty || !(error instanceof DirtyRepository)) throw error;
+            // A worker that forgot to commit still produced files on disk. Commit them
+            // in the trusted repository so the worker index and config stay unread.
+            const tree = path.resolve(source);
+            await git(trusted, ['read-tree', head]);
+            await git(trusted, ['--work-tree=' + tree, 'add', '-A', '.']);
+            const written = await git(trusted, ['write-tree']);
+            candidate = await git(trusted, ['-c', 'user.name=Factory', '-c', 'user.email=factory@localhost', 'commit-tree', written, '-p', head, '-m', 'Commit uncommitted worker changes']);
+        }
         await git(trusted, ['merge-base', '--is-ancestor', base, candidate]);
         const files = (await git(trusted, ['diff', '--name-only', '--no-ext-diff', '--no-textconv', '--no-renames', '-z', base, candidate])).split('\0').filter(Boolean);
         if (!files.length)
