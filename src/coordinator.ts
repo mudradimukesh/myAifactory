@@ -302,7 +302,7 @@ async function clarificationStep(store: Store, s: State, runtime: LocalRuntime, 
             target.answerAttemptId = jobId; target.admitted = admitted; target.digest = outcome.attempt.handoff!.sha256;
         });
     }
-    if (current.round === 1 && side === 'developer') {
+    if (current.round === 1) {
         if (spent >= limit) return store.transition(run, 'awaiting_input', 'Clarification unresolved');
         const priorClarification = clarificationSchema.parse(parseJsonText(await readFile(await within(store.dir(run), s.attempts.find(a => a.id === current.clarifyAttemptId)!.handoff!.path), 'utf8')));
         const priorAnswer = answerSchema.parse(parseJsonText(await readFile(await within(store.dir(run), s.attempts.find(a => a.id === current.answerAttemptId)!.handoff!.path), 'utf8')));

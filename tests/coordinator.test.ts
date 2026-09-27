@@ -787,7 +787,32 @@ test('the default clarification budget covers a corrected developer round and th
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a rejected tester assumption stops after one clarification round', { timeout: 30000 }, async () => {
+test('a corrected tester gets a second clarification round and then tests', { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        f.project.limits.maxClarificationJobs = 8;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        class CorrectedTesterRuntime extends FakeRuntime {
+            override async execute(job: Job) {
+                const result = await super.execute(job);
+                if (job.id === 'answer-architect-tester-1') {
+                    const text = JSON.stringify({ schemaVersion: 1, answers: [{ id: 'tq1', verdict: 'wrong', correction: 'Cover the failure case too' }] });
+                    await writeFile(path.join(job.captureDir, 'stdout.log'), codexOutput(text));
+                }
+                return result;
+            }
+        }
+        const runtime = new CorrectedTesterRuntime();
+        const final = await runRun(f.store, 'run', runtime);
+        assert.equal(final.status, 'handoff_ready', final.reason);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-tester')), ['clarify-tester-1', 'clarify-tester-r2']);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect-tester')), ['answer-architect-tester-1', 'answer-architect-tester-r2']);
+        assert.match(runtime.prompts.get('clarify-tester-r2')!, /Cover the failure case too/);
+        assert.ok(runtime.calls.some(id => id.startsWith('tester-')));
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('a tester still rejected after the second round stops without testing', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxClarificationJobs = 8;
@@ -806,10 +831,8 @@ test('a rejected tester assumption stops after one clarification round', { timeo
         const final = await runRun(f.store, 'run', runtime);
         assert.equal(final.status, 'awaiting_input');
         assert.equal(final.reason, 'Clarification unresolved');
-        assert.equal(final.clarification?.tester?.admitted, false);
-        assert.equal(final.clarification?.tester?.round, 1);
-        assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-tester')), ['clarify-tester-1']);
-        assert.deepEqual(runtime.calls.filter(id => id.startsWith('answer-architect-tester')), ['answer-architect-tester-1']);
+        assert.equal(final.clarification?.tester?.round, 2);
+        assert.deepEqual(runtime.calls.filter(id => id.startsWith('clarify-tester')), ['clarify-tester-1', 'clarify-tester-r2']);
         assert.deepEqual(runtime.calls.filter(id => id.startsWith('tester-')), []);
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
