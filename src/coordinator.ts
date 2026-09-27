@@ -7,7 +7,7 @@ import { FactoryProfiles, defaultFactory, runFactory, workerPolicy } from './fac
 import { buildRunHandoff } from './run-handoff.ts';
 import { check as checkSchema, choice, id, projectSchema, reviewSchema, meterReadingSchema, handoffSchema, clarificationSchema, answerSchema, isClarificationJob } from './contracts.ts';
 import type { Attempt, Check, MeterReading, Project, Result, Role, Segment, State, WorkerChoice } from './contracts.ts';
-import { checkout, cleanRepository, createStore, git, importCandidate, treeDigest } from './git.ts';
+import { checkout, cleanRepository, createStore, EmptyCandidate, git, importCandidate, treeDigest } from './git.ts';
 import { contextMax, handoffTrigger } from './model-context.ts';
 import { PauseGate, groupMembers, groupStopped, identify, isOwnedAlive, terminateOwnedBatch } from './process.ts';
 import { LocalRuntime, workerHome } from './runtime.ts';
@@ -164,9 +164,11 @@ function budget(s: State, role: Role) {
 }
 
 // CLI structured-output engines reject bound keywords; zod still enforces every bound when the result is parsed.
+// OpenAI strict mode also requires every property to be listed, so optional fields must be nullish in the contract.
 const unenforced = new Set(['$schema', 'minLength', 'maxLength', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'minItems', 'maxItems']);
 function outputSchema(schema: z.ZodTypeAny): string {
-    return JSON.stringify(zodToJsonSchema(schema, { $refStrategy: 'none' }), (key, value) => unenforced.has(key) ? undefined : value);
+    return JSON.stringify(zodToJsonSchema(schema, { $refStrategy: 'none' }), (key, value) => unenforced.has(key) ? undefined
+        : value && typeof value === 'object' && value.properties && !Array.isArray(value) ? { ...value, required: Object.keys(value.properties) } : value);
 }
 
 function parseJsonText(text: string): unknown {
@@ -262,7 +264,7 @@ async function clarificationBlock(store: Store, s: State, side: 'developer' | 't
  */
 async function clarificationStep(store: Store, s: State, runtime: LocalRuntime, side: 'developer' | 'tester', task: Proposal['tasks'][number], control: RunControl | undefined): Promise<State> {
     const run = s.id;
-    const limit = s.project.limits.maxClarificationJobs ?? 4;
+    const limit = s.project.limits.maxClarificationJobs ?? 8; // two sides, two rounds, question plus answer
     const spent = s.attempts.filter(a => isClarificationJob(a.id)).length;
     const clarifyBase = side === 'developer' ? 'clarify-developer' : 'clarify-tester';
     const answerBase = side === 'developer' ? 'answer-architect' : 'answer-architect-tester';
@@ -274,9 +276,10 @@ async function clarificationStep(store: Store, s: State, runtime: LocalRuntime, 
         const jobId = await nextAttemptId(store, s, `${clarifyBase}-1`);
         const outcome = await roleJob(store, s, runtime, side, jobId, clarifyPrompt(side, task), source, true, undefined, control, clarificationSchema);
         if (!outcome.passed) return store.transition(run, 'awaiting_input', outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `${label} clarification failed or usage unknown`);
-        clarificationSchema.parse(parseJsonText(outcome.text));
-        return store.update(run, 'clarification_recorded', { jobId, role: side, round: 1 }, state => {
-            state.clarification = { ...(state.clarification ?? {}), [side]: { round: 1, clarifyAttemptId: jobId, admitted: false } };
+        // A worker with no questions has nothing for the architect to answer, so it is admitted as is.
+        const admitted = clarificationSchema.parse(parseJsonText(outcome.text)).questions.length === 0;
+        return store.update(run, 'clarification_recorded', { jobId, role: side, round: 1, admitted }, state => {
+            state.clarification = { ...(state.clarification ?? {}), [side]: { round: 1, clarifyAttemptId: jobId, admitted, ...(admitted ? { noQuestions: true as const } : {}) } };
         });
     }
     if (!current.answerAttemptId) {
@@ -457,8 +460,15 @@ async function runSegment(store: Store, s: State, runtime: LocalRuntime, role: R
     await poll();
     const stdout = await readFile(path.join(job.captureDir, 'stdout.log'), 'utf8');
     const parsed = parseWorkerOutput(provider, stdout);
-    const usageKnown = parsed.inputTokens !== null && parsed.cachedInputTokens !== null && parsed.outputTokens !== null;
-    const usage = usageKnown ? { input: parsed.inputTokens!, cached: parsed.cachedInputTokens!, output: parsed.outputTokens! } : tracked.lastReading?.usage ?? null;
+    // A worker whose output holds only session bookkeeping and errors got no model response, so it used nothing.
+    const bookkeeping = new Set(['thread.started', 'turn.started', 'turn.failed', 'error']);
+    const neverStarted = completed.reason === 'completed' && stdout.split('\n').every(line => {
+        if (!line.trim()) return true;
+        try { const e = JSON.parse(line); return bookkeeping.has(e.type) || (e.type === 'item.completed' && e.item?.type === 'error'); } catch { return false; }
+    });
+    const usageKnown = neverStarted || (parsed.inputTokens !== null && parsed.cachedInputTokens !== null && parsed.outputTokens !== null);
+    const usage = neverStarted ? { input: 0, cached: 0, output: 0 }
+        : usageKnown ? { input: parsed.inputTokens!, cached: parsed.cachedInputTokens!, output: parsed.outputTokens! } : tracked.lastReading?.usage ?? null;
     const raw = usageKnown ? parsed.raw : tracked.lastReading?.raw ?? null;
     const metered = usage ? meteredTokens(usage) : null;
     const source: Segment['source'] = usageKnown ? 'final' : 'meter';
@@ -832,7 +842,11 @@ async function stepUnlocked(store: Store, run: string, runtime: LocalRuntime, co
             outcome.reason === 'stall_start' || outcome.reason === 'stall_idle' ? outcome.reason : `Tester attempt failed: ${outcome.reason}`);
         let imported;
         try { imported = await importCandidate(candidateStore(store, run), path.join(evidenceDir(store, run, jobId), 'source'), s.candidate, s.project.allowedPaths); }
-        catch (error) { return store.transition(run, 'changes_requested', `Tester candidate import rejected: ${String(error)}`); }
+        catch (error) {
+            // A clean tester checkout at the developer candidate means the tester found no tests to add.
+            if (error instanceof EmptyCandidate) return store.transition(run, 'verifying', 'Tester added no tests; developer candidate kept');
+            return store.transition(run, 'changes_requested', `Tester candidate import rejected: ${String(error)}`);
+        }
         return store.update(run, 'candidate_imported', imported, state => { state.candidate = imported.candidate; state.candidateReferences = { candidate: imported.candidate, referenceImageHashes: referenceHashes(state) }; state.checks = []; move(state, 'verifying', 'Tester candidate imported'); });
     }
     if (s.status === 'verifying') {

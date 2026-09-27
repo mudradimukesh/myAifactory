@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { ClaudeLogin } from './claude-login.ts';
 import { CollaborationError, Dashboard, FactoryConflict, LaunchFailed, StaleRevision, StopIncomplete } from './dashboard.ts';
 import { ReferenceConflict, ReferenceImageInvalid } from './store.ts';
+import { DirtyRepository } from './git.ts';
 import { FactoryRevisionConflict } from './factory-profiles.ts';
 import { AgentChat, ChatUnavailable } from './agent-chat.ts';
 
@@ -151,6 +152,7 @@ export function createDashboardServer(root: string, dashboard = new Dashboard(ro
       return failure(res, 404, 'not_found', 'This dashboard path does not exist.', 'Use the navigation in the dashboard.');
     } catch (error) {
       if (error instanceof FactoryRevisionConflict) return failure(res, 409, 'factory_revision_conflict', error.message, 'Reload the factory before saving.');
+      if (error instanceof DirtyRepository) return failure(res, 409, 'repository_dirty', 'The project repository has uncommitted changes.', 'Commit, stash or ignore them, then create the run again.');
       if (error instanceof ReferenceConflict) return failure(res, 409, 'reference_conflict', error.message, 'Reload the reference images and retry.');
       if (error instanceof ReferenceImageInvalid) return failure(res, 415, 'unsupported_image', error.message, 'Choose a PNG or JPEG image.');
       if (error instanceof ChatUnavailable) return failure(res, 409, 'chat_unavailable', error.message, 'Select a quiescent run with a Claude role and retry.');
@@ -163,6 +165,7 @@ export function createDashboardServer(root: string, dashboard = new Dashboard(ro
       if (error instanceof z.ZodError || error instanceof SyntaxError || error instanceof TypeError || error instanceof Error && /^(Invalid GitHub token format|Credentials must be one line)$/.test(error.message))
         return failure(res, 400, 'invalid_input', 'The submitted values are invalid.', error instanceof z.ZodError ? error.issues.map(x => x.path.length ? `${x.path.join('.')}: ${x.message}` : x.message).join('; ') : 'Review the form values and retry.');
       if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return failure(res, 404, 'run_not_found', 'The requested run or record does not exist.', 'Refresh the dashboard.');
+      process.stderr.write(`Dashboard ${req.method} ${req.url}: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
       return failure(res, 500, 'record_unavailable', 'The requested record could not be read safely.', 'Inspect the local state files before trying another action.');
     }
   });

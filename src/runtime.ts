@@ -61,7 +61,7 @@ export function sandboxProfile(read: string[], write: string[], network: Job['ne
         `(allow file-read* (literal "/") ${paths([...systemRoots, ...read])} (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom"))`,
         `(allow file-write* (literal "/dev/null") ${paths(write)})`,
         temp ? `(allow network-bind network-inbound network-outbound (subpath ${JSON.stringify(temp)}))` : '',
-        network === 'none' ? '' : '(allow mach-lookup (global-name "com.apple.bsd.dirhelper") (global-name "com.apple.system.opendirectoryd") (global-name "com.apple.SystemConfiguration.configd") (global-name "com.apple.networkd") (global-name "com.apple.dnssd.service") (global-name "com.apple.trustd"))',
+        network === 'none' ? '' : '(allow mach-lookup (global-name "com.apple.bsd.dirhelper") (global-name "com.apple.system.opendirectoryd") (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.SystemConfiguration.configd") (global-name "com.apple.networkd") (global-name "com.apple.dnssd.service") (global-name "com.apple.trustd"))',
         network === 'outbound' ? '(allow network-outbound (remote ip "*:*") (literal "/private/var/run/mDNSResponder"))' : '',
         network === 'none' ? '' : '(allow network-bind (local ip "localhost:*")) (allow network-inbound (local ip "localhost:*")) (allow network-outbound (remote ip "localhost:*"))',
     ].filter(Boolean).join('\n');
@@ -214,7 +214,10 @@ export async function validateAuthHome(provider: 'codex' | 'claude', home: strin
     const root = await directory(home);
     const filename = provider === 'codex' ? 'auth.json' : '.credentials.json';
     for (const file of await readdir(root)) {
-        if (file !== filename || !(await lstat(path.join(root, file))).isFile())
+        const info = await lstat(path.join(root, file));
+        // codex login leaves its own log/ and tmp/ scratch directories behind
+        if (provider === 'codex' && (file === 'log' || file === 'tmp') && info.isDirectory()) continue;
+        if (file !== filename || !info.isFile())
             throw Error(`The ${provider} auth home must contain credentials only, without settings or plugins`);
     }
     const file = path.join(root, filename);

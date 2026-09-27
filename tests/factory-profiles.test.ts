@@ -230,6 +230,11 @@ test('HTTP factory editor persists agent copies, enforces CSRF and creates selec
         assert.equal((await request('/api/factories/ui-design/agents/developer', { revision: 1, skills: agent.skills }, 'PUT')).status, 200);
         assert.equal((await request('/api/factories/ui-design/agents/developer', { revision: 1, skills: agent.skills }, 'PUT')).status, 409);
         assert.equal((await request('/api/settings', { ...await f.dashboard.settings(), factoryId: 'ui-design' }, 'PUT')).status, 200);
+        await writeFile(path.join(f.project.repository, 'stray.txt'), 'x');
+        const dirty = await request('/api/runs', { id: 'dirty', project: f.project, approval });
+        assert.equal(dirty.status, 409);
+        assert.match((await dirty.json()).message, /uncommitted changes/);
+        await rm(path.join(f.project.repository, 'stray.txt'));
         const run = await request('/api/runs', { id: 'from-ui', project: f.project, approval }); assert.equal(run.status, 201);
         const state = await f.store.read('from-ui'); assert.equal(state.project.factoryId, 'ui-design');
         const saved = await (await fetch(base + '/api/runs/from-ui/skills')).json();

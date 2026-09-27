@@ -76,12 +76,12 @@ export const transitions: Record<Status, Status[]> = {
 };
 export const clarificationSchema = z.object({
     schemaVersion: z.literal(1),
-    questions: z.array(z.object({ id, prompt: z.string().min(1), assumption: z.string().min(1) }).strict()).min(1).max(20),
+    questions: z.array(z.object({ id, prompt: z.string().min(1), assumption: z.string().min(1) }).strict()).max(20),
 }).strict();
 export type Clarification = z.infer<typeof clarificationSchema>;
 export const answerSchema = z.object({
     schemaVersion: z.literal(1),
-    answers: z.array(z.object({ id, verdict: z.enum(['correct', 'wrong']), correction: z.string().min(1).optional() }).strict()).min(1),
+    answers: z.array(z.object({ id, verdict: z.enum(['correct', 'wrong']), correction: z.string().min(1).nullish() }).strict()).min(1),
 }).strict().superRefine((v, c) => {
     for (const a of v.answers)
         if (a.verdict === 'wrong' && !a.correction)
@@ -90,7 +90,7 @@ export const answerSchema = z.object({
 export type Answer = z.infer<typeof answerSchema>;
 const clarificationSideSchema = z.object({
     round: z.union([z.literal(1), z.literal(2)]), clarifyAttemptId: id, answerAttemptId: id.optional(),
-    admitted: z.boolean(), digest: digest.optional(),
+    admitted: z.boolean(), digest: digest.optional(), noQuestions: z.literal(true).optional(),
 }).strict();
 export type ClarificationSide = z.infer<typeof clarificationSideSchema>;
 export const reviewSchema = z.object({ schemaVersion: z.literal(1), candidate: commit, specDigest: digest, referenceImageHashes: z.array(digest).max(5).optional(), referenceObservations: z.array(z.object({ sha256: digest, read: z.boolean(), observation: z.string().trim().min(1) }).strict()).max(5).optional(), requirements: z.array(id), verdict: z.enum(['pass', 'changes_requested']), findings: z.array(z.object({ severity: z.enum(['blocking', 'minor']), requirement: id, message: z.string().min(1), evidence: z.string().min(1) }).strict()) }).strict();
@@ -235,7 +235,7 @@ export const stateSchema = baseStateSchema.superRefine((v, c) => {
         if (!side) continue;
         if (!v.attempts.some(a => a.id === side.clarifyAttemptId) || (side.answerAttemptId && !v.attempts.some(a => a.id === side.answerAttemptId)))
             c.addIssue({ code: 'custom', message: 'Unknown clarification attempt reference' });
-        if (side.admitted && !side.answerAttemptId)
+        if (side.admitted && !side.answerAttemptId && !side.noQuestions)
             c.addIssue({ code: 'custom', message: 'An admitted clarification requires an answer' });
     }
 });

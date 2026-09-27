@@ -827,7 +827,6 @@ import { renderFactories, showObservedSkills, showRunHandoff } from './factories
   }
 
   function navigate(page) {
-    state.page = page;
     history.pushState({ page }, '', `#${page}`);
     showPage(page);
   }

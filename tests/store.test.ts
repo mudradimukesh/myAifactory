@@ -124,3 +124,13 @@ test('a record writer waits out the lock left by a killed holder', async () => {
     assert.equal(state.status, 'ready');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('run listing ignores directories without run state, such as the Headroom workspace', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'factory-store-list-'));
+    try {
+        await mkdir(path.join(root, 'headroom', 'logs'), { recursive: true });
+        await mkdir(path.join(root, 'real'));
+        await writeFile(path.join(root, 'real', 'state.json'), '{}');
+        assert.deepEqual(await new Store(root).runs(), ['real']);
+    } finally { await rm(root, { recursive: true, force: true }); }
+});

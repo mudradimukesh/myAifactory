@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { sha, relativePath, within, exists } from './store.ts';
 const exec = promisify(execFile);
+export class DirtyRepository extends Error {}
+export class EmptyCandidate extends Error {}
 export async function git(cwd: string, args: string[]) {
     const { stdout } = await exec('git', ['--no-replace-objects', '-c', `safe.directory=${cwd}`, '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'maintenance.auto=false', '-c', 'protocol.file.allow=always', '-c', 'protocol.ext.allow=never', ...args], { cwd, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30000, env: { PATH: process.env.PATH, LANG: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1' } });
     return args.includes("-z") ? stdout : stdout.trim();
@@ -65,7 +67,7 @@ async function requireClean(trusted: string, repository: string, head: string) {
     // A fresh trusted index and empty config prevent worker filters/index flags
     // from changing cleanliness. Repository attributes may normalize data only.
     if (await git(trusted, ['--work-tree=' + path.resolve(repository), 'status', '--porcelain', '--untracked-files=all']))
-        throw Error('Candidate has staged, unstaged, or untracked changes');
+        throw new DirtyRepository('Candidate has staged, unstaged, or untracked changes');
     // The worker index is data too. Read it under trusted configuration to catch
     // staged edits even if the working tree was put back to HEAD afterward.
     const index = await within(path.join(repository, '.git'), 'index');
@@ -114,7 +116,7 @@ export async function importCandidate(store: string, source: string, base: strin
         await git(trusted, ['merge-base', '--is-ancestor', base, candidate]);
         const files = (await git(trusted, ['diff', '--name-only', '--no-ext-diff', '--no-textconv', '--no-renames', '-z', base, candidate])).split('\0').filter(Boolean);
         if (!files.length)
-            throw Error('Candidate contains no implementation change');
+            throw new EmptyCandidate('Candidate contains no implementation change');
         for (const file of files) {
             relativePath(file);
             if (!allowed(file, allowedPaths))

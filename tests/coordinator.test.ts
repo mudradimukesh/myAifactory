@@ -36,6 +36,8 @@ class FakeRuntime extends LocalRuntime {
     proposedReviewerModel?: WorkerChoice;
     reviewReferenceHashes?: string[];
     reviewObservations?: { sha256: string; read: boolean; observation: string }[];
+    testerAddsNothing = false;
+    developerHasNoQuestions = false;
     override async preflight() { return []; }
     override async execute(job: Job): Promise<Awaited<ReturnType<LocalRuntime['execute']>>> {
         this.calls.push(job.id);
@@ -52,6 +54,7 @@ class FakeRuntime extends LocalRuntime {
         if (job.id.startsWith('plan-architect')) text = proposal('developer', job.project.models.developer);
         else if (job.id.startsWith('plan-tester')) text = proposal('reviewer', this.proposedReviewerModel ?? job.project.models.reviewer);
         else if (job.id.startsWith('clarify-tester')) text = JSON.stringify({ schemaVersion: 1, questions: [{ id: 'tq1', prompt: 'Which behavior should the test cover?', assumption: 'The happy path in src/app.txt' }] });
+        else if (job.id.startsWith('clarify-developer') && this.developerHasNoQuestions) text = JSON.stringify({ schemaVersion: 1, questions: [] });
         else if (job.id.startsWith('clarify-developer')) text = JSON.stringify({ schemaVersion: 1, questions: [{ id: 'q1', prompt: 'Which module owns this?', assumption: 'src/app.txt' }] });
         else if (job.id.startsWith('answer-architect-tester')) text = JSON.stringify({ schemaVersion: 1, answers: [{ id: 'tq1', verdict: 'correct' }] });
         else if (job.id.startsWith('answer-architect')) text = JSON.stringify({ schemaVersion: 1, answers: [{ id: 'q1', verdict: 'correct' }] });
@@ -61,7 +64,8 @@ class FakeRuntime extends LocalRuntime {
             await git(job.workspace, ['add', '.']);
             await git(job.workspace, ['commit', '-m', 'Fix approved behavior']);
             text = 'Implemented and committed';
-        } else if (job.id.startsWith('tester-')) {
+        } else if (job.id.startsWith('tester-') && this.testerAddsNothing) text = 'Verified; existing tests cover the fix';
+        else if (job.id.startsWith('tester-')) {
             await mkdir(path.join(job.workspace, 'src'), { recursive: true });
             await appendFile(path.join(job.workspace, 'src', 'app.test.txt'), `test for ${job.id}\n`);
             await git(job.workspace, ['add', '.']);
@@ -668,6 +672,14 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
         assert.deepEqual(JSON.parse(runtime.schemas.get('plan-architect')!).required, ['schemaVersion', 'tasks']);
         assert.ok(JSON.parse(runtime.schemas.get('review-1')!).required.includes('verdict'));
         assert.doesNotMatch(runtime.schemas.get('plan-architect')!, /minLength|minItems|maximum|\$schema/);
+        // OpenAI strict structured output rejects any object whose required list omits a property.
+        const strict = (node: unknown, at: string): void => {
+            if (!node || typeof node !== 'object') return;
+            const o = node as { properties?: Record<string, unknown>; required?: string[] };
+            if (o.properties) assert.deepEqual([...(o.required ?? [])].sort(), Object.keys(o.properties).sort(), at);
+            for (const [k, v] of Object.entries(node)) strict(v, `${at}.${k}`);
+        };
+        for (const [job, schema] of runtime.schemas) strict(JSON.parse(schema), job);
         assert.equal(final.attempts.length, 9);
         assert.equal(final.checks.length, 2);
         assert.equal(final.reportedTokens, 180);
@@ -753,6 +765,25 @@ test('a repeat clarification round still unresolved ends in awaiting_input', { t
         const secondClarifyPrompt = runtime.prompts.get('clarify-developer-r2')!;
         assert.match(secondClarifyPrompt, /Round 1 corrections/);
         assert.match(secondClarifyPrompt, /Use src\/other\.txt instead/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('the default clarification budget covers a corrected developer round and the tester round', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        class CorrectedOnceRuntime extends FakeRuntime {
+            override async execute(job: Job) {
+                const result = await super.execute(job);
+                if (job.id === 'answer-architect-1')
+                    await writeFile(path.join(job.captureDir, 'stdout.log'), codexOutput(JSON.stringify({ schemaVersion: 1, answers: [{ id: 'q1', verdict: 'wrong', correction: 'Use src/other.txt instead' }] })));
+                return result;
+            }
+        }
+        const runtime = new CorrectedOnceRuntime();
+        let state = await stepRun(f.store, 'run', runtime);
+        for (let i = 0; i < 30 && !runtime.calls.some(id => id.startsWith('tester-')) && state.status !== 'awaiting_input'; i++) state = await stepRun(f.store, 'run', runtime);
+        assert.ok(runtime.calls.includes('answer-architect-tester-1'), state.reason);
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
@@ -934,6 +965,38 @@ test('a failed mandatory check moves to changes_requested without running the re
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
+test('a developer with no clarifying questions starts work without an architect answer', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FakeRuntime();
+        runtime.developerHasNoQuestions = true;
+        let state = await stepRun(f.store, 'run', runtime);
+        for (let i = 0; i < 20 && !runtime.calls.some(id => id.startsWith('developer-')) && state.status !== 'awaiting_input'; i++) state = await stepRun(f.store, 'run', runtime);
+        assert.ok(runtime.calls.some(id => id.startsWith('developer-')), state.reason);
+        assert.equal(runtime.calls.some(id => id.startsWith('answer-architect-1')), false);
+        assert.equal(state.clarification?.developer?.admitted, true);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('a tester that adds no tests keeps the developer candidate and continues to checks', { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FakeRuntime();
+        runtime.testerAddsNothing = true;
+        let state = await stepRun(f.store, 'run', runtime);
+        let developerCandidate: string | undefined;
+        for (let i = 0; i < 20 && !runtime.calls.some(id => id.startsWith('check-')) && state.status !== 'changes_requested'; i++) {
+            if (state.status === 'candidate') developerCandidate = state.candidate;
+            state = await stepRun(f.store, 'run', runtime);
+        }
+        assert.equal(state.reworks, 0, state.reason);
+        assert.ok(runtime.calls.some(id => id.startsWith('check-')), state.reason);
+        assert.equal(state.candidate, developerCandidate);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
 test('reset retries a failed planner with fresh evidence and dispatches the fixture workflow', { timeout: 10000 }, async () => {
     const f = await fixture();
     try {
@@ -1058,6 +1121,28 @@ test('unknown worker usage persists as a failed attempt and stops dispatch', { t
         assert.equal(meter.raw, null);
         assert.equal(state.attempts[0].segments?.[0].metered, null);
         assert.deepEqual(runtime.calls, ['plan-architect']);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+for (const [name, stdout] of [
+    ['exits silently', ''],
+    ['has its request rejected', [{ type: 'thread.started', thread_id: 't1' }, { type: 'item.completed', item: { id: 'item_0', type: 'error', message: 'warning' } },
+        { type: 'turn.started' }, { type: 'error', message: 'invalid_json_schema' }, { type: 'turn.failed', error: { message: 'invalid_json_schema' } }].map(e => JSON.stringify(e)).join('\n')],
+] as const) test(`a worker that ${name} before any model output counts as zero usage`, { timeout: 10000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        class CrashRuntime extends FakeRuntime {
+            override async execute(job: Job) {
+                const result = await super.execute(job);
+                await writeFile(path.join(job.captureDir, 'stdout.log'), stdout);
+                return { ...result, exitCode: 1 };
+            }
+        }
+        const state = await stepRun(f.store, 'run', new CrashRuntime());
+        assert.equal(state.unknownUsage, false);
+        assert.equal(state.attempts[0]?.status, 'failed');
+        assert.equal(state.attempts[0].segments?.[0].metered, 0);
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 

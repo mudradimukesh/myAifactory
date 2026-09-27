@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile, symlink, realpath } from 'node
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { LocalRuntime, validateAuthHome, workerHome } from '../src/runtime.ts';
+import { LocalRuntime, sandboxProfile, validateAuthHome, workerHome } from '../src/runtime.ts';
 import type { Job } from '../src/runtime.ts';
 import { projectSchema } from '../src/contracts.ts';
 
@@ -114,6 +114,9 @@ test('native runtime copies only dedicated credentials and returns a refreshed c
     assert.equal(result.reason, 'completed');
     assert.deepEqual(JSON.parse(await readFile(path.join(job.captureDir, 'stdout.log'), 'utf8')), { mode: 'chatgpt', denied: true });
     assert.equal(await readFile(path.join(auth, 'auth.json'), 'utf8'), refreshed, 'the next attempt must start from the rotated credential');
+    await mkdir(path.join(auth, 'log'));
+    await mkdir(path.join(auth, 'tmp'));
+    await validateAuthHome('codex', auth);
     await writeFile(path.join(auth, 'config.toml'), 'unapproved');
     await assert.rejects(validateAuthHome('codex', auth), /credentials only/);
   });
@@ -188,4 +191,13 @@ test('deep attempt paths retain private Unix IPC and remove temporary files afte
     await assert.rejects(readFile(path.join(output.temp, 'worker.sock')), { code: 'ENOENT' });
     await assert.rejects(realpath(output.temp), { code: 'ENOENT' });
   });
+});
+
+// Codex 0.157 resolves the current user while loading managed preferences; without libinfo it fails at thread/start.
+test('networked sandboxes can resolve the current user', { skip: process.platform !== 'darwin' }, async () => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const { userInfo } = await import('node:os');
+    const { stdout } = await promisify(execFile)('/usr/bin/sandbox-exec', ['-p', sandboxProfile([], [], 'loopback'), '/usr/bin/id', '-un']);
+    assert.equal(stdout.trim(), userInfo().username);
 });

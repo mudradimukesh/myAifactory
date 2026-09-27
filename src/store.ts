@@ -386,7 +386,9 @@ export class Store {
     }
     async transition(run: string, next: Status, reason: string) { return this.update(run, 'transition', { next, reason }, s => { move(s, next, reason); }); }
     async runs() { if (!await exists(this.root))
-        return []; return (await readdir(this.root, { withFileTypes: true })).filter(x => x.isDirectory() && idSchema.safeParse(x.name).success).map(x => x.name); }
+        return []; const names = (await readdir(this.root, { withFileTypes: true })).filter(x => x.isDirectory() && idSchema.safeParse(x.name).success).map(x => x.name);
+        // A directory without state.json is a crashed creation or another tool's workspace (Headroom), not a run.
+        const runs: string[] = []; for (const name of names) if (await exists(path.join(this.root, name, 'state.json'))) runs.push(name); return runs; }
 }
 export function move(s: State, next: Status, reason: string) {
     if (!transitions[s.status].includes(next))

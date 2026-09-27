@@ -136,7 +136,7 @@ export async function renderFactories(context) {
     const factorySelect = control('select');
     options(factorySelect, listing.factories.map(factory => [factory.id, factory.name]), selectedFactory);
     factorySelect.addEventListener('change', () => { selectedFactory = factorySelect.value; renderFactories(context); });
-    chooser.append(field('Factory', factorySelect));
+    if (listing.factories.length) chooser.append(field('Factory', factorySelect));
     const use = button(settings.factoryId === selectedFactory ? 'Selected for new runs' : 'Use for new runs', async () => {
       use.disabled = true;
       try {
@@ -147,7 +147,7 @@ export async function renderFactories(context) {
       } catch (error) { notice.textContent = error.message; use.disabled = false; }
     });
     use.disabled = !selectedFactory || settings.factoryId === selectedFactory;
-    chooser.append(use);
+    if (listing.factories.length) chooser.append(use);
     const create = el('details');
     create.open = Boolean(selectedHandoff);
     create.append(el('summary', 'Create factory'));
@@ -171,7 +171,31 @@ export async function renderFactories(context) {
     create.append(createButton);
     chooser.append(create);
     page.append(chooser);
-    if (!selectedFactory) return;
+    const appendRunPanel = () => {
+      const run = panel('Create run', 'Uses the factory selected for new runs. Supply an approved project JSON with its checks and execution configuration.');
+      const runId = control('input');
+      const project = control('textarea'); project.rows = 8;
+      const owner = control('input');
+      const statement = control('textarea');
+      const referenceImageHashes = control('input');
+      const runStatus = el('p', '', 'form-status'); runStatus.setAttribute('role', 'status');
+      run.append(el('p', `Selected factory: ${settings.factoryId || 'General software factory (default)'}`), field('Run ID', runId), field('Approved project JSON', project), field('Reference image hashes', referenceImageHashes, 'Comma-separated hashes from the saved reference images.'), field('Approval owner', owner), field('Approval statement', statement));
+      const start = button('Create run', async () => {
+        start.disabled = true;
+        try {
+          if ([...drafts.values()].some(item => item.dirty)) throw new Error('Save or discard unsaved agent skill changes before creating a run.');
+          const hashes = referenceImageHashes.value.split(',').map(value => value.trim()).filter(Boolean);
+          await api('/api/runs', { method: 'POST', body: JSON.stringify({ id: runId.value.trim(), project: JSON.parse(project.value), referenceImageHashes: hashes, approval: { owner: owner.value.trim(), statement: statement.value.trim() } }) });
+          await onRun(runId.value.trim());
+        } catch (error) { runStatus.textContent = error.message; start.disabled = false; }
+      }, true);
+      run.append(runStatus, start); page.append(run);
+    };
+    if (!selectedFactory) {
+      chooser.append(el('p', 'No saved factories yet. New runs use the General software factory until you create one.', 'field-help'));
+      appendRunPanel();
+      return;
+    }
     const result = await api(`/api/factories/${encodeURIComponent(selectedFactory)}`);
     if (!page.isConnected) return;
     const factory = result.factory;
@@ -261,23 +285,6 @@ export async function renderFactories(context) {
     source.append(field('Search source skills', search), results);
     editor.append(source);
     page.append(editor);
-    const run = panel('Create run', 'Uses the factory selected for new runs. Supply an approved project JSON with its checks and execution configuration.');
-    const runId = control('input');
-    const project = control('textarea'); project.rows = 8;
-    const owner = control('input');
-    const statement = control('textarea');
-    const referenceImageHashes = control('input');
-    const runStatus = el('p', '', 'form-status'); runStatus.setAttribute('role', 'status');
-    run.append(el('p', `Selected factory: ${settings.factoryId || 'default'}`), field('Run ID', runId), field('Approved project JSON', project), field('Reference image hashes', referenceImageHashes, 'Comma-separated hashes from the saved reference images.'), field('Approval owner', owner), field('Approval statement', statement));
-    const start = button('Create run', async () => {
-      start.disabled = true;
-      try {
-        if ([...drafts.values()].some(item => item.dirty)) throw new Error('Save or discard unsaved agent skill changes before creating a run.');
-        const hashes = referenceImageHashes.value.split(',').map(value => value.trim()).filter(Boolean);
-        await api('/api/runs', { method: 'POST', body: JSON.stringify({ id: runId.value.trim(), project: JSON.parse(project.value), referenceImageHashes: hashes, approval: { owner: owner.value.trim(), statement: statement.value.trim() } }) });
-        await onRun(runId.value.trim());
-      } catch (error) { runStatus.textContent = error.message; start.disabled = false; }
-    }, true);
-    run.append(runStatus, start); page.append(run);
+    appendRunPanel();
   } catch (error) { notice.textContent = error.message; }
 }
