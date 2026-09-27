@@ -727,7 +727,7 @@ export class Dashboard {
     const done = async (changed: boolean, message: string) => ({ factory: await factoryView(await this.store.read(run), value => value, this.store.dir(run)), changed, message });
     if (input.action === 'reset') return this.store.lock(`launch-${run}`, async () => {
       const state = await this.store.read(run);
-      if (!resettable(state)) throw new FactoryConflict('Only failed, cancelled, or execution-stage awaiting runs can be reset.');
+      if (!resettable(state)) throw new FactoryConflict('Only failed, cancelled, execution-stage awaiting, or unknown-usage rework runs can be reset.');
       const liveSupervisor = state.supervisor?.process && await isOwnedAlive(state.supervisor.process);
       const liveJob = state.activeJob?.process && await isOwnedAlive(state.activeJob.process);
       const supervisorOrphans = state.supervisor && !liveSupervisor ? await groupMembers(state.supervisor.process.pgid) : [];
@@ -736,7 +736,7 @@ export class Dashboard {
         throw new FactoryConflict('Reset requires a quiescent run with no live or unconfirmed processes.');
       await this.store.update(run, 'factory_reset', { from: state.status }, current => {
         reset(current, 'Operator reset the run');
-        current.activeJob = undefined; current.supervisor = undefined; current.control = undefined; current.suspended = false; current.priorStatus = undefined;
+        current.activeJob = undefined; current.supervisor = undefined; current.control = undefined; current.suspended = false; current.priorStatus = undefined; current.unknownUsage = false;
       });
       return done(true, 'The run was reset and is ready to start.');
     });

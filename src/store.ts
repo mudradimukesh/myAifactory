@@ -407,11 +407,12 @@ export function move(s: State, next: Status, reason: string) {
  */
 export function resettable(s: State) {
     return s.status === 'failed' || s.status === 'cancelled'
+        || (s.status === 'changes_requested' && s.unknownUsage)
         || (s.status === 'awaiting_input' && ['ready', 'running', 'candidate', 'verifying'].includes(s.priorStatus ?? ''));
 }
 
 export function reset(s: State, reason: string) {
     if (!resettable(s)) throw Error(`Invalid reset from ${s.status}${s.priorStatus ? ` after ${s.priorStatus}` : ''}`);
-    s.status = s.status === 'awaiting_input' && s.priorStatus === 'candidate' ? 'candidate' : 'ready';
+    if (s.status !== 'changes_requested') s.status = s.status === 'awaiting_input' && s.priorStatus === 'candidate' ? 'candidate' : 'ready';
     s.reason = reason;
 }

@@ -940,6 +940,21 @@ test(`reset after an exhausted ${side} clarification budget grants a fresh budge
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
+test('reset clears unknown usage after a timed-out worker and keeps the rework state', { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        await f.store.update('run', 'job_finished', { jobId: 'developer-1', passed: false, reason: 'timeout' }, state => {
+            state.status = 'changes_requested'; state.reason = 'Developer attempt failed: timeout'; state.unknownUsage = true;
+        });
+        const dashboard = new Dashboard(path.join(f.root, 'state'));
+        assert.equal((await dashboard.control('run', { action: 'reset' })).changed, true);
+        const after = await f.store.read('run');
+        assert.equal(after.unknownUsage, false);
+        assert.equal(after.status, 'changes_requested');
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
 test('an old state.json without the clarification field still loads', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
