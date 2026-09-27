@@ -401,14 +401,17 @@ export function move(s: State, next: Status, reason: string) {
     s.reason = reason;
 }
 
-/** Reset returns failed, cancelled, or execution-stage awaiting_input runs to ready. */
+/**
+ * Reset returns failed, cancelled, or execution-stage awaiting_input runs to ready.
+ * A run paused at the candidate (tester clarification) keeps its candidate and returns to candidate.
+ */
 export function resettable(s: State) {
     return s.status === 'failed' || s.status === 'cancelled'
-        || (s.status === 'awaiting_input' && ['ready', 'running', 'verifying'].includes(s.priorStatus ?? ''));
+        || (s.status === 'awaiting_input' && ['ready', 'running', 'candidate', 'verifying'].includes(s.priorStatus ?? ''));
 }
 
 export function reset(s: State, reason: string) {
     if (!resettable(s)) throw Error(`Invalid reset from ${s.status}${s.priorStatus ? ` after ${s.priorStatus}` : ''}`);
-    s.status = 'ready';
+    s.status = s.status === 'awaiting_input' && s.priorStatus === 'candidate' ? 'candidate' : 'ready';
     s.reason = reason;
 }

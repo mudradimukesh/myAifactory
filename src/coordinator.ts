@@ -265,7 +265,9 @@ async function clarificationBlock(store: Store, s: State, side: 'developer' | 't
 async function clarificationStep(store: Store, s: State, runtime: LocalRuntime, side: 'developer' | 'tester', task: Proposal['tasks'][number], control: RunControl | undefined): Promise<State> {
     const run = s.id;
     const limit = s.project.limits.maxClarificationJobs ?? 8; // two sides, two rounds, question plus answer
-    const spent = s.attempts.filter(a => isClarificationJob(a.id)).length;
+    // An operator reset grants a fresh budget, so only jobs started after the last reset count.
+    const resetAt = s.history.findLast(e => e.type === 'factory_reset')?.at ?? '';
+    const spent = s.attempts.filter(a => isClarificationJob(a.id) && a.startedAt > resetAt).length;
     const clarifyBase = side === 'developer' ? 'clarify-developer' : 'clarify-tester';
     const answerBase = side === 'developer' ? 'answer-architect' : 'answer-architect-tester';
     const label = side === 'developer' ? 'Developer' : 'Tester';

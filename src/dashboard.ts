@@ -255,7 +255,7 @@ export async function factoryView(state: State, redact: (value: string) => strin
     state: factory,
     supervisor: state.supervisor ? { pid: state.supervisor.process.pid, launchedAt: state.supervisor.launchedAt } : null,
     activeJob: job ? { id: job.id, kind: job.kind, startedAt: job.startedAt, frozen: live && state.suspended } : null,
-    canStart: startable && !state.unknownUsage,
+    canStart: startable && !terminal(state.status) && !state.unknownUsage,
     canPause: factory === 'running' || factory === 'resuming' || ((factory === 'idle' || factory === 'exited') && state.control !== 'suspend'),
     canStop: factory !== 'terminal' || live || jobLive || orphans.length > 0 || supervisorOrphans.length > 0,
     canReset: resettable(state) && !state.activeJob && !live && !jobLive && !state.control && orphans.length === 0 && supervisorOrphans.length === 0,

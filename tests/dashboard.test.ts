@@ -750,6 +750,15 @@ test('reset is disabled and rejected during a visual-review wait', { timeout: 10
   assert.equal((await dashboard.store.read(state.id)).status, 'awaiting_input');
 });
 
+for (const status of ['handoff_ready', 'failed', 'cancelled'] as const)
+test(`start is disabled on a ${status} run`, { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), `factory-terminal-${status}-`)); roots.push(root);
+  const dashboard = new Dashboard(root), state = runState();
+  state.status = status; state.candidate = state.sourceBase; delete state.activeJob;
+  await dashboard.store.create(state);
+  assert.equal((await dashboard.snapshot()).runs[0]!.factory?.canStart, false);
+});
+
 for (const priorStatus of ['running', 'verifying'] as const)
 test(`reset accepts a stalled ${priorStatus} execution`, { timeout: 10000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), `factory-reset-${priorStatus}-`)); roots.push(root);

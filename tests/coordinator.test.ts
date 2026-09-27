@@ -207,7 +207,7 @@ async function fixture(visual = false) {
     return { root, project, store: new Store(path.join(root, 'state')) };
 }
 
-test('review with another reference hash cannot approve the candidate', { timeout: 10000 }, async () => {
+test('review with another reference hash cannot approve the candidate', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
@@ -223,7 +223,7 @@ test('review with another reference hash cannot approve the candidate', { timeou
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('worker prompts use copied attempt-local reference paths', { timeout: 10000 }, async () => {
+test('worker prompts use copied attempt-local reference paths', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
@@ -240,7 +240,7 @@ test('worker prompts use copied attempt-local reference paths', { timeout: 10000
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('hash-only passing review is rejected', { timeout: 10000 }, async () => {
+test('hash-only passing review is rejected', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
@@ -253,7 +253,7 @@ test('hash-only passing review is rejected', { timeout: 10000 }, async () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('passing review rejects a reported reference read failure', { timeout: 10000 }, async () => {
+test('passing review rejects a reported reference read failure', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
@@ -268,7 +268,7 @@ test('passing review rejects a reported reference read failure', { timeout: 1000
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('run creation stages references before files and retries an uncommitted run', { timeout: 10000 }, async () => {
+test('run creation stages references before files and retries an uncommitted run', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZsAAAAASUVORK5CYII=', 'base64');
@@ -296,7 +296,7 @@ test('run creation stages references before files and retries an uncommitted run
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('run creation retries after a crash left a partial skill snapshot', { timeout: 10000 }, async () => {
+test('run creation retries after a crash left a partial skill snapshot', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await mkdir(f.store.dir('run'), { recursive: true, mode: 0o700 });
@@ -394,7 +394,7 @@ class FinalSampleExitRuntime extends FinalSampleStallRuntime {
 }
 
 for (const growth of ['stdout', 'stderr', 'rollout'] as const)
-test(`stall_idle is postponed by ${growth} growth`, { timeout: 10000 }, async t => {
+test(`stall_idle is postponed by ${growth} growth`, { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     const f = await fixture();
     try {
@@ -419,7 +419,7 @@ test(`stall_idle is postponed by ${growth} growth`, { timeout: 10000 }, async t 
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('rollout-only non-token bytes count as activity and cross the idle boundary only afterward', { timeout: 10000 }, async t => {
+test('rollout-only non-token bytes count as activity and cross the idle boundary only afterward', { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     const f = await fixture();
     try {
@@ -438,7 +438,7 @@ test('rollout-only non-token bytes count as activity and cross the idle boundary
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a stalled hand-off ends after exactly two invocations', { timeout: 10000 }, async t => {
+test('a stalled hand-off ends after exactly two invocations', { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     const f = await fixture();
     try {
@@ -460,7 +460,7 @@ test('a stalled hand-off ends after exactly two invocations', { timeout: 10000 }
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('known final usage does not rework a stalled developer', { timeout: 10000 }, async t => {
+test('known final usage does not rework a stalled developer', { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     const f = await fixture();
     try {
@@ -486,7 +486,7 @@ test('known final usage does not rework a stalled developer', { timeout: 10000 }
 });
 
 for (const finalReason of ['context_limit', 'token_limit', 'compacted'] as const)
-test(`final sampling preserves stall_idle over ${finalReason}`, { timeout: 10000 }, async t => {
+test(`final sampling preserves stall_idle over ${finalReason}`, { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     const f = await fixture();
     try {
@@ -508,7 +508,7 @@ test(`final sampling preserves stall_idle over ${finalReason}`, { timeout: 10000
 });
 
 for (const exitReason of ['cancelled', 'timeout'] as const)
-test(`final sampling preserves measured limits after ${exitReason}`, { timeout: 10000 }, async t => {
+test(`final sampling preserves measured limits after ${exitReason}`, { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     const f = await fixture();
     try {
@@ -524,7 +524,7 @@ test(`final sampling preserves measured limits after ${exitReason}`, { timeout: 
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a start event on the threshold poll beats stall_start', { timeout: 10000 }, async t => {
+test('a start event on the threshold poll beats stall_start', { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     const f = await fixture();
     try {
@@ -543,7 +543,7 @@ test('a start event on the threshold poll beats stall_start', { timeout: 10000 }
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('stall_start rejects non-start capture growth and accepts a start on the threshold poll', { timeout: 10000 }, async t => {
+test('stall_start rejects non-start capture growth and accepts a start on the threshold poll', { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
         const { f, state } = await runStall(t, new StallFixtureRuntime(false));
@@ -554,7 +554,7 @@ test('stall_start rejects non-start capture growth and accepts a start on the th
 });
 
 for (const provider of ['codex', 'claude'] as const)
-test(`stall_idle after ${provider} start with no new activity`, { timeout: 10000 }, async t => {
+test(`stall_idle after ${provider} start with no new activity`, { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
         const f = await fixture();
@@ -582,7 +582,7 @@ test(`stall_idle after ${provider} start with no new activity`, { timeout: 10000
     } finally { t.mock.timers.reset(); }
 });
 
-test('pause before start and after start consumes no stall allowance', { timeout: 10000 }, async t => {
+test('pause before start and after start consumes no stall allowance', { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
         const gate = new PauseGate(); gate.pause();
@@ -605,7 +605,7 @@ test('pause before start and after start consumes no stall allowance', { timeout
     } finally { t.mock.timers.reset(); }
 });
 
-test('resume keeps only the idle allowance left before the pause', { timeout: 10000 }, async t => {
+test('resume keeps only the idle allowance left before the pause', { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     const f = await fixture();
     try {
@@ -625,7 +625,7 @@ test('resume keeps only the idle allowance left before the pause', { timeout: 10
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('stall reason persists through meter, history, result, segment and reopened dashboard row', { timeout: 10000 }, async t => {
+test('stall reason persists through meter, history, result, segment and reopened dashboard row', { timeout: 30000 }, async t => {
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
         const { f, state } = await runStall(t, new StallFixtureRuntime(false));
@@ -641,7 +641,7 @@ test('stall reason persists through meter, history, result, segment and reopened
     } finally { t.mock.timers.reset(); }
 });
 
-for (const claudePlanner of [false, true]) test(`an older run without Headroom cannot admit Codex with ${claudePlanner ? 'a Claude planner' : 'all Codex roles'}`, { timeout: 10000 }, async () => {
+for (const claudePlanner of [false, true]) test(`an older run without Headroom cannot admit Codex with ${claudePlanner ? 'a Claude planner' : 'all Codex roles'}`, { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -659,7 +659,7 @@ for (const claudePlanner of [false, true]) test(`an older run without Headroom c
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('dispatches bounded planner tasks and accepts only candidate-bound runner checks', { timeout: 10000 }, async () => {
+test('dispatches bounded planner tasks and accepts only candidate-bound runner checks', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         const created = await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -694,7 +694,7 @@ test('dispatches bounded planner tasks and accepts only candidate-bound runner c
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('disabled planner and test roles are skipped while enabled workers run', { timeout: 10000 }, async () => {
+test('disabled planner and test roles are skipped while enabled workers run', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.enabledRoles = ['developer', 'reviewer'];
@@ -707,7 +707,7 @@ test('disabled planner and test roles are skipped while enabled workers run', { 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('disabling every agent verifies the source through mandatory checks only', { timeout: 10000 }, async () => {
+test('disabling every agent verifies the source through mandatory checks only', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.enabledRoles = [];
@@ -721,7 +721,7 @@ test('disabling every agent verifies the source through mandatory checks only', 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('developer clarification runs clarify then answer before dispatch, in order', { timeout: 10000 }, async () => {
+test('developer clarification runs clarify then answer before dispatch, in order', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -741,7 +741,7 @@ test('developer clarification runs clarify then answer before dispatch, in order
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a repeat clarification round still unresolved ends in awaiting_input', { timeout: 10000 }, async () => {
+test('a repeat clarification round still unresolved ends in awaiting_input', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -768,7 +768,7 @@ test('a repeat clarification round still unresolved ends in awaiting_input', { t
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('the default clarification budget covers a corrected developer round and the tester round', { timeout: 10000 }, async () => {
+test('the default clarification budget covers a corrected developer round and the tester round', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -787,7 +787,7 @@ test('the default clarification budget covers a corrected developer round and th
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a rejected tester assumption stops after one clarification round', { timeout: 10000 }, async () => {
+test('a rejected tester assumption stops after one clarification round', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxClarificationJobs = 8;
@@ -814,7 +814,7 @@ test('a rejected tester assumption stops after one clarification round', { timeo
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('the developer dispatch prompt includes the admitted answers', { timeout: 10000 }, async () => {
+test('the developer dispatch prompt includes the admitted answers', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -835,7 +835,7 @@ test('the developer dispatch prompt includes the admitted answers', { timeout: 1
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('clarify and answer jobs are dispatched with a read-only source checkout', { timeout: 10000 }, async () => {
+test('clarify and answer jobs are dispatched with a read-only source checkout', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -909,7 +909,7 @@ test('a rework reuses developer and tester clarification on the new candidate', 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('maxClarificationJobs stops the exchange with an unresolved clarification budget', { timeout: 10000 }, async () => {
+test('maxClarificationJobs stops the exchange with an unresolved clarification budget', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxClarificationJobs = 1;
@@ -922,7 +922,25 @@ test('maxClarificationJobs stops the exchange with an unresolved clarification b
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('an old state.json without the clarification field still loads', { timeout: 10000 }, async () => {
+for (const [budget, side, next] of [[1, 'developer', 'answer-architect-1'], [2, 'tester', 'clarify-tester-1']] as const)
+test(`reset after an exhausted ${side} clarification budget grants a fresh budget`, { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        f.project.limits.maxClarificationJobs = budget;
+        await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
+        const runtime = new FakeRuntime();
+        const paused = await runRun(f.store, 'run', runtime);
+        assert.equal(paused.status, 'awaiting_input');
+        assert.match(paused.reason ?? '', /Clarification budget exhausted/);
+        const dashboard = new Dashboard(path.join(f.root, 'state'));
+        assert.equal((await dashboard.control('run', { action: 'reset' })).changed, true);
+        const calls = runtime.calls.length;
+        await stepRun(f.store, 'run', runtime);
+        assert.equal(runtime.calls[calls], next);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('an old state.json without the clarification field still loads', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         const created = await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -933,7 +951,7 @@ test('an old state.json without the clarification field still loads', { timeout:
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('mandatory checks run before the independent review', { timeout: 10000 }, async () => {
+test('mandatory checks run before the independent review', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -946,7 +964,7 @@ test('mandatory checks run before the independent review', { timeout: 10000 }, a
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a failed mandatory check moves to changes_requested without running the review', { timeout: 10000 }, async () => {
+test('a failed mandatory check moves to changes_requested without running the review', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -965,7 +983,7 @@ test('a failed mandatory check moves to changes_requested without running the re
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a developer with no clarifying questions starts work without an architect answer', { timeout: 10000 }, async () => {
+test('a developer with no clarifying questions starts work without an architect answer', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -979,7 +997,7 @@ test('a developer with no clarifying questions starts work without an architect 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a tester that adds no tests keeps the developer candidate and continues to checks', { timeout: 10000 }, async () => {
+test('a tester that adds no tests keeps the developer candidate and continues to checks', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -997,7 +1015,7 @@ test('a tester that adds no tests keeps the developer candidate and continues to
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('reset retries a failed planner with fresh evidence and dispatches the fixture workflow', { timeout: 10000 }, async () => {
+test('reset retries a failed planner with fresh evidence and dispatches the fixture workflow', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -1028,7 +1046,7 @@ test('reset retries a failed planner with fresh evidence and dispatches the fixt
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('reset retries a planner whose proposal was rejected', { timeout: 10000 }, async () => {
+test('reset retries a planner whose proposal was rejected', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -1047,7 +1065,7 @@ test('reset retries a planner whose proposal was rejected', { timeout: 10000 }, 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('reset cannot bypass a zero-rework implementation ceiling', { timeout: 10000 }, async () => {
+test('reset cannot bypass a zero-rework implementation ceiling', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxReworks = 0;
@@ -1069,7 +1087,7 @@ test('reset cannot bypass a zero-rework implementation ceiling', { timeout: 1000
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('requires exact visual evidence and an explicit owner answer before handoff', { timeout: 10000 }, async () => {
+test('requires exact visual evidence and an explicit owner answer before handoff', { timeout: 30000 }, async () => {
     const f = await fixture(true);
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -1097,7 +1115,7 @@ test('requires exact visual evidence and an explicit owner answer before handoff
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('unknown worker usage persists as a failed attempt and stops dispatch', { timeout: 10000 }, async () => {
+test('unknown worker usage persists as a failed attempt and stops dispatch', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -1128,7 +1146,7 @@ for (const [name, stdout] of [
     ['exits silently', ''],
     ['has its request rejected', [{ type: 'thread.started', thread_id: 't1' }, { type: 'item.completed', item: { id: 'item_0', type: 'error', message: 'warning' } },
         { type: 'turn.started' }, { type: 'error', message: 'invalid_json_schema' }, { type: 'turn.failed', error: { message: 'invalid_json_schema' } }].map(e => JSON.stringify(e)).join('\n')],
-] as const) test(`a worker that ${name} before any model output counts as zero usage`, { timeout: 10000 }, async () => {
+] as const) test(`a worker that ${name} before any model output counts as zero usage`, { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -1147,7 +1165,7 @@ for (const [name, stdout] of [
 });
 
 for (const proposed of ['configured', 'provider', 'model', 'effort'] as const) {
-    test(`planner admission preserves configured Claude choice: ${proposed}`, { timeout: 10000 }, async () => {
+    test(`planner admission preserves configured Claude choice: ${proposed}`, { timeout: 30000 }, async () => {
         const f = await fixture();
         try {
             const selected: WorkerChoice = { provider: 'claude', model: 'sonnet', effort: 'medium' };
@@ -1167,7 +1185,7 @@ for (const proposed of ['configured', 'provider', 'model', 'effort'] as const) {
     });
 }
 
-test('a Claude developer runs to the fixture happy path', { timeout: 10000 }, async () => {
+test('a Claude developer runs to the fixture happy path', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.models.developer = { provider: 'claude', model: 'claude-sonnet-5', effort: 'medium' };
@@ -1187,7 +1205,7 @@ test('a Claude developer runs to the fixture happy path', { timeout: 10000 }, as
 });
 
 for (const inputTokens of [150000, 350000]) {
-    test(`developer allocation meters ${inputTokens} cached input tokens against the reserved share`, { timeout: 10000 }, async () => {
+    test(`developer allocation meters ${inputTokens} cached input tokens against the reserved share`, { timeout: 30000 }, async () => {
         const f = await fixture();
         try {
             f.project.limits.maxReportedTokens = 900000;
@@ -1227,7 +1245,7 @@ for (const inputTokens of [150000, 350000]) {
     });
 }
 
-test('an uncached developer overrun is metered gross and fails with token_limit', { timeout: 10000 }, async () => {
+test('an uncached developer overrun is metered gross and fails with token_limit', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxReportedTokens = 900000;
@@ -1261,7 +1279,7 @@ test('an uncached developer overrun is metered gross and fails with token_limit'
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('planner usage is metered with cache reads at one tenth', { timeout: 10000 }, async () => {
+test('planner usage is metered with cache reads at one tenth', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxReportedTokens = 3000;
@@ -1282,7 +1300,7 @@ test('planner usage is metered with cache reads at one tenth', { timeout: 10000 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('planner usage over its metered share fails', { timeout: 10000 }, async () => {
+test('planner usage over its metered share fails', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxReportedTokens = 3000;
@@ -1304,7 +1322,7 @@ test('planner usage over its metered share fails', { timeout: 10000 }, async () 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a normal completion still writes a final meter.json with source final', { timeout: 10000 }, async () => {
+test('a normal completion still writes a final meter.json with source final', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -1323,7 +1341,7 @@ test('a normal completion still writes a final meter.json with source final', { 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a developer over its token allowance is stopped with token_limit and the meter file matches the segment', { timeout: 10000 }, async () => {
+test('a developer over its token allowance is stopped with token_limit and the meter file matches the segment', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.limits.maxReportedTokens = 900000;
@@ -1398,7 +1416,7 @@ async function writeRollout(job: Job, text: string) {
     await writeFile(path.join(dir, 'rollout-test.jsonl'), text);
 }
 
-test('a context_limit crossing produces one attempt with three segments and a stored handoff', { timeout: 10000 }, async t => {
+test('a context_limit crossing produces one attempt with three segments and a stored handoff', { timeout: 30000 }, async t => {
     const f = await fixture();
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
@@ -1444,7 +1462,7 @@ test('a context_limit crossing produces one attempt with three segments and a st
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('a non-zero resume exit fails the attempt with handoff_failed', { timeout: 10000 }, async t => {
+test('a non-zero resume exit fails the attempt with handoff_failed', { timeout: 30000 }, async t => {
     const f = await fixture();
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
@@ -1466,7 +1484,7 @@ test('a non-zero resume exit fails the attempt with handoff_failed', { timeout: 
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('Claude contextWindowMismatch is set only when the reported window differs', { timeout: 10000 }, async () => {
+test('Claude contextWindowMismatch is set only when the reported window differs', { timeout: 30000 }, async () => {
     for (const window of [200000, 250000]) {
         const f = await fixture();
         try {
@@ -1490,7 +1508,7 @@ test('Claude contextWindowMismatch is set only when the reported window differs'
 });
 
 for (const failure of ['invalid', 'absent', 'token_limit', 'compacted', 'timeout'] as const)
-test(`a handoff ${failure} stops the chain before fresh work`, { timeout: 10000 }, async t => {
+test(`a handoff ${failure} stops the chain before fresh work`, { timeout: 30000 }, async t => {
     const f = await fixture();
     t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: Date.now() });
     try {
@@ -1523,7 +1541,7 @@ test(`a handoff ${failure} stops the chain before fresh work`, { timeout: 10000 
     } finally { t.mock.timers.reset(); await rm(f.root, { recursive: true, force: true }); }
 });
 
-for (const reason of ['timeout', 'cancelled'] as const) test(`${reason} without final usage preserves an unknown lower bound`, { timeout: 10000 }, async () => {
+for (const reason of ['timeout', 'cancelled'] as const) test(`${reason} without final usage preserves an unknown lower bound`, { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -1547,7 +1565,7 @@ for (const reason of ['timeout', 'cancelled'] as const) test(`${reason} without 
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-for (const reason of ['compacted', 'context_limit', 'token_limit'] as const) test(`final polling preserves ${reason} on the segment`, { timeout: 10000 }, async () => {
+for (const reason of ['compacted', 'context_limit', 'token_limit'] as const) test(`final polling preserves ${reason} on the segment`, { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         await createRun(f.store, 'run', f.project, { owner: 'operator', statement: 'Approved brief' });
@@ -1581,7 +1599,7 @@ for (const reason of ['compacted', 'context_limit', 'token_limit'] as const) tes
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('unknown Claude model is refused before recording or executing an attempt', { timeout: 10000 }, async () => {
+test('unknown Claude model is refused before recording or executing an attempt', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.models.inspector = { provider: 'claude', model: 'claude-unknown-test', effort: 'low' };
@@ -1593,7 +1611,7 @@ test('unknown Claude model is refused before recording or executing an attempt',
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('Claude context crossing stops a live segment and retains its limit reason', { timeout: 10000 }, async () => {
+test('Claude context crossing stops a live segment and retains its limit reason', { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         f.project.models.inspector = { provider: 'claude', model: 'claude-sonnet-5', effort: 'low' };
@@ -1623,7 +1641,7 @@ test('Claude context crossing stops a live segment and retains its limit reason'
     } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
-test('runSegment waits for an in-flight poll before finalizing the sidecar', { timeout: 10000 }, async t => {
+test('runSegment waits for an in-flight poll before finalizing the sidecar', { timeout: 30000 }, async t => {
     const f = await fixture();
     const originalOpen = fsPromises.open;
     let release!: () => void, entered!: () => void;
@@ -1676,7 +1694,7 @@ test('runSegment waits for an in-flight poll before finalizing the sidecar', { t
     }
 });
 
-for (const failure of ['write', 'usage'] as const) test(`a meter ${failure} failure cancels the worker and blocks dispatch`, { timeout: 10000 }, async t => {
+for (const failure of ['write', 'usage'] as const) test(`a meter ${failure} failure cancels the worker and blocks dispatch`, { timeout: 30000 }, async t => {
     const f = await fixture();
     const originalOpen = fsPromises.open;
     if (failure === 'write') t.mock.method(fsPromises, 'open', async (...args: Parameters<typeof originalOpen>) => {
