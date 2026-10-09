@@ -65,4 +65,3 @@ Proposed `review-schema.json` v2 (it replaces `REPO/scripts/swarm/review-schema.
 ```
 
 Every property is required and every optional value is nullable. That follows the strict structured-output convention, which I infer is how Codex `--output-schema` applies it. I have not confirmed that strict mode supports `minItems` and `maxItems`, so `review_check.py` re-checks box length, SHAs, ids and bounds in code either way.
-
