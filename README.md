@@ -23,3 +23,7 @@ FACTORY_NODE="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/nod
 [The verification skill](home/.agents/skills/verify-my-aifactory/SKILL.md) drives the implemented library interfaces. Its feature map separates those checks from the missing operator workflow. [The review status](docs/review-status.md) records confirmed fixes and remaining gaps.
 
 Factory code now lives in this repository. The separate `floorplanto3d` application is a future client project and is not included or modified here.
+
+## Reusable orchestrator kit
+
+The [orchestrator guide](orchestrator/GUIDE.md) contains the extracted swarm scripts, regression tests, goal-neutral agent templates, setup steps and incident lessons. It is a separate operational harness; read its verified scope and limitations before starting a new goal.

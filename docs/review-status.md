@@ -35,3 +35,7 @@ The maintained [verification skill](../home/.agents/skills/verify-my-aifactory/S
 The review used the requested design, rationale, blast-radius, behavioral verification, migration, sequencing, subtraction, and strict maintainability skills. `coupling-analysis` could not be located in the supplied skill directories; coupling was inspected directly without claiming that skill ran.
 
 Historical evidence is limited to the supplied handoff, design, and subscription ADR. The imported factory had no Git history, issue tracker, team chat, production observability, error tracking, or analytics evidence. Do not infer implementation-time intent from code alone.
+
+## Orchestrator kit extraction, 2026-10-09
+
+The separate `orchestrator/` kit packages a goal-neutral operational harness and incident guide. Its 95 Python regressions pass, and the existing 23 TypeScript library tests, typecheck and seven-role bundle validation pass. See [its verification record](../orchestrator/VERIFICATION.md). This does not establish live subscription-worker, notification-channel or application acceptance. The new target project's runtime adapter requires validation; workflow hooks are not OS isolation. Remaining metering and stale-artifact issues are recorded in [the guide](../orchestrator/GUIDE.md).

@@ -1,0 +1,19 @@
+[project]
+name = "orchestrator-handoff-kit"
+version = "0.1.0"
+requires-python = ">=3.11"
+[project.optional-dependencies]
+dev = ["diff-cover==10.6.0", "hypothesis==6.168.5", "jsonschema==4.26.0", "mutmut==3.8.0", "mypy==2.4.0", "pytest==9.1.1", "pytest-cov==7.1.0", "pytest-randomly==5.0.0", "pytest-repeat==0.9.4", "ruff==0.16.9"]
+[tool.pytest.ini_options]
+testpaths = ["tests/swarm"]
+[tool.mypy]
+strict = true
+plugins = []
+[tool.mutmut]
+source_paths = ["src"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[tool.setuptools]
+packages = []

@@ -7,3 +7,5 @@ This map covers the implemented library interfaces used by a coordinator. Follow
 - [Worker contracts](workers.md) covers command construction, structured completion, usage, and failure parsing.
 
 The planned operator commands in design section 11.1, including init, start, step, resume, and handoff, are unimplemented. No feature file claims they work. Live Docker stdin, native sandbox permissions, credential refresh, independent review calibration, and the complete acceptance path remain unverified. Add those journeys when their entry points exist, then run the full maintenance pass.
+
+The separate [orchestrator kit verification record](../../../../../orchestrator/VERIFICATION.md) covers its Python harness regressions and states its live-integration limitations. It does not extend the factory library acceptance claims above.

@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PILOT_PYTHON:-python3}\" \"${BIN}/fp-guard.py\""
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "p1-pilot-reviewer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PILOT_PYTHON:-python3}\" \"${BIN}/pilot_guard.py\""
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "p1-pilot-reviewer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PILOT_PYTHON:-python3}\" \"${BIN}/pilot_guard.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

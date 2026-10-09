@@ -7,3 +7,5 @@ Use Node 24.19.x. Run the behavior checks described in `home/.agents/skills/veri
 Keep reusable skills under `home/.agents/skills/`. Worker-loaded skills are selected by `roles.json` and hashed by `skills.lock.json`. The repository verification skill is for maintainers and is not a worker capability.
 
 Do not report local process fixtures as live Docker, subscription-worker, or application acceptance. Record remaining gaps in `docs/review-status.md`.
+
+For work under `orchestrator/`, read its AGENTS.md and GUIDE.md. Update the guide in the same change as each diagnosed orchestration issue or fix; keep current project goals and private run evidence out of the reusable kit.
