@@ -53,3 +53,33 @@ These come from `reports/Agent loop token waste revalidation.md` in FloorInterio
 - Resuming a Codex thread at 127K to 170K context for a small repair cost about 1M tokens each. Start fresh at 17K to 35K.
 - Auto-mode classifier denials cost 21.7 minutes and about 624K tokens of retries in one P1 lead. Settle permission rules before launch, not mid-run.
 - The `lead-spawn.sh` adoption timeout left two P2 leads running in parallel for 6.5 hours. Retire the predecessor before the successor dispatches.
+
+## Changes from orchestrators 490 to 570 (2026-10-11 to 2026-10-13)
+
+These are the tooling and process changes the same run made after the entries above. The rulings cited live in `questions.md` of the run directory; the command templates live in `logs/orchestrator-templates.md`.
+
+**Merge into a pre-main branch and gate there.** Reviewed units merge with `git merge --no-ff` into `pre-main`. The gates, including G17, run on `pre-main`, and `main` fast-forwards only to a `pre-main` sha that passed them (RULING567b). Leads never wait on a gate, review or merge (RULING567e). Until a pre-main gate path exists, `main` cannot advance, and any tool installed from `main` keeps its old behavior. One reviewer admission fix sat on `pre-main` while the launcher kept running the `main` copy (RULING569d).
+
+**Refill every builder slot at every result.** At each completion the lead fills all builder slots from eligible disjoint scopes before anything else. The user raised the count from two to six and then to eight. When a drain blocks on a merge, move the unblocking unit to the front of the merge queue instead of letting the drain wait (RULING550a).
+
+**Concurrent handoff carries running jobs.** `pilot_lead.py --handoff-start` in concurrent mode records running Codex jobs as `kept_jobs`, so a lead never waits for a job or gate to exit before handing off. Fix the refusal cause and rerun at once (RULING563d). The exception is an in-process Claude reviewer subagent: it has no `-launch.json` receipt, cannot be carried, and dies with the lead, so the handoff must start right after that review returns (RULING570d).
+
+**Caps were raised and split by role.** The orchestrator hands off at 160,000 context tokens (RULING567h), the lead cap is 180,000, builders get 160,000 with handoff at 145,000, and reviewers get 120,000 with handoff at 105,000. A builder allowance is never lowered to save tokens. This replaces the 100,000 threshold above. Measure an orchestrator's context from the last assistant usage in its transcript (input plus cache read plus cache creation).
+
+**Launch with the minimum tool surface.** Lead and orchestrator panes start with `--disable-slash-commands`. `codex_launch.py` disables bundled skills, plugins, `find-skills` and `typesafe-ai`, which cut Codex prompt input from 24,930 to 20,117 characters (RULING559f). An orchestrator started with the template flags has about 11,500 tokens of fixed startup context, against about 23,300 without them.
+
+**A new permission rule needs a new session.** Allow rules added to the orchestrator settings file load only at session start. When the user adds rules, hand off to a fresh orchestrator at once (RULING569c).
+
+**Run gates detached.** A gate started as a Bash background task dies with its pane and keeps old orchestrator panes open. Start it with `nohup ... & disown`, record the pid in the handoff, and let the successor check it with `kill -0`.
+
+**Pass full shas to `unit_gate.py pre`.** The gate compares its arguments as strings with `candidate_sha` and `main_sha` in `ART/<tag>-candidate.json`. Short shas fail with "Candidate arguments differ from receipt" (RULING570a).
+
+**Deliver a drain notification before closing its target.** `--drain-retire` requires the exact `DRAIN_COMPLETE` message as a user message in every target transcript named in the completion record. Two leads, d09c2fc2 and e70f5787, could not be retired because one target was an orchestrator whose pane had already closed (BLOCKER567n, BLOCKER570b). Deliver and verify the notification before the predecessor orchestrator closes, or give the tool a branch for a closed target.
+
+**A kept allocation cannot move to a new lead.** Move the worktree with `run_state.py release-drain-scope` and register a fresh allocation instead (RULING567p).
+
+**s1 accepts tests-only commits.** When a builder's red commit also touches production code, build a tests-only commit with `git commit-tree` on the same parent and write s1 with `evidence_write.py ... --correction` (RULING568f).
+
+**Never delete run files.** A cleanup at 2026-10-13 00:00 IST removed interior-p2 artifacts and worktrees. No snapshot or git history held them, so they were lost (RULING557h). No file of any phase may be deleted; archive under a new name instead.
+
+**Small traps.** The Bash tool runs zsh, which does not word-split `$x`, so wrap id loops in `bash -c`. A Claude session id can change on the same pane (567 went from 1c9d9f40 to 68d7cae1); register the new id at once. To submit text to a pane, clear the composer with `$'\x05\x15\x15'`, send the text, send a separate `$'\r'`, and send a second `$'\r'` after 3 seconds.
