@@ -83,3 +83,15 @@ These are the tooling and process changes the same run made after the entries ab
 **Never delete run files.** A cleanup at 2026-10-13 00:00 IST removed interior-p2 artifacts and worktrees. No snapshot or git history held them, so they were lost (RULING557h). No file of any phase may be deleted; archive under a new name instead.
 
 **Small traps.** The Bash tool runs zsh, which does not word-split `$x`, so wrap id loops in `bash -c`. A Claude session id can change on the same pane (567 went from 1c9d9f40 to 68d7cae1); register the new id at once. To submit text to a pane, clear the composer with `$'\x05\x15\x15'`, send the text, send a separate `$'\r'`, and send a second `$'\r'` after 3 seconds.
+
+## Later lessons from orchestrator 570 (2026-10-13)
+
+**Record an in-process reviewer by session id.** `run_state.py record-run` with a `thread_id` creates a threads row and leaves the reviewer's sessions row incomplete, so `--drain-ready` refuses with "Drain in-process reviewer work before handoff". Pass the reviewer's `session_id` (`<lead session>/<agent id>`). A repeat record-run with the same counters adds a zero delta. For Claude usage, deduplicate assistant messages by message id and take new tokens = input + cache creation + output.
+
+**A brief cannot stop an in-process reviewer.** Three reviewers in one morning overran the 120,000 allowance (134,985 to 170,237) although their briefs said to stop at 105,000. Enforcement belongs in the guard. Until then, cap reviewers by turn count and split large packets.
+
+**A lead acts only on pane pointers.** Rulings written to `questions.md` without a pointer left a lead idle while zero builders ran. When a pane holds another sender's unsubmitted draft, the auto-mode classifier denies the orchestrator's carriage return ("Auto-Mode Bypass"), so the draft blocks both the drain notification and all pointers until a human presses Enter.
+
+**One owner per gate.** A lead and the orchestrator each started the same unit gate 9 seconds apart, and both wrote the same artifacts. Only the orchestrator starts unit gates, detached.
+
+**Retries must be idempotent.** An aborted `prepare_candidate` left a partial attempt archive, and the retry refused because the evidence had changed since. Move the partial archive aside under a new name, never delete it, and make the archive step do that itself.
