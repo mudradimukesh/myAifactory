@@ -86,7 +86,7 @@ def test_start_records_known_zero_usage(
     assert saved["reservations"]["review"]["released"] is False
 
 
-def test_start_allows_reviewer_and_builder_admission(
+def test_start_preserves_reviewer_serialization_and_builder_admission(
     guard: ModuleType, starting_reviewer: tuple[Path, dict[str, str]]
 ) -> None:
     run, event = starting_reviewer
@@ -101,24 +101,36 @@ def test_start_allows_reviewer_and_builder_admission(
     run.with_name("second-candidate.json").write_text(
         json.dumps({"expected_review_modes": ["code"]})
     )
-    for role in ("reviewer", "builder"):
-        data = {
-            "role": role,
-            "allocation_id": "second-" + role,
-            "run_id": "second-" + role + "-run",
+    # Known usage allows independent builders, but does not release the reviewer slot.
+    with pytest.raises(ValueError, match="one reserved allocation"):
+        guard.transact(
+            run,
+            "launcher",
+            "admit",
+            {
+                "role": "reviewer",
+                "allocation_id": "second-reviewer",
+                "run_id": "second-reviewer-run",
+                "allowance": 60,
+                "tag": "second",
+            },
+        )
+    guard.transact(
+        run,
+        "launcher",
+        "admit",
+        {
+            "role": "builder",
+            "allocation_id": "second-builder",
+            "run_id": "second-builder-run",
             "allowance": 60,
-        }
-        if role == "reviewer":
-            data["tag"] = "second"
-        try:
-            guard.transact(run, "launcher", "admit", data)
-        except ValueError as error:
-            raise AssertionError("Running reviewer blocked admission: " + str(error)) from error
+        },
+    )
     saved = json.loads(run.read_text())
-    for role in ("reviewer", "builder"):
-        assert saved["reservations"]["second-" + role]["active_run"] == "second-" + role + "-run"
-    assert saved["reservations"]["second-reviewer"]["output_paths"] == [
-        str(run.with_name("second-code-review.json").resolve())
+    assert "second-reviewer" not in saved["reservations"]
+    assert saved["reservations"]["second-builder"]["active_run"] == "second-builder-run"
+    assert saved["reservations"]["review"]["output_paths"] == [
+        str(run.with_name("feature-code-review.json"))
     ]
     assert saved["runs"]["review-run"]["complete"] is False
     assert saved["consumed"] == {"overall": 0, "pilot": 0}
@@ -127,7 +139,7 @@ def test_start_allows_reviewer_and_builder_admission(
             run,
             "launcher",
             "admit",
-            {"role": "builder", "allocation_id": "over", "run_id": "over", "allowance": 121},
+            {"role": "builder", "allocation_id": "over", "run_id": "over", "allowance": 181},
         )
     for index in range(7):
         guard.transact(

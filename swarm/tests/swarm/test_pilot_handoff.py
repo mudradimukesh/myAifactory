@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
-def lead():
+def lead(monkeypatch):
     sys.path.insert(0, str(ROOT / "scripts/swarm"))
     try:
         spec = importlib.util.spec_from_file_location(
@@ -19,6 +19,14 @@ def lead():
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        original_stop = module.stop
+
+        def fixture_stop(pid, owned, int_wait=0.1, term_wait=0.1, reap=None, **kwargs):
+            # Background runners can inherit ignored SIGINT. Exercise real escalation
+            # and ownership checks without waiting through production grace periods.
+            return original_stop(pid, owned, int_wait, term_wait, reap, **kwargs)
+
+        monkeypatch.setattr(module, "stop", fixture_stop)
         yield module
     finally:
         sys.path.pop(0)

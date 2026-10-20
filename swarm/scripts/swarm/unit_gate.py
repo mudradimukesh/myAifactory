@@ -57,6 +57,9 @@ def run_all(checks, workers=1):
 
 
 FULL_ONLY = {"G2", "G3", "G9", "G10", "G11", "G12", "G13", "G16", "G17", "G18"}
+# Gates that start the API or touch the database each get a fresh runtime, so one gate's
+# rows, users and jobs cannot leak into another gate's assertions.
+STATEFUL = {"G2", "G9", "G10", "G11", "G12", "G13", "G17", "related"}
 # The Phase 1 POC gates skip suites another phase owns (user ruling 2026-10-20).
 # Phase 2's environment tests read Phase 2 receipts that Phase 1 cannot provide.
 PYTEST_IGNORE = ["--ignore=tests/phase2"]
@@ -64,6 +67,9 @@ WEB_LINTED = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 
 
 class Gate:
+    # Provisioned environment for per-gate runtimes; None runs gates without a runtime.
+    runtime_env = None
+
     art: Path
     tag: str
     fast = False
@@ -84,6 +90,19 @@ class Gate:
         self.mapping = json.loads((art / (tag + "-test-map.json")).read_text())
         self.reports = {}
         self.survivors = []
+
+    def isolated(self, identifier, action):
+        def run():
+            name = self.tag + ("-fast" if self.fast else "") + "-" + identifier
+            with runtime(self.root, self.art, name, self.runtime_env) as configured:
+                shared = self.env
+                self.env = {**shared, **configured}
+                try:
+                    return action()
+                finally:
+                    self.env = shared
+
+        return run
 
     def input(self, suffix: str) -> Path:
         return self.art / (self.tag + "-" + suffix)
@@ -549,6 +568,14 @@ class Gate:
             ("G17", self.journey),
             ("G18", lambda: self.mutation("G18", "web", self.ts)),
         ]
+        if self.runtime_env is not None:
+            checks = [
+                (
+                    identifier,
+                    self.isolated(identifier, action) if identifier in STATEFUL else action,
+                )
+                for identifier, action in checks
+            ]
         if self.fast:
             deferred = {
                 "disposition": "not_applicable",
@@ -560,6 +587,8 @@ class Gate:
             }
             checks = [(i, (lambda: deferred) if i in FULL_ONLY else a) for i, a in checks]
             checks.append(("related", self.related))
+            if self.runtime_env is not None:
+                checks[-1] = ("related", self.isolated("related", self.related))
         else:
             from collections.abc import Callable
             from functools import partial
@@ -720,10 +749,8 @@ def main():
             env = provision(root, art / (args.tag + "-install.log"))
             marker.write_text(current)
         gate = Gate(root, art, args.tag, args.base, args.candidate, args.mode == "fast")
-        isolation = args.tag + ("-fast" if args.mode == "fast" else "")
-        with runtime(root, art, isolation, env) as isolated:
-            gate.env.update(isolated)
-            rows = gate.execute()
+        gate.runtime_env = env
+        rows = gate.execute()
         try:
             hashes = artifact_hashes(art, args.tag, gate.spec, args.mode == "fast")
         except (ValueError, OSError) as error:

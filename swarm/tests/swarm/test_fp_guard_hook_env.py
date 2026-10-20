@@ -571,7 +571,7 @@ def test_bin_pilot_context_override_preserves_branch_default(
         "tool_name": "Write",
         "tool_input": {"file_path": str(hook_run["tmp_path"] / "output.txt"), "content": "work"},
     }
-    for used in (100000, 180000, 180001) if override is None else (100000,):
+    for used in (100000, 120000, 120001) if override is None else (100000,):
         hook_run["original"].write_text(
             json.dumps({"message": {"usage": {"input_tokens": used}}}) + "\n"
         )
@@ -581,7 +581,7 @@ def test_bin_pilot_context_override_preserves_branch_default(
             env,
             hook_run["lead"],
         )
-        denied = override == "95000" or used == 180001
+        denied = override == "95000" or used == 120001
         assert result["returncode"] == (2 if denied else 0), result
         if denied:
             assert "Context cap permits handoff only" in result["stderr"], result

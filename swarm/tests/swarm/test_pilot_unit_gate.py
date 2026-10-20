@@ -189,7 +189,7 @@ def test_fast_gate_skips_provision_only_when_marker_matches(tmp_path, monkeypatc
         monkeypatch.setattr(module, "provision", lambda root, log: provisioned.append(1) or {})
         monkeypatch.setattr(module, "fingerprint", lambda root: "f")
         monkeypatch.setattr(module, "artifact_hashes", lambda *args: {})
-        isolations = []
+        isolations, runtime_envs = [], []
         monkeypatch.setattr(
             module,
             "runtime",
@@ -202,6 +202,7 @@ def test_fast_gate_skips_provision_only_when_marker_matches(tmp_path, monkeypatc
                 self.files, self.spec, self.env = [], {}, {}
 
             def execute(self):
+                runtime_envs.append(self.runtime_env is not None)
                 return [{"id": "G1", "exit_code": 0}]
 
         monkeypatch.setattr(module, "Gate", Probe)
@@ -210,7 +211,9 @@ def test_fast_gate_skips_provision_only_when_marker_matches(tmp_path, monkeypatc
             monkeypatch.setattr(sys, "argv", ["unit_gate", mode, "probe", "b", "c"])
             assert module.main() == 0
         assert len(provisioned) == 2
-        assert isolations == ["probe-fast", "probe-fast", "probe"]
+        # Each stateful gate opens its own runtime inside execute, so main opens none.
+        assert isolations == []
+        assert runtime_envs == [True, True, True]
         marker = (tmp_path / ".venv/provision.sha256").read_text()
         assert marker == hashlib.sha256(b"pl").hexdigest()
         (tmp_path / "web/package-lock.json").write_text("changed")

@@ -55,6 +55,9 @@ def launch(tmp_path, monkeypatch, capsys):
     def run(tag, error=None, role="tester", brief="Implement the assigned task."):
         work = tmp_path / tag
         work.mkdir()
+        checkout_brief = work / "prompts/phase-1/builder-brief.md"
+        checkout_brief.parent.mkdir(parents=True)
+        checkout_brief.write_text(builder_brief.read_text())
         stub = work / "codex"
         stub.write_text(
             "#!"
@@ -209,6 +212,7 @@ def test_cs_brief_builder_paragraph_and_missing_source(launch):
     issues = []
     brief = "Implement the assigned task."
     appended = launch("builder-append", role="builder", brief=brief)
+    assert appended["code"] == 0, appended["stdout"] + appended["stderr"]
     prompt = appended["prompt_path"].read_text()
     if not (prompt.startswith(brief) and prompt.count(BUILDER_PARAGRAPH) == 1):
         issues.append("builder prompt must append the source paragraph once")

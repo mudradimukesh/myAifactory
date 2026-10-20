@@ -2,7 +2,7 @@
 
 This directory holds the orchestrator, lead, builder and gate tooling that ran the FloorInteriorDesignAndRenderer Phase 1 swarm. Copy it into a new project to start a swarm there.
 
-The kit comes from commit `216d8c9` on branch `swarm-kit-premain` of FloorInteriorDesignAndRenderer. That commit is the project's pre-main swarm tooling merged with the token, succession and worktree fixes from session 8f3b47cf. Read [the loop lessons](../docs/orchestrator-lead-loop-lessons.md) before running it.
+The kit comes from commit `00cfe5b` on branch `p1-premain-candidate/1` of FloorInteriorDesignAndRenderer: the project's pre-main swarm tooling merged with the token, succession and worktree fixes from session 8f3b47cf, the remaining gate test repairs, and per-gate database and API runtimes. Read [the loop lessons](../docs/orchestrator-lead-loop-lessons.md) before running it.
 
 ## Layout
 
@@ -37,7 +37,7 @@ The paths match the host project, so tests and scripts resolve each other withou
    grep -rnE 'mukeshkumarmudradi|factory-fp-0925|FloorInteriorDesignAndRenderer|interior-p[0-9]' scripts/swarm tests/swarm .claude prompts
    ```
 
-3. **Adapt the gates to the project's stack.** `unit_gate.py` defines gates G1 to G19 with this project's commands: pytest with randomization and coverage, Ruff, mypy, ESLint, the TypeScript typecheck, Vitest seeds, Playwright journeys and mutation testing. `gate_evidence.runtime()` creates a fresh PostgreSQL database and starts the project's API. Replace these commands, and `PYTEST_IGNORE`, with the new project's checks. Keep one fresh database and API per gate: a shared test database broke both API and browser tests in the original run.
+3. **Adapt the gates to the project's stack.** `unit_gate.py` defines gates G1 to G19 with this project's commands: pytest with randomization and coverage, Ruff, mypy, ESLint, the TypeScript typecheck, Vitest seeds, Playwright journeys and mutation testing. `gate_evidence.runtime()` creates a fresh PostgreSQL database and starts the project's API. Replace these commands, and `PYTEST_IGNORE`, with the new project's checks. Keep one fresh database and API per stateful gate (`STATEFUL` in `unit_gate.py`): a shared test database broke both API and browser tests in the original run, and each runtime drops the database it created.
 
 4. **Install BIN.** Copy each script to a temporary name in BIN, then `mv` it into place, so running scripts never read a half-written file.
 
@@ -68,7 +68,7 @@ Run the suite from the host project with its Python environment:
 .venv/bin/python -m pytest -q -p no:randomly tests/swarm
 ```
 
-Run standalone in this directory, 996 tests pass. The others need a host project: the `task_env` tests need `web/node_modules`, and the quality-dependency and mypy tests need its `pyproject.toml`. Three tests also fail on the source branch itself (`test_codex_launch`, `test_fp_guard_hook_env`, `test_reviewer_start_usage`); they are tracked there as pre-main failures.
+Run standalone in this directory, 996 tests pass. The others need a host project: the `task_env` tests need `web/node_modules`, and the quality-dependency and mypy tests need its `pyproject.toml`. The three swarm tests that failed on pre-main (`test_codex_launch`, `test_fp_guard_hook_env`, `test_reviewer_start_usage`) were repaired in this version.
 
 ## Known limits
 

@@ -141,10 +141,18 @@ def test_reviewer_candidate_pytest_preserves_refusals(guard, tmp_path, candidate
         guard.check(e, s, tmp_path / "run.json", 100, 83000)
 
 
-def test_reviewer_candidate_pytest_collects_from_main(guard, tmp_path, candidate_pytest):
+@pytest.mark.parametrize("extra_options", ["-q", "--collect-only"])
+def test_reviewer_candidate_pytest_collects_from_main(
+    guard, tmp_path, candidate_pytest, monkeypatch, extra_options
+):
+    monkeypatch.setenv("PYTEST_ADDOPTS", extra_options)
     s, e, outside_candidate = candidate_pytest
     words = shlex.split(e["tool_input"]["command"])
-    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONPATH", "PYTEST_ADDOPTS"}
+    }
     old = subprocess.run(
         [words[0], "-q", words[-1]], cwd=outside_candidate, env=env, capture_output=True, text=True
     )

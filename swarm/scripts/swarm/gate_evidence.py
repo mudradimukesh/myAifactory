@@ -276,9 +276,16 @@ def runtime(root: Path, art: Path, tag: str, env: Mapping[str, str]) -> Iterator
             yield configured
     finally:
         api.close()
-        if child:
-            signals, remaining = stop(child.pid, owned, reap=child.poll)
-            receipt.update(signals=signals, remaining_processes=remaining)
-            if remaining:
-                raise ValueError("Isolated API cleanup incomplete")
-        (art / (tag + "-runtime.json")).write_text(json.dumps(receipt, indent=2) + "\n")
+        try:
+            if child:
+                signals, remaining = stop(child.pid, owned, reap=child.poll)
+                receipt.update(signals=signals, remaining_processes=remaining)
+                if remaining:
+                    raise ValueError("Isolated API cleanup incomplete")
+            # Drop only the database this runtime created, once its API has stopped.
+            dropped = subprocess.run(["dropdb", "-h", "/tmp", name], capture_output=True, text=True)
+            receipt["database_dropped"] = dropped.returncode == 0
+            if dropped.returncode:
+                raise ValueError("Isolated database cleanup failed: " + dropped.stderr.strip())
+        finally:
+            (art / (tag + "-runtime.json")).write_text(json.dumps(receipt, indent=2) + "\n")
