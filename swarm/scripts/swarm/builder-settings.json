@@ -1,0 +1,112 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /tmp/factory-fp-0925/swarm/bin/fp-guard.py"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "p1-pilot-reviewer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /tmp/factory-fp-0925/swarm/bin/pilot_guard.py"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "p1-pilot-reviewer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /tmp/factory-fp-0925/swarm/bin/pilot_guard.py"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Agent(p1-pilot-reviewer)",
+      "Bash(.venv/bin/python -m pytest tests/swarm/*)",
+      "Bash(.venv/bin/python -m pytest tests/swarm/test_pilot_launch.py tests/swarm/test_pilot_worker.py tests/swarm/test_acceptance_results.py *)",
+      "Bash(.venv/bin/python -m pytest tests/swarm/test_pilot_launch.py tests/swarm/test_pilot_worker.py tests/swarm/test_acceptance_results.py)",
+      "Bash(.venv/bin/python /tmp/factory-fp-0925/swarm/bin/jev_triage.py *)",
+      "Bash(.venv/bin/python /tmp/factory-fp-0925/swarm/bin/red_check.py *)",
+      "Bash(.venv/bin/python /tmp/factory-fp-0925/swarm/bin/review_check.py *)",
+      "Bash(.venv/bin/ruff check tests/swarm/test_pilot_worker.py scripts/swarm/codex_launch.py)",
+      "Bash(.venv/bin/ruff format --check tests/swarm/test_pilot_worker.py)",
+      "Bash(/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/.venv/bin/python /tmp/factory-fp-0925/swarm/bin/jev_triage.py *)",
+      "Bash(/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/.venv/bin/python /tmp/factory-fp-0925/swarm/bin/red_check.py *)",
+      "Bash(/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/.venv/bin/python /tmp/factory-fp-0925/swarm/bin/review_check.py *)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/codex-agent.sh *)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/alert-orchestrator.sh *)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/interior-lead.sh --handoff-begin)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/interior-lead.sh --handoff-start *)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/merge_unit.sh *)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/prepare_candidate.sh *)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/unit_gate.sh *)",
+      "Bash(FEATURE=p1-tooling-task-env-continuation ROLE=builder ASSIGNMENT_ID=p1-tooling-task-env-continuation-3 ALLOCATION_ID=p1-tooling-task-env-continuation-3 *)",
+      "Bash(S=/private/tmp/claude-501/-Users-mukeshkumarmudradi-Documents-AI-Projects-github-FloorInteriorDesignAndRenderer/5177f07e-a41c-4dbd-824c-583ef1a0dd1f/scratchpad; cd /tmp/factory-fp-0925/swarm/interior-p1-poc && cp -p p1-poc-plan-workspace-test-map.json p1-poc-plan-workspace-test-map.pre-q5.json && cp -p ids.txt ids.pre-q5.txt && cp \"$S/map-q5.json\" p1-poc-plan-workspace-test-map.json && python3 -c \"\nimport json;print('\\n'.join(e['id'] for e in json.load(open('p1-poc-plan-workspace-test-map.json'))))\" > ids.txt && cat ids.txt | tr '\\n' ' ' && echo && git -C worktree status --porcelain | wc -l && (cd worktree && shasum -a 256 -c ../p1-poc-plan-workspace-s1-tests.sha256 | tail -2))",
+      "Bash(cat >> /tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-acceptance.md *)",
+      "Bash(cd /Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer && .venv/bin/python -m pytest tests/swarm/test_pilot_launch.py tests/swarm/test_pilot_worker.py tests/swarm/test_acceptance_results.py -q 2>&1 | tail -2; .venv/bin/ruff check tests/swarm/test_pilot_worker.py scripts/swarm/codex_launch.py | tail -1; .venv/bin/ruff format --check tests/swarm/test_pilot_worker.py | tail -1)",
+      "Bash(cp -p ids.txt ids.pre-q5.txt)",
+      "Bash(cp -p p1-poc-plan-workspace-test-map.json p1-poc-plan-workspace-test-map.pre-q5.json)",
+      "Bash(cp /private/tmp/claude-501/-Users-mukeshkumarmudradi-Documents-AI-Projects-github-FloorInteriorDesignAndRenderer/5177f07e-a41c-4dbd-824c-583ef1a0dd1f/scratchpad/map-q5.json /tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-test-map.json)",
+      "Bash(.venv/bin/python -m pytest tests/swarm/*)",
+      "Bash(rg --only-matching * /tmp/factory-fp-0925/swarm/interior-p1-poc/run.json)",
+      "Bash(FEATURE=p1-tooling-task-env-continuation ROLE=builder ASSIGNMENT_ID=p1-tooling-task-env-continuation-3 ALLOCATION_ID=p1-tooling-task-env-continuation-3 *)",
+      "Bash(jq -r '.[].id' /tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-test-map.json > /tmp/factory-fp-0925/swarm/interior-p1-poc/ids.txt)",
+      "Bash(python3 /tmp/factory-fp-0925/swarm/bin/jev_triage.py *)",
+      "Bash(python3 /tmp/factory-fp-0925/swarm/bin/red_check.py *)",
+      "Bash(python3 /tmp/factory-fp-0925/swarm/bin/review_check.py *)",
+      "Bash(rg --only-matching -e '^  \"dispatch_frozen\": [a-z]+' -e '^  \"handoff\": null' -e '^    \"model_session_id\": \"[^\"]+\"' -e '^    \"pane\": \"[^\"]+\"' -e '^    \"pid\": [0-9]+' /tmp/factory-fp-0925/swarm/interior-p1-poc/run.json)",
+      "Bash(rg --only-matching -e '^  \"dispatch_frozen\": [a-z]+' -e '^  \"handoff\": null' -e '^    \"model_session_id\": \"[^\"]+\"' -e '^    \"pane\": \"[^\"]+\"' /tmp/factory-fp-0925/swarm/interior-p1-poc/run.json)",
+      "Bash(wezterm cli send-text --pane-id * --no-paste *)",
+      "Bash(wezterm cli kill-pane --pane-id \"$WEZTERM_PANE\")",
+      "Edit(//Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/prompts/phase-1/state.md)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/handoff/**)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/ids.txt)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/inbox.md)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-code-review.json)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-product-review.json)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-test-map.json)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/questions.md)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/state.md)",
+      "Read(//Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/scripts/swarm/codex_launch.py)",
+      "Read(//Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/tests/swarm/test_pilot_launch.py)",
+      "Read(//Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/tests/swarm/test_pilot_worker.py)",
+      "Read(//tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-test-map.json)",
+      "Write(//tmp/factory-fp-0925/swarm/interior-p1-poc/handoff/**)",
+      "Write(//tmp/factory-fp-0925/swarm/interior-p1-poc/ids.txt)",
+      "Write(//tmp/factory-fp-0925/swarm/interior-p1-poc/inbox.md)",
+      "Write(//tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-code-review.json)",
+      "Write(//tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-product-review.json)",
+      "Write(//tmp/factory-fp-0925/swarm/interior-p1-poc/p1-poc-plan-workspace-test-map.json)",
+      "Write(//tmp/factory-fp-0925/swarm/interior-p1-poc/questions.md)",
+      "Write(//tmp/factory-fp-0925/swarm/interior-p1-poc/state.md)"
+    ]
+  },
+  "autoMode": {
+    "environment": [
+      "The user authorized the established P1 POC workflow in /Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer and /tmp/factory-fp-0925/swarm/interior-p1-poc, using installed tooling in /tmp/factory-fp-0925/swarm/bin. These are trusted local task directories, not external destinations.",
+      "The user authorized Q1 launcher validation and Q5 test-map metadata correction. Preserve all frozen test assertions, original reports and coverage; run genuine red_check. The installed fresh builder launcher retains workspace-write/on-request with automatic approval review.",
+      "P1 ownership and usage checks may read only bounded run.json fields. All ledger mutations use existing run_state transactions. Supported lead handoff uses interior-lead.sh, a registered snapshot acknowledgement and the existing controller. Alerts use literal wezterm send-text to the latest registered integer orchestrator pane_id.",
+      "The user authorized Jev priority/evidence integration through existing P1 call sites, existing provider and separate POC spend ledger. Preserve deterministic gates, independent review, ownership hooks and caps. No credential exploration, new paid routes, unsafe mode, direct ledger edits or gate waivers are authorized."
+    ]
+  },
+  "verbose": false,
+  "viewMode": "focus",
+  "env": {
+    "CLAUDE_CODE_NO_FLICKER": "1"
+  }
+}

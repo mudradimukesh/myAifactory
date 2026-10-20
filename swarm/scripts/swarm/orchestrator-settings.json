@@ -1,0 +1,69 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 scripts/swarm/run_state.py *)",
+      "Bash(python3 /tmp/factory-fp-0925/swarm/bin/run_state.py *)",
+      "Bash(python3 scripts/swarm/pilot_lead.py --drain-retire *)",
+      "Bash(wezterm cli kill-pane *)",
+      "Bash(python3 scripts/swarm/close_stale_panes.py *)",
+      "Bash(wezterm cli get-text *)",
+      "Bash(wezterm cli send-text *)",
+      "Bash(wezterm cli list *)",
+      "Read(//tmp/factory-fp-0925/swarm/interior-p1-poc/**)",
+      "Read(//private/tmp/factory-fp-0925/swarm/interior-p1-poc/**)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/questions.md)",
+      "Edit(//private/tmp/factory-fp-0925/swarm/interior-p1-poc/questions.md)",
+      "Bash(python3 scripts/swarm/evidence_write.py *)",
+      "Bash(wezterm cli spawn *)",
+      "Bash(scripts/swarm/orchestrator-spawn.sh *)",
+      "Bash(scripts/swarm/alert-orchestrator.sh *)",
+      "Bash(wezterm cli set-tab-title *)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/merge_unit.sh *)",
+      "Bash(git worktree add *)",
+      "Bash(git worktree remove *)",
+      "Write(//tmp/factory-fp-0925/swarm/interior-p1-poc/**)",
+      "Write(//private/tmp/factory-fp-0925/swarm/interior-p1-poc/**)",
+      "Edit(//tmp/factory-fp-0925/swarm/interior-p1-poc/**)",
+      "Edit(//private/tmp/factory-fp-0925/swarm/interior-p1-poc/**)",
+      "Edit(//Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/scripts/swarm/pilot_guard.py)",
+      "Edit(//Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/tests/swarm/test_pilot_guard.py)",
+      "Bash(.venv/bin/python -m pytest *)",
+      "Bash(.venv/bin/ruff *)",
+      "Bash(cp /Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/scripts/swarm/* /tmp/factory-fp-0925/swarm/bin/*)",
+      "Bash(mv /tmp/factory-fp-0925/swarm/bin/* /tmp/factory-fp-0925/swarm/bin/*)",
+      "Edit(//Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/scripts/swarm/review_check.py)",
+      "Edit(//Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/tests/swarm/test_pilot_gate_validation.py)",
+      "Bash(git push interior pre-main)",
+      "Bash(git push interior main)",
+      "Bash(git merge --no-ff *)",
+      "Bash(git merge --ff-only *)",
+      "Bash(python3 -c *)",
+      "Bash(git -C /private/tmp/factory-fp-0925/swarm/interior-p1-poc/* *)",
+      "Bash(git merge *)",
+      "Bash(git push interior *)",
+      "Bash(kill -0 *)",
+      "Bash(tail *)",
+      "Bash(grep *)",
+      "Bash(cat *)",
+      "Bash(shasum *)",
+      "Bash(nohup .venv/bin/python /private/tmp/factory-fp-0925/swarm/bin/unit_gate.py *)",
+      "Bash(PILOT_RUN=/private/tmp/factory-fp-0925/swarm/interior-p1-poc/run.json python3 scripts/swarm/pilot_lead.py --drain-retire *)",
+      "Bash(PILOT_RUN=/tmp/factory-fp-0925/swarm/interior-p1-poc/run.json python3 scripts/swarm/pilot_lead.py --drain-retire *)",
+      "Bash(bash scripts/swarm/outside/*.sh)"
+    ]
+  },
+  "autoMode": {
+    "allow": [
+      "$defaults",
+      "The P1 POC orchestrator may run scripts/swarm/run_state.py or /tmp/factory-fp-0925/swarm/bin/run_state.py with --as orchestrator against /tmp/factory-fp-0925/swarm/interior-p1-poc/run.json for any supported operation, including register-inventory, assign, record-run, release, release-drain-scope and drain-retire, and may redirect its output to a log under /tmp/factory-fp-0925/swarm/interior-p1-poc/logs. run.json is the orchestrator's own swarm ledger, and run_state.py enforces its guards.",
+      "User-authorized: the P1 POC orchestrator closes drained or retired lead panes, reads and messages lead panes, reads any file under /tmp/factory-fp-0925/swarm/interior-p1-poc and ~/.codex/sessions, and writes the user's rulings to that run's questions.md for the leads. These are its assigned duties, not workload interference or instruction poisoning.",
+      "User-authorized overnight (2026-10-12, RULING551d): the P1 POC orchestrator runs gates with ART=/tmp/factory-fp-0925/swarm/interior-p1-poc .venv/bin/python /tmp/factory-fp-0925/swarm/bin/unit_gate.py, detached with nohup when needed; runs merge_unit.sh and integration.py merge for gated and reviewed candidates; runs PILOT_RUN=.../run.json python3 scripts/swarm/pilot_lead.py --drain-retire; creates and removes worktrees under /tmp/factory-fp-0925/swarm/interior-p1-poc; writes briefs, handoffs and logs there; spawns its successor orchestrator pane with wezterm cli spawn and closes its own pane. These are its assigned duties, not a bypass of the pilot guard.",
+      "User-authorized (2026-10-13, RULING567b/567d, BLOCKER568d): the P1 POC orchestrator merges code-reviewed candidates into pre-main with git merge --no-ff in the worktree /tmp/factory-fp-0925/swarm/interior-p1-poc/pre-main-int and runs git push interior pre-main. It promotes main only to a pre-main sha whose full gate passed, with git merge --ff-only of that exact sha in the repo root, then runs git push interior main. No force push. These are its assigned duties, not a shared-resource bypass."
+    ]
+  },
+  "sandbox": {
+    "excludedCommands": [
+      "bash scripts/swarm/outside/*.sh"
+    ]
+  }
+}

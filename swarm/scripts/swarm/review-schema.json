@@ -1,0 +1,15 @@
+{"type":"object","additionalProperties":false,
+ "required":["schema_version","mode","unit","base_sha","candidate_sha","statuses","acceptance","checks","mutants","findings","needs_ruling","merge"],
+ "properties":{
+  "schema_version":{"type":"string","enum":["p1-review-2"]},
+  "mode":{"type":"string","enum":["tests","code","product"]},
+  "unit":{"type":"string"},
+  "base_sha":{"type":"string","pattern":"^[0-9a-f]{40}$"},
+  "candidate_sha":{"type":"string","pattern":"^[0-9a-f]{40}$"},
+  "statuses":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","status","evidence"],"properties":{"id":{"type":"string"},"status":{"type":"string","enum":["fixed","partly_fixed","not_fixed","not_assessed"]},"evidence":{"type":"string"}}}},
+  "acceptance":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","test_node","contract_ref","coverage","oracle","evidence_kind","evidence"],"properties":{"id":{"type":"string"},"test_node":{"type":"string"},"contract_ref":{"type":"string"},"coverage":{"type":"string","enum":["asserted","weak","missing"]},"oracle":{"type":"string","enum":["spec_literal","observed_fixture","independent_computation","property","from_code_under_test","none"]},"evidence_kind":{"type":"string","enum":["observed","inferred"]},"evidence":{"type":"string"}}}},
+  "checks":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["check","result","evidence"],"properties":{"check":{"type":"string","enum":["frozen_tests_unchanged","no_fixture_literals","no_special_case_branch","no_skip_or_xfail","no_operator_or_equality_override","no_broad_except_or_success_fallback","no_type_escape","no_comments","deterministic_tests"]},"result":{"type":"string","enum":["pass","fail","not_assessed"]},"evidence":{"type":"string"}}}},
+  "mutants":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["mutant","file","line","disposition","evidence"],"properties":{"mutant":{"type":"string"},"file":{"type":"string"},"line":{"type":"integer"},"disposition":{"type":"string","enum":["equivalent","test_gap","out_of_scope"]},"evidence":{"type":"string"}}}},
+  "findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","axis","view","box","file","line","severity","category","evidence_kind","text"],"properties":{"id":{"type":"string"},"axis":{"type":"string","enum":["spec","standards","test","product"]},"view":{"type":"string"},"box":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"file":{"type":["string","null"]},"line":{"type":["integer","null"]},"severity":{"type":"string","enum":["blocker","major","minor"]},"category":{"type":"string","enum":["fidelity","geometry","asset","material","light","camera","noise","site","parse","ir","api","data","auth","ui","accessibility","eval","tooling","typing","simplicity","test_quality","flakiness","overfitting"]},"evidence_kind":{"type":"string","enum":["observed","inferred"]},"text":{"type":"string"}}}},
+  "needs_ruling":{"type":["string","null"]},
+  "merge":{"type":"boolean"}}}
