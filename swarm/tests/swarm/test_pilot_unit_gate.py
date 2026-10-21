@@ -7,6 +7,193 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture
+def poc_gate(tmp_path, monkeypatch):
+    import importlib
+    import json
+
+    sys.path.insert(0, str(ROOT / "scripts/swarm"))
+    try:
+        module = importlib.import_module("unit_gate")
+        files = ["src/plan.py", "tests/api/test_plan.py", "tests/swarm/test_plan.py"]
+        for file in files:
+            (tmp_path / file).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / file).write_text("import plan\n")
+        mapping = [
+            {
+                "id": "A1",
+                "runner": "pytest",
+                "test_node": "tests/api/test_plan.py::test_save",
+                "oracle": "spec_literal",
+            }
+        ]
+        (tmp_path / "u-test-map.json").write_text(json.dumps(mapping))
+        (tmp_path / "u-ids.txt").write_text("A1\n")
+        (tmp_path / "u-s1-tests.json").write_text('{"tests_commit": "t"}')
+        (tmp_path / "u-red.json").write_text(
+            json.dumps(
+                {
+                    "passed": True,
+                    "tests_commit": "t",
+                    "test_map_sha256": module.digest(tmp_path / "u-test-map.json"),
+                }
+            )
+        )
+        monkeypatch.setattr(
+            module, "acceptance", lambda path: {"journey_specs": ["save.phase1-flows.spec.ts"]}
+        )
+        monkeypatch.setattr(module, "changed", lambda *args: files)
+        gate = module.Gate(tmp_path, tmp_path, "u", "base", "candidate")
+        captured = []
+
+        def commands(identifier, commands, cwd="."):
+            captured.extend(commands)
+            gate.file("green-browser.json").write_text(
+                json.dumps(
+                    {
+                        "suites": [
+                            {
+                                "specs": [
+                                    {
+                                        "file": "save.phase1-flows.spec.ts",
+                                        "title": "saves",
+                                        "tests": [
+                                            {"projectName": p, "results": [{"status": "passed"}]}
+                                            for p in ("light-keyboard", "light-pointer")
+                                        ],
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                )
+            )
+            return {"exit_code": 0, "measured": 0, "threshold": 0, "command": commands}
+
+        monkeypatch.setattr(gate, "commands", commands)
+        monkeypatch.setattr(module, "python_rows", lambda path: [])
+        yield module, gate, captured
+    finally:
+        sys.path.pop(0)
+
+
+def test_development_runs_affected_tests_once_without_swarm_or_benchmarks(poc_gate):
+    _, gate, commands = poc_gate
+    gate.green()
+    gate.unit("G16")
+    python = [c for c in commands if "pytest" in c]
+    assert len(python) == 1
+    assert "tests/api/test_plan.py" in python[0]
+    assert "tests/api/test_plan.py::test_save" not in python[0]
+    assert not any(
+        "swarm" in arg or "--cov" in arg or "count=" in arg for c in commands for arg in c
+    )
+    browser = next(c for c in commands if "e2e" in c)
+    assert "--project=light-keyboard" in browser and "--project=light-pointer" in browser
+    assert "--repeat-each=1" in browser
+    assert not any("dark" in arg or "bench" in arg for arg in browser)
+
+
+def test_final_reuses_one_python_run_for_regression_and_coverage(poc_gate):
+    _, gate, commands = poc_gate
+    gate.final = True
+    gate.green()
+    gate.coverage()
+    python = [c for c in commands if "pytest" in c]
+    assert len(python) == 1
+    assert "--ignore=tests/swarm" in python[0]
+    assert "--ignore=tests/phase2" in python[0]
+    assert "--cov=src" in python[0] and "--cov-branch" in python[0]
+    assert any("diff-cover" in c[0] for c in commands)
+    assert gate.file("gate.json").name == "u-final-gate.json"
+
+
+def test_gate_stops_before_expensive_work_after_lint_failure(poc_gate, monkeypatch):
+    _, gate, _ = poc_gate
+    monkeypatch.setattr(gate, "frozen", lambda: {"exit_code": 0})
+    monkeypatch.setattr(gate, "commands", lambda *args: {"exit_code": 1})
+    monkeypatch.setattr(gate, "green", lambda: pytest.fail("tests ran after lint failed"))
+    rows = {r["id"]: r for r in gate.execute()}
+    assert rows["G4"]["exit_code"] == 1
+    assert rows["G2"]["disposition"] == "blocked"
+    assert rows["G18"]["exit_code"] == 1
+
+
+def test_development_results_pass_review_without_running_final_work(poc_gate, monkeypatch):
+    import importlib
+
+    module, gate, commands = poc_gate
+    checks = importlib.import_module("review_check")
+    monkeypatch.setattr(gate, "frozen", lambda: {"exit_code": 0, "measured": 0, "threshold": 0})
+    monkeypatch.setattr(gate, "diff", lambda *args: {"exit_code": 0, "measured": 0, "threshold": 0})
+    monkeypatch.setattr(
+        module,
+        "python_rows",
+        lambda path: [
+            {
+                "node": "tests/api/test_plan.py::test_save",
+                "project": "pytest",
+                "status": "passed",
+            }
+        ],
+    )
+    monkeypatch.setattr(gate, "mutation", lambda *args: pytest.fail("development ran mutation"))
+    rows = gate.execute()
+    packet = {
+        "candidate_sha": "candidate",
+        "fingerprint": "env",
+        "gates": rows,
+        "test_policy": module.POC_TEST_POLICY,
+        "stage": "pre",
+        "test_suite": "poc",
+    }
+    checks.gates_valid(packet, {"candidate_sha": "candidate"}, gate.spec, "env")
+    assert len([c for c in commands if "pytest" in c]) == 1
+    assert len([c for c in commands if "e2e" in c]) == 1
+    assert len([c for c in commands if "test" in c and "npm" in c]) == 1
+    assert {r["id"] for r in rows if r["disposition"] == "deferred"} == {
+        "G10",
+        "G11",
+        "G12",
+        "G13",
+        "G18",
+    }
+
+
+def test_swarm_selection_stays_separate_from_product(poc_gate):
+    _, gate, commands = poc_gate
+    gate.suite = "swarm"
+    gate.mapping = [{"runner": "pytest", "test_node": "tests/swarm/test_plan.py::test_lifecycle"}]
+    gate.green()
+    assert len(commands) == 1
+    assert "tests/swarm" in commands[0]
+    assert "--ignore=tests/swarm" not in commands[0]
+    assert not any("e2e" in command for command in commands)
+
+
+def test_default_collection_excludes_swarm_but_explicit_swarm_still_runs(tmp_path):
+    import os
+    import subprocess
+
+    (tmp_path / "pyproject.toml").write_text((ROOT / "pyproject.toml").read_text())
+    for folder in ("api", "swarm", "phase2"):
+        path = tmp_path / "tests" / folder / ("test_" + folder + ".py")
+        path.parent.mkdir(parents=True)
+        path.write_text("def test_example():\n    assert True\n")
+    command = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
+    env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTEST_ADDOPTS": ""}
+    product = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert product.returncode == 0, product.stdout + product.stderr
+    assert "tests/api/test_api.py" in product.stdout
+    assert "tests/swarm/" not in product.stdout and "tests/phase2/" not in product.stdout
+    swarm = subprocess.run(
+        [*command, "tests/swarm"], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    assert swarm.returncode == 0, swarm.stdout + swarm.stderr
+    assert "tests/swarm/test_swarm.py" in swarm.stdout
+    assert "tests/api/" not in swarm.stdout
+
+
 def test_gate_runs_later_checks_after_failure_and_records_all(tmp_path):
     sys.path.insert(0, str(ROOT / "scripts/swarm"))
     try:
@@ -78,12 +265,16 @@ def test_gate_formats_changed_python_tests(tmp_path, monkeypatch):
         gate = object.__new__(module.Gate)
         gate.root, gate.art, gate.tag = tmp_path, tmp_path, "probe"
         gate.files = ["tests/api/test_session.py", "web/src/auth.ts"]
+        (tmp_path / "tests/api").mkdir(parents=True)
+        (tmp_path / "tests/api/test_session.py").write_text("")
         gate.py, gate.ts, gate.spec, gate.survivors = [], [], {}, []
         captured = []
         monkeypatch.setattr(
-            gate, "commands", lambda name, commands: captured.extend(commands) or {}
+            gate,
+            "commands",
+            lambda name, commands, cwd=".": captured.extend(commands) or {"exit_code": 1},
         )
-        monkeypatch.setattr(module, "run_all", lambda checks, workers=1: dict(checks)["G4"]())
+        monkeypatch.setattr(gate, "frozen", lambda: {"exit_code": 0})
         gate.execute()
         assert [
             str(tmp_path / ".venv/bin/ruff"),
@@ -122,21 +313,16 @@ def test_fast_gate_runs_tests_once_and_defers_repeats_and_mutation(tmp_path, mon
         monkeypatch.setattr(
             gate,
             "commands",
-            lambda name, commands, cwd=".": captured.update({name: (cwd, commands)}) or {},
+            lambda name, commands, cwd=".": (
+                captured.update({name: (cwd, commands)}) or {"exit_code": 0}
+            ),
         )
         monkeypatch.setattr(gate, "mutation", lambda *args: pytest.fail("mutation ran"))
-        rows = {}
-        monkeypatch.setattr(
-            module,
-            "run_all",
-            lambda checks, workers=1: rows.update(dict(checks), workers=workers),
-        )
-        gate.execute()
+        monkeypatch.setattr(gate, "frozen", lambda: {"exit_code": 0})
+        monkeypatch.setattr(gate, "diff", lambda *args: {"exit_code": 0})
+        rows = {row["id"]: row for row in gate.execute()}
         for identifier in ("G2", "G3", "G9", "G10", "G11", "G12", "G13", "G16", "G17", "G18"):
-            assert rows[identifier]()["disposition"] == "not_applicable"
-        assert rows["workers"] == len(rows) - 1
-        for identifier in ("G4", "G14", "related"):
-            rows[identifier]()
+            assert rows[identifier]["disposition"] == "deferred"
         assert captured["G4"][1][0] == [
             str(tmp_path / ".venv/bin/ruff"),
             "check",
@@ -210,8 +396,7 @@ def test_fast_gate_skips_provision_only_when_marker_matches(tmp_path, monkeypatc
         for mode in ("fast", "fast", "pre"):
             monkeypatch.setattr(sys, "argv", ["unit_gate", mode, "probe", "b", "c"])
             assert module.main() == 0
-        assert len(provisioned) == 2
-        # Each stateful gate opens its own runtime inside execute, so main opens none.
+        assert len(provisioned) == 1
         assert isolations == []
         assert runtime_envs == [True, True, True]
         marker = (tmp_path / ".venv/provision.sha256").read_text()
@@ -219,7 +404,7 @@ def test_fast_gate_skips_provision_only_when_marker_matches(tmp_path, monkeypatc
         (tmp_path / "web/package-lock.json").write_text("changed")
         monkeypatch.setattr(sys, "argv", ["unit_gate", "fast", "probe", "b", "c"])
         assert module.main() == 0
-        assert len(provisioned) == 3
+        assert len(provisioned) == 2
     finally:
         sys.path.pop(0)
 
@@ -256,9 +441,9 @@ def test_baseline_requires_recorded_format_file_to_be_unchanged(tmp_path, monkey
             monkeypatch.setattr(gate, "output", output)
             assert gate.baseline(tmp_path, tmp_path, "probe", {}) is modified
             packet = json.loads((tmp_path / "probe-baseline.json").read_text())
-            assert packet["results"][2]["disposition"] == (
-                "failed" if modified else "known_failure"
-            )
+            assert next(r for r in packet["results"] if "format" in r["command"])[
+                "disposition"
+            ] == ("failed" if modified else "known_failure")
     finally:
         sys.path.pop(0)
 
@@ -290,6 +475,7 @@ def test_web_changed_line_coverage_uses_repository_paths(tmp_path, monkeypatch):
     report.write_text("TN:\nSF:src/auth.ts\nDA:1,0\nLF:1\nLH:0\nend_of_record\n")
     gate = object.__new__(gate_module.Gate)
     gate.root, gate.art, gate.tag, gate.base = root, tmp_path, "coverage", base
+    gate.qualification_base = base
     gate.py, gate.ts, gate.env = [], ["web/src/auth.ts"], env
     monkeypatch.setattr(gate, "unit", lambda *args: {"exit_code": 0})
     assert gate.coverage()["exit_code"] != 0
@@ -442,7 +628,7 @@ def test_gate_uses_acceptance_check_readers(
     ]
 
 
-def test_gate_commands_runs_every_command_and_records_codes(
+def test_gate_commands_stops_after_failure_and_records_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import importlib
@@ -473,17 +659,14 @@ def test_gate_commands_runs_every_command_and_records_codes(
     }
     log = (tmp_path / "probe-G4.log").read_text()
     assert "first" in log
-    assert str(tmp_path / "work") in log
-    assert "environment retained" in log
-    assert "stderr retained" in log
+    assert str(tmp_path / "work") not in log
+    assert "environment retained" not in log
+    assert "stderr retained" not in log
 
 
-@pytest.mark.parametrize("report_case", ["passed", "missing_project", "missing_repeat", "skipped"])
-def test_gate_journey_checks_acceptance_rows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report_case: str
-) -> None:
+@pytest.mark.parametrize("report_case", ["passed", "missing_project", "duplicate_run", "skipped"])
+def test_gate_journey_checks_acceptance_rows(tmp_path, monkeypatch, report_case):
     import importlib
-    import json
 
     monkeypatch.syspath_prepend(str(ROOT / "scripts/swarm"))
     module = importlib.import_module("unit_gate")
@@ -497,47 +680,30 @@ def test_gate_journey_checks_acceptance_rows(
             "runner": "playwright",
             "oracle": "fixture",
             "test_node": "tests/probe.spec.ts::acceptance passes",
-            "projects": ["chromium", "firefox"],
-        },
-        {"id": "python-1", "runner": "pytest"},
-    ]
-    captured: list[tuple[str, list[list[str]]]] = []
-
-    def commands(identifier: str, actions: list[list[str]]) -> dict[str, object]:
-        captured.append((identifier, actions))
-        projects = ["chromium"] if report_case == "missing_project" else ["chromium", "firefox"]
-        repeats = 4 if report_case == "missing_repeat" else 5
-        document = {
-            "suites": [
-                {
-                    "suites": [
-                        {
-                            "file": "tests/probe.spec.ts",
-                            "specs": [
-                                {
-                                    "title": "acceptance passes",
-                                    "tests": [
-                                        {
-                                            "projectName": project,
-                                            "results": [
-                                                {
-                                                    "status": "skipped"
-                                                    if report_case == "skipped" and index == 0
-                                                    else "passed"
-                                                }
-                                                for index in range(repeats)
-                                            ],
-                                        }
-                                        for project in projects
-                                    ],
-                                }
-                            ],
-                        }
-                    ]
-                }
-            ]
+            "projects": ["light-keyboard", "light-pointer"],
         }
-        Path(gate.env["PLAYWRIGHT_JSON_OUTPUT_NAME"]).write_text(json.dumps(document))
+    ]
+    projects = (
+        ["light-keyboard"]
+        if report_case == "missing_project"
+        else ["light-keyboard", "light-pointer"]
+    )
+    repeats = 2 if report_case == "duplicate_run" else 1
+    gate.reports = {
+        "playwright": [
+            {
+                "node": "tests/probe.spec.ts::acceptance passes",
+                "project": project,
+                "status": "skipped" if report_case == "skipped" else "passed",
+            }
+            for project in projects
+            for _ in range(repeats)
+        ]
+    }
+    captured = []
+
+    def commands(identifier, actions):
+        captured.extend(actions)
         return {"exit_code": 0, "measured": 0, "threshold": 0, "command": actions}
 
     monkeypatch.setattr(gate, "commands", commands)
@@ -547,42 +713,17 @@ def test_gate_journey_checks_acceptance_rows(
         assert result["failed_test_ids"] == []
         assert result["paths"] == ["web/", "src/", "scripts/swarm/", "tests/e2e/"]
     else:
-        message = (
-            "missing or unexpected projects"
-            if report_case == "missing_project"
-            else ("did not pass every repetition")
-        )
-        with pytest.raises(ValueError, match="acceptance-1 " + message):
+        with pytest.raises(ValueError, match="acceptance-1"):
             gate.journey()
-    assert captured == [
-        (
-            "G17",
-            [
-                [
-                    "npm",
-                    "--prefix",
-                    "web",
-                    "run",
-                    "e2e",
-                    "--",
-                    "tests/probe.spec.ts",
-                    "--retries=0",
-                    "--repeat-each=5",
-                    "--workers=1",
-                    "--reporter=json",
-                ]
-            ],
-        )
-    ]
+    assert captured == []
 
 
-def test_full_suite_gates_skip_phase2_tests():
+def test_full_suite_gates_skip_swarm_and_phase2_tests():
     sys.path.insert(0, str(ROOT / "scripts/swarm"))
     try:
         import unit_gate
     finally:
         sys.path.pop(0)
     source = (ROOT / "scripts/swarm/unit_gate.py").read_text()
-    assert unit_gate.PYTEST_IGNORE == ["--ignore=tests/phase2"]
-    # G10, G12 coverage and baseline are the full-suite pytest runs.
-    assert source.count("*PYTEST_IGNORE") == 3
+    assert unit_gate.PYTEST_IGNORE == ["--ignore=tests/phase2", "--ignore=tests/swarm"]
+    assert source.count("*PYTEST_IGNORE") == 2

@@ -15,6 +15,10 @@ from uuid import uuid4
 
 from run_state import ProcessInfo
 
+POC_TEST_POLICY = "poc-single-pass-2026-10-21"
+FINAL_ONLY = {"G10", "G12", "G13", "G18"}
+POC_PROJECTS = ["light-keyboard", "light-pointer"]
+
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -75,8 +79,16 @@ NODE = Path(
 
 
 def artifact_hashes(
-    art: Path, tag: str, spec: Mapping[str, Sequence[str]], fast: bool = False
+    art: Path,
+    tag: str,
+    spec: Mapping[str, Sequence[str]],
+    fast: bool = False,
+    final: bool = False,
 ) -> dict[str, str]:
+    required = [
+        *spec.get("required_artifacts", []),
+        *(spec.get("final_artifacts", []) if final else []),
+    ]
     names = [
         "acceptance.md",
         "ids.txt",
@@ -84,8 +96,8 @@ def artifact_hashes(
         "s1-tests.json",
         "s1-tests.sha256",
         "red.json",
-        "fast-survivors.json" if fast else "survivors.json",
-        *spec.get("required_artifacts", []),
+        "fast-survivors.json" if fast else "final-survivors.json" if final else "survivors.json",
+        *required,
     ]
     hashes = {}
     for name in names:
@@ -93,7 +105,7 @@ def artifact_hashes(
         if not path.resolve().is_relative_to(art.resolve()):
             raise ValueError("Artifact escapes packet directory")
         hashes[path.name] = digest(path)
-        if name in spec.get("required_artifacts", []):
+        if name in required:
             manifest = json.loads(path.read_text())
             for item in manifest.get("artifacts", []):
                 child = art / item["path"]

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import jsonschema
 from gate_evidence import (
+    FINAL_ONLY,
+    POC_TEST_POLICY,
     acceptance,
     artifact_hashes,
     changed,
@@ -61,11 +63,25 @@ def gates_valid(gate, candidate, spec, actual_fingerprint, u8_approved=False):
         raise ValueError("Gate candidate differs")
     if gate["fingerprint"] != actual_fingerprint:
         raise ValueError("Environment fingerprint differs")
+    policy = gate.get("test_policy") == POC_TEST_POLICY
+    if policy and (
+        gate.get("stage") not in {"pre", "final"} or gate.get("test_suite") not in {"poc", "swarm"}
+    ):
+        raise ValueError("Development feedback is not an acceptance gate")
+    if (
+        policy
+        and gate.get("stage") == "final"
+        and (
+            not gate.get("qualification_base_sha")
+            or gate["qualification_base_sha"] != spec.get("qualification_base_sha")
+        )
+    ):
+        raise ValueError("Final qualification base differs from frozen acceptance")
     exact([g["id"] for g in gate["gates"]], [f"G{i}" for i in range(1, 19)], "Gates")
     for row in gate["gates"]:
         disposition = row["disposition"]
         if disposition in {"retained", "applicable"}:
-            if lost_p2_art_only(row):
+            if not policy and lost_p2_art_only(row):
                 continue
             if row["exit_code"] != 0:
                 raise ValueError(row["id"] + " failed")
@@ -75,6 +91,17 @@ def gates_valid(gate, candidate, spec, actual_fingerprint, u8_approved=False):
                 passed = row["measured"] <= row["threshold"]
             if not passed:
                 raise ValueError(row["id"] + " threshold failed")
+        elif disposition == "deferred":
+            allowed = {"G11"} | (FINAL_ONLY if gate.get("stage") == "pre" else set())
+            if (
+                not policy
+                or row["id"] not in allowed
+                or row.get("approval") != POC_TEST_POLICY
+                or row.get("exit_code") != 0
+                or row.get("command") != []
+                or not row.get("evidence")
+            ):
+                raise ValueError("Unauthorized test deferral")
         elif disposition == "waived":
             if (
                 row["id"] not in {"G13", "G18"}
@@ -83,7 +110,18 @@ def gates_valid(gate, candidate, spec, actual_fingerprint, u8_approved=False):
             ):
                 raise ValueError("Unapproved gate waiver")
         elif disposition == "not_applicable":
-            files = gate.get("diff_files", [])
+            files = (
+                gate.get("qualification_diff_files", [])
+                if gate.get("stage") == "final"
+                else gate.get("diff_files", [])
+            )
+            if policy:
+                files = [
+                    f
+                    for f in files
+                    if f.startswith(("scripts/swarm/", "tests/swarm/"))
+                    == (gate["test_suite"] == "swarm")
+                ]
             allowed = (
                 (row["id"] == "G9" and not spec.get("property_test_paths"))
                 or (row["id"] == "G13" and not production(files, "python"))
@@ -186,7 +224,7 @@ def packet_artifacts(art, tag, gate, spec):
         if not path.resolve().is_relative_to(art.resolve()) or digest(path) != expected:
             raise ValueError("Packet artifact hash differs")
     try:
-        actual = artifact_hashes(art, tag, spec)
+        actual = artifact_hashes(art, tag, spec, final=gate.get("stage") == "final")
     except (ValueError, OSError) as error:
         raise ValueError("Packet artifact hashes cannot be verified") from error
     if gate.get("artifact_hashes") != actual:
@@ -231,6 +269,7 @@ def finding_history(art, tag, candidate, findings):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--require-final", action="store_true")
     for name in ("gate", "candidate", "ids", "open-findings"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--review", type=Path, action="append", required=True)
@@ -238,6 +277,10 @@ def main():
     try:
         candidate = json.loads(args.candidate.read_text())
         gate = json.loads(args.gate.read_text())
+        if args.require_final and (
+            gate.get("test_policy") != POC_TEST_POLICY or gate.get("stage") != "final"
+        ):
+            raise ValueError("Final qualification requires a final gate receipt")
         root = Path(candidate["worktree"])
         if output(["git", "rev-parse", "HEAD"], root) != candidate["candidate_sha"]:
             raise ValueError("Candidate checkout moved")
@@ -253,6 +296,23 @@ def main():
         files = changed(root, candidate["main_sha"], candidate["candidate_sha"])
         if files != gate["diff_files"]:
             raise ValueError("Recorded diff differs")
+        if gate.get("stage") == "final":
+            qualification_base = gate["qualification_base_sha"]
+            subprocess.run(
+                [
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    qualification_base,
+                    candidate["candidate_sha"],
+                ],
+                cwd=root,
+                check=True,
+            )
+            if changed(root, qualification_base, candidate["candidate_sha"]) != gate.get(
+                "qualification_diff_files"
+            ):
+                raise ValueError("Qualification diff differs")
         prefix = args.candidate.name.removesuffix("-candidate.json")
         art = args.candidate.parent
         spec = acceptance(art / (prefix + "-acceptance.md"))
@@ -272,7 +332,16 @@ def main():
             spec,
             [json.loads(p.read_text()) for p in args.review],
             findings,
-            json.loads((art / (prefix + "-survivors.json")).read_text()),
+            json.loads(
+                (
+                    art
+                    / (
+                        prefix
+                        + ("-final" if gate.get("stage") == "final" else "")
+                        + "-survivors.json"
+                    )
+                ).read_text()
+            ),
             fingerprint(root),
             state.get("approvals", {}).get("U8", False),
         )

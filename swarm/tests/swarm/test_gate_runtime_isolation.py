@@ -49,8 +49,6 @@ def test_each_stateful_gate_gets_its_own_runtime(tmp_path, monkeypatch):
         gate.isolated("G2", broken)()
     assert closed[-1] == "unit-G2"
     assert gate.env == {"BASE": "1"}
-    assert {"G2", "G10", "G17", "related"} <= unit_gate.STATEFUL
-    assert not {"G4", "G14", "G15", "G16"} & unit_gate.STATEFUL
 
 
 def test_runtime_drops_only_its_database_when_setup_fails(tmp_path, monkeypatch):
@@ -73,3 +71,34 @@ def test_runtime_drops_only_its_database_when_setup_fails(tmp_path, monkeypatch)
     dropped = [c[-1] for c in calls if c[0] == "dropdb"]
     assert len(created) == 1 and dropped == created
     assert '"database_dropped": true' in (tmp_path / "unit-G10-runtime.json").read_text()
+
+
+@pytest.mark.parametrize("first_exit", [0, 1])
+def test_python_and_browser_commands_use_separate_runtimes(tmp_path, monkeypatch, first_exit):
+    opened, closed, seen = [], [], []
+
+    @contextmanager
+    def runtime(root, art, tag, env):
+        opened.append(tag)
+        try:
+            yield {"INTERIOR_DATABASE_URL": "db-" + tag}
+        finally:
+            closed.append(tag)
+
+    def run(command, **kwargs):
+        seen.append((command, kwargs["env"]["INTERIOR_DATABASE_URL"]))
+        return subprocess.CompletedProcess(command, first_exit if len(seen) == 1 else 0)
+
+    monkeypatch.setattr(unit_gate, "runtime", runtime)
+    monkeypatch.setattr(unit_gate.subprocess, "run", run)
+    gate = object.__new__(unit_gate.Gate)
+    gate.root, gate.art, gate.tag = tmp_path, tmp_path, "unit"
+    gate.env = {"BASE": "1"}
+    gate.runtime_env = dict(gate.env)
+    commands = [["python", "-m", "pytest"], ["npm", "run", "e2e"]]
+    result = gate.commands("G2", commands)
+    expected = commands[:1] if first_exit else commands
+    assert seen == [(command, f"db-unit-G2-{i}") for i, command in enumerate(expected)]
+    assert opened == closed == [f"unit-G2-{i}" for i in range(len(expected))]
+    assert result["exit_code"] == first_exit
+    assert gate.env == {"BASE": "1"}

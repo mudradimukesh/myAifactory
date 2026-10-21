@@ -81,6 +81,29 @@ def test_colored_playwright_assertions_keep_their_expected_message(checker):
     assert checker.assertion_red(row, "Expected: 1")
 
 
+def test_light_policy_preserves_frozen_map_and_requires_both_inputs(checker):
+    mapping = [
+        {
+            "id": "A1",
+            "runner": "playwright",
+            "test_node": "a::works",
+            "oracle": "spec_literal",
+            "projects": ["light-keyboard", "dark-keyboard", "light-pointer", "dark-pointer"],
+        }
+    ]
+    selected = checker.light_mapping(mapping)
+    assert len(mapping[0]["projects"]) == 4
+    rows = [
+        {"node": "a::works", "project": p, "status": "passed"}
+        for p in ("light-keyboard", "light-pointer")
+    ]
+    checker.check(selected, ["A1"], {"playwright": rows})
+    with pytest.raises(ValueError):
+        checker.check(selected, ["A1"], {"playwright": rows[:1]})
+    with pytest.raises(ValueError, match="no light-theme"):
+        checker.light_mapping([{**mapping[0], "projects": ["dark-keyboard"]}])
+
+
 def test_retroactive_red_accepts_expected_failure_of_any_kind(checker):
     missing = {"status": "failed", "error": "AttributeError: no attribute 'retire_draining'"}
     assert checker.retroactive_red(missing, "AttributeError")

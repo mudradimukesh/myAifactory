@@ -41,6 +41,15 @@ def allowed(run_path, action):
     return state
 
 
+def has_branch(repo: Path, name: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", "refs/heads/" + name], cwd=repo
+        ).returncode
+        == 0
+    )
+
+
 def resolve_base(repo: Path) -> tuple[str, str]:
     base_ref = os.environ.get("PILOT_BASE_REF", "main")
     try:
@@ -84,14 +93,7 @@ def prepare(repo, art, run_path, tag, branch, check_only=False):
         while True:
             root = worktree_root / tag / str(attempt)
             integration_branch = f"int/{tag}/{attempt}"
-            if not (
-                root.exists()
-                or subprocess.run(
-                    ["git", "show-ref", "--verify", "--quiet", "refs/heads/" + integration_branch],
-                    cwd=repo,
-                ).returncode
-                == 0
-            ):
+            if not (root.exists() or has_branch(repo, integration_branch)):
                 break
             skipped.append(attempt)
             attempt += 1
@@ -117,6 +119,10 @@ def prepare(repo, art, run_path, tag, branch, check_only=False):
             "integration_branch": integration_branch,
             "status": "prepared",
         }
+        if has_branch(repo, branch):
+            receipt["builder_branch"] = branch
+        elif current.exists() and previous.get("builder_branch"):
+            receipt["builder_branch"] = previous["builder_branch"]
         if skipped:
             receipt["skipped_attempts"] = skipped
         if current.exists() and kept:
@@ -179,8 +185,31 @@ def push(repo, remote, art, tag, receipt):
 
 def cleanup(repo, art, tag, receipt):
     # A kept or failed removal never changes the push outcome; merge retries it later.
-    kept = retire_worktree(repo, receipt["worktree"])
-    receipt["worktree_cleanup"] = "done" if kept is None else "pending: " + kept
+    kept = [retire_worktree(repo, receipt["worktree"])]
+    # Every attempt and the builder branch go once main holds all their content. A branch
+    # with changes main lacks, or one checked out in a live worktree, is kept.
+    attempts = [f"int/{tag}/{n}" for n in range(1, receipt["attempt"] + 1)]
+    for branch in [*attempts, receipt.get("builder_branch")]:
+        if not branch or not has_branch(repo, branch):
+            continue
+        merged = subprocess.run(
+            ["git", "merge-tree", "--write-tree", "HEAD", branch],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        if merged.returncode or merged.stdout.split()[0] != output(
+            ["git", "rev-parse", "HEAD^{tree}"], repo
+        ):
+            kept.append("branch " + branch + " has changes main lacks")
+            continue
+        deleted = subprocess.run(
+            ["git", "branch", "-D", branch], cwd=repo, capture_output=True, text=True
+        )
+        if deleted.returncode:
+            kept.append("branch " + branch + " kept: " + deleted.stderr.strip())
+    reasons = [reason for reason in kept if reason]
+    receipt["worktree_cleanup"] = "pending: " + "; ".join(reasons) if reasons else "done"
     save(art / (tag + "-candidate.json"), receipt)
 
 

@@ -11,6 +11,7 @@
 set -u
 REPO=${REPO:-/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer}
 ART=${ART:-/private/tmp/factory-fp-0925/swarm/interior-p1-poc}
+WORKSPACE=${ORCH_WORKSPACE:-$REPO-wt/orchestrator}
 CAP=${ORCH_CAP:-100000}
 PID_WAIT=${SPAWN_PID_WAIT:-60}
 READY_WAIT=${SPAWN_READY_WAIT:-900}
@@ -24,7 +25,7 @@ DISALLOWED=Agent,Artifact,ArtifactComments,ArtifactData,WebSearch,WebFetch,Noteb
 
 ready_file() { print -r -- "$ART/logs/orchestrator-$1-ready.json"; }
 prompt() {
-  print -r -- "You are orchestrator $1, session $2. Follow prompts/phase-1/orchestrator-brief.md and read the latest orchestrator handoff (prompts/phase-1/orchestrator-handoff.md). ART=$ART. Command templates: ART/logs/orchestrator-templates.md. First, after reading the handoff, use Write to create $(ready_file $1) containing exactly {\"session_id\":\"$2\",\"handoff_sha256\":\"$3\"}. scripts/swarm/orchestrator-spawn.sh is registering you and, once that file exists, retires your predecessor and records its final usage. These steps are pending, not done: read tail -4 ART/logs/orchestrator-spawns.log together with your next other read, and do by template any step it reports as not done. Context cap $CAP: at your handoff, write the handoff, then run scripts/swarm/orchestrator-spawn.sh $(( $1 + 1 )).
+  print -r -- "You are orchestrator $1, session $2. Follow prompts/phase-1/orchestrator-brief.md and read the latest orchestrator handoff (prompts/phase-1/orchestrator-handoff.md). ART=$ART. Command templates: ART/logs/orchestrator-templates.md. First, after reading the handoff, use Write to create $(ready_file $1) containing exactly {\"session_id\":\"$2\",\"handoff_sha256\":\"$3\"}. scripts/swarm/orchestrator-spawn.sh is registering you and, once that file exists, retires your predecessor and records its final usage. These steps are pending, not done: read tail -4 ART/logs/orchestrator-spawns.log together with your next other read, and do by template any step it reports as not done. Your workspace is $WORKSPACE, shared by every orchestrator: do repairs, merges and validation runs there, switching branches inside it. Do not create other worktrees or /tmp checkouts for your own work; builder and integration worktrees come only from their launch and prepare scripts. Context cap $CAP: at your handoff, write the handoff, then run scripts/swarm/orchestrator-spawn.sh $(( $1 + 1 )).
 
 $PACKET"
 }
@@ -49,6 +50,25 @@ same_process() {
 running() { ps -o stat= -p "$1" 2>/dev/null | grep -qv '^Z'; }
 ledger() { python3 "$REPO/scripts/swarm/run_state.py" --run "$RUN" --as orchestrator "$1" --data "$2" >/dev/null; }
 log() { print -r -- "$(date '+%FT%T') $*" >> "$LOG"; }
+# Every orchestrator reuses one workspace. One that is no longer a usable worktree is
+# removed and re-added from main; an unregistered directory at the path is never deleted.
+workspace() {
+  [[ $(git -C "$WORKSPACE" rev-parse --show-toplevel 2>/dev/null) == ${WORKSPACE:A} ]] && return 0
+  if [[ -e $WORKSPACE ]] && ! git -C "$REPO" worktree remove --force "$WORKSPACE" >> "$LOG" 2>&1; then
+    # Git refuses a registered worktree whose .git file is gone; delete it directly.
+    git -C "$REPO" worktree list --porcelain | grep -qxF "worktree ${WORKSPACE:A}" || {
+      print -r -- "workspace $WORKSPACE is unusable and is not a removable worktree"
+      return 1
+    }
+    rm -rf -- "$WORKSPACE" || return 1
+  fi
+  git -C "$REPO" worktree prune
+  git -C "$REPO" worktree add --detach "$WORKSPACE" main >> "$LOG" 2>&1 || {
+    print -r -- "could not add workspace $WORKSPACE from main"
+    return 1
+  }
+  log "workspace $WORKSPACE re-added from main"
+}
 
 usage_json() {
   (cd "$REPO/scripts/swarm" && python3 -c 'import json,sys;from pathlib import Path;from pilot_guard import claude_usage;print(json.dumps(claude_usage(Path(sys.argv[1]))))' "$TRANSCRIPTS/$1.jsonl" 2>/dev/null)
@@ -165,6 +185,7 @@ esac
 [[ -f $RUN ]] || { print "no ledger at $RUN; restore run state before succession"; exit 2; }
 [[ -f $HANDOFF ]] || { print "no handoff at $HANDOFF"; exit 2; }
 mkdir -p "${LOG:h}" || exit 1
+workspace || exit 1
 mkdir "$LOCK" 2>/dev/null || { print "another orchestrator spawn is in progress; lock: $LOCK"; exit 3; }
 session=$(uuidgen | tr A-Z a-z)
 hash=$(shasum -a 256 "$HANDOFF" | cut -d' ' -f1)

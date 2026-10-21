@@ -280,3 +280,72 @@ def test_exited_successor_with_unknown_usage_keeps_a_blocker(spawn):
     assert inventory_row(art, session)["complete"] is True
     assert state["runs"]["orchestrator-" + session]["usage_status"] == "unknown"
     assert any(b["id"] == "SPAWN-" + session[:8] for b in state["blockers"])
+
+
+@pytest.mark.parametrize("state", ["missing", "valid", "broken", "foreign"])
+def test_spawn_reuses_one_workspace(tmp_path, state):
+    repo = tmp_path / "repo"
+    (repo / "prompts/phase-1").mkdir(parents=True)
+    (repo / "prompts/phase-1/orchestrator-handoff.md").write_text("handoff")
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=F",
+            "-c",
+            "user.email=f@x",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "base",
+        ],
+        check=True,
+    )
+    art = tmp_path / "art"
+    (art / "logs").mkdir(parents=True)
+    (art / "run.json").write_text("{}")
+    workspace = tmp_path / "orchestrator"
+    if state in {"valid", "broken"}:
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(workspace)],
+            check=True,
+        )
+        (workspace / "in-progress").write_text("keep")
+        if state == "broken":
+            (workspace / ".git").unlink()
+    elif state == "foreign":
+        workspace.mkdir()
+        (workspace / "in-progress").write_text("keep")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "wezterm-calls"
+    (bin_dir / "wezterm").write_text(f'#!/bin/sh\necho "$@" >> {calls}\nexit 1\n')
+    (bin_dir / "wezterm").chmod(0o755)
+    env = dict(
+        os.environ,
+        REPO=str(repo),
+        ART=str(art),
+        ORCH_WORKSPACE=str(workspace),
+        PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+    )
+    result = subprocess.run(
+        ["/bin/zsh", str(SCRIPT), "--start", "1"], env=env, capture_output=True, text=True
+    )
+    listed = subprocess.check_output(["git", "-C", str(repo), "worktree", "list"], text=True)
+    if state == "foreign":
+        assert "is unusable and is not a removable worktree" in result.stdout
+        assert (workspace / "in-progress").read_text() == "keep"
+        assert not calls.exists()
+        return
+    # The stub wezterm fails, so the spawn stops right after preparing the workspace.
+    assert "wezterm spawn failed" in result.stdout
+    assert f"Your\\ workspace\\ is\\ {workspace}" in calls.read_text()
+    assert listed.count(str(workspace)) == 1
+    assert subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ) == subprocess.check_output(["git", "-C", str(repo), "rev-parse", "main"], text=True)
+    assert (workspace / "in-progress").exists() == (state == "valid")

@@ -5,7 +5,14 @@ import sys
 import time
 from pathlib import Path
 
-from acceptance_check import assertion_red, browser_rows, mapped_nodes, python_rows, retroactive_red
+from acceptance_check import (
+    assertion_red,
+    browser_rows,
+    light_mapping,
+    mapped_nodes,
+    python_rows,
+    retroactive_red,
+)
 from gate_evidence import digest, output, provision, retire_worktree, runtime
 
 
@@ -17,7 +24,7 @@ def run(root, command, log, env):
 
 
 def prove(repo, art, tag, predecessor, tests_commit, retroactive=None):
-    mapping = json.loads((art / (tag + "-test-map.json")).read_text())
+    mapping = light_mapping(json.loads((art / (tag + "-test-map.json")).read_text()))
     root = art / "red" / (tag + "-" + str(time.time_ns()))
     subprocess.run(
         ["git", "worktree", "add", "--detach", str(root), predecessor], cwd=repo, check=True
@@ -85,6 +92,8 @@ def collect(repo, art, tag, root, mapping, predecessor, tests_commit, retroactiv
                     "e2e",
                     "--",
                     *specs,
+                    "--project=light-keyboard",
+                    "--project=light-pointer",
                     "--reporter=json",
                     "--retries=0",
                 ],

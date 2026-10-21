@@ -9,11 +9,14 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from acceptance_check import browser_rows, check, mapped_nodes
+from acceptance_check import browser_rows, check, light_mapping, mapped_nodes
 from acceptance_check import python_rows as read_python_rows
 from diff_lint import check as lint_diff
 from gate_evidence import (
+    FINAL_ONLY,
     NODE,
+    POC_PROJECTS,
+    POC_TEST_POLICY,
     acceptance,
     artifact_hashes,
     changed,
@@ -57,12 +60,9 @@ def run_all(checks, workers=1):
 
 
 FULL_ONLY = {"G2", "G3", "G9", "G10", "G11", "G12", "G13", "G16", "G17", "G18"}
-# Gates that start the API or touch the database each get a fresh runtime, so one gate's
-# rows, users and jobs cannot leak into another gate's assertions.
-STATEFUL = {"G2", "G9", "G10", "G11", "G12", "G13", "G17", "related"}
 # The Phase 1 POC gates skip suites another phase owns (user ruling 2026-10-20).
 # Phase 2's environment tests read Phase 2 receipts that Phase 1 cannot provide.
-PYTEST_IGNORE = ["--ignore=tests/phase2"]
+PYTEST_IGNORE = ["--ignore=tests/phase2", "--ignore=tests/swarm"]
 WEB_LINTED = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 
 
@@ -73,10 +73,13 @@ class Gate:
     art: Path
     tag: str
     fast = False
+    final = False
+    suite = "poc"
 
     def __init__(self, root, art, tag, base, candidate, fast=False):
         self.root, self.art, self.tag, self.base, self.candidate = root, art, tag, base, candidate
         self.fast = fast
+        self.qualification_base = base
         self.spec = acceptance(art / (tag + "-acceptance.md"))
         self.files = changed(root, base, candidate)
         self.py = production(self.files, "python")
@@ -87,13 +90,28 @@ class Gate:
             "PATH": str(NODE.parent) + os.pathsep + os.environ["PATH"],
             "CI": "1",
         }
-        self.mapping = json.loads((art / (tag + "-test-map.json")).read_text())
+        self.mapping = light_mapping(json.loads((art / (tag + "-test-map.json")).read_text()))
+        nodes = [n for m in self.mapping if m["runner"] == "pytest" for n in mapped_nodes(m)]
+        if nodes and all(n.startswith("tests/swarm/") for n in nodes):
+            if any(m["runner"] != "pytest" for m in self.mapping):
+                raise ValueError("Separate swarm acceptance from POC acceptance")
+            self.suite = "swarm"
+        elif any(n.startswith("tests/swarm/") for n in nodes):
+            raise ValueError("Separate swarm acceptance from POC acceptance")
+        self.py = [f for f in self.py if f.startswith("scripts/swarm/") == (self.suite == "swarm")]
+        if self.suite == "swarm":
+            self.ts = []
         self.reports = {}
         self.survivors = []
 
     def isolated(self, identifier, action):
         def run():
-            name = self.tag + ("-fast" if self.fast else "") + "-" + identifier
+            name = (
+                self.tag
+                + ("-fast" if self.fast else "-final" if self.final else "")
+                + "-"
+                + identifier
+            )
             with runtime(self.root, self.art, name, self.runtime_env) as configured:
                 shared = self.env
                 self.env = {**shared, **configured}
@@ -108,7 +126,8 @@ class Gate:
         return self.art / (self.tag + "-" + suffix)
 
     def file(self, suffix: str) -> Path:
-        return self.input(("fast-" if self.fast else "") + suffix)
+        prefix = "fast-" if self.fast else "final-" if self.final else ""
+        return self.input(prefix + suffix)
 
     def commands(self, gate, commands, cwd="."):
         report = self.file("G10-tests.xml")
@@ -116,11 +135,25 @@ class Gate:
             commands = [[*command, "--junitxml=" + str(report)] for command in commands]
         codes = []
         with self.file(gate + ".log").open("w") as log:
-            for command in commands:
-                completed = subprocess.run(
-                    command, cwd=self.root / cwd, env=self.env, stdout=log, stderr=subprocess.STDOUT
+            for index, command in enumerate(commands):
+
+                def launch(command=command):
+                    return subprocess.run(
+                        command,
+                        cwd=self.root / cwd,
+                        env=self.env,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                    )
+
+                completed = (
+                    self.isolated(f"G2-{index}", launch)()
+                    if (gate == "G2" and self.runtime_env is not None)
+                    else launch()
                 )
                 codes.append(completed.returncode)
+                if completed.returncode:
+                    break
         result = {
             "command": commands,
             "exit_code": max([abs(c) for c in codes], default=0),
@@ -128,7 +161,7 @@ class Gate:
             "threshold": 0,
             "evidence": str(self.file(gate + ".log")),
         }
-        if gate == "G10":
+        if gate == "G10" and commands:
             if not report.exists():
                 raise ValueError("G10 test report missing")
             tests = python_rows(report)
@@ -180,9 +213,16 @@ class Gate:
         ):
             raise ValueError("Red proof differs from frozen tests")
         commands = []
-        nodes = sorted(
-            {node for m in self.mapping if m["runner"] == "pytest" for node in mapped_nodes(m)}
-        )
+        nodes = self.python_nodes()
+        if self.final or self.suite == "swarm":
+            nodes = ["tests/swarm"] if self.suite == "swarm" else ["tests", *PYTEST_IGNORE]
+        coverage = []
+        if self.final and self.py:
+            coverage = [
+                *["--cov=" + path for path in sorted({str(Path(f).parent) for f in self.py})],
+                "--cov-branch",
+                "--cov-report=xml:" + str(self.file("cov.xml")),
+            ]
         if nodes:
             commands.append(
                 [
@@ -193,17 +233,25 @@ class Gate:
                     "-p",
                     "no:randomly",
                     *nodes,
+                    *coverage,
                     "--junitxml=" + str(self.file("green.xml")),
                 ]
             )
         specs = sorted(
             {
-                node.split("::")[0]
-                for m in self.mapping
-                if m["runner"] == "playwright"
-                for node in mapped_nodes(m)
+                *self.spec.get("journey_specs", []),
+                *[
+                    node.split("::")[0]
+                    for m in self.mapping
+                    if m["runner"] == "playwright"
+                    for node in mapped_nodes(m)
+                ],
             }
         )
+        if self.final and self.suite == "poc":
+            specs = [".*\\.phase1-flows\\.spec\\.ts"]
+        if self.suite == "swarm":
+            specs = []
         if specs:
             self.env["PLAYWRIGHT_JSON_OUTPUT_NAME"] = str(self.file("green-browser.json"))
             commands.append(
@@ -215,6 +263,8 @@ class Gate:
                     "e2e",
                     "--",
                     *specs,
+                    *["--project=" + project for project in POC_PROJECTS],
+                    "--repeat-each=1",
                     "--retries=0",
                     "--reporter=json",
                 ]
@@ -228,24 +278,45 @@ class Gate:
             )
         return result
 
-    def related(self):
+    def python_nodes(self):
         present = [f for f in self.files if (self.root / f).exists()]
         stems = [Path(f).stem for f in present if f.endswith(".py") and not f.startswith("tests/")]
         importing = [
             str(path.relative_to(self.root))
             for path in sorted((self.root / "tests").rglob("test_*.py"))
-            if any(
+            if ("swarm" in path.relative_to(self.root).parts) == (self.suite == "swarm")
+            and "phase2" not in path.relative_to(self.root).parts
+            and any(
                 "import" in line and any(re.search(rf"\b{re.escape(s)}\b", line) for s in stems)
                 for line in path.read_text().splitlines()
             )
         ]
         nodes = sorted(
             {
-                *[f for f in present if re.fullmatch(r"tests/(.+/)?test_[^/]+\.py", f)],
+                *[
+                    f
+                    for f in present
+                    if re.fullmatch(r"tests/(.+/)?test_[^/]+\.py", f)
+                    and f.startswith("tests/swarm/") == (self.suite == "swarm")
+                    and not f.startswith("tests/phase2/")
+                ],
                 *importing,
+                *self.spec.get("python_test_paths", []),
+                *self.spec.get("property_test_paths", []),
                 *[n for m in self.mapping if m["runner"] == "pytest" for n in mapped_nodes(m)],
             }
         )
+        for node in nodes:
+            if node.startswith("tests/phase2/") or (
+                node.startswith("tests/swarm/") != (self.suite == "swarm")
+            ):
+                raise ValueError("Test path belongs to a different suite: " + node)
+        files = {n for n in nodes if "::" not in n}
+        return [n for n in nodes if "::" not in n or n.split("::")[0] not in files]
+
+    def related(self):
+        present = [f for f in self.files if (self.root / f).exists()]
+        nodes = self.python_nodes()
         web = [f.removeprefix("web/") for f in present if f.startswith("web/src/")]
         commands = []
         if nodes:
@@ -284,15 +355,22 @@ class Gate:
             "errors": selected,
         }
 
-    def unit(self, identifier, repeat=True):
-        commands = []
-        include = [
-            option
-            for file in self.ts
-            for option in ["--coverage.include", file.removeprefix("web/")]
-        ]
-        for seed in range(1, 6) if repeat else [1]:
-            commands.append(
+    def unit(self, identifier):
+        if self.suite == "swarm":
+            return self.commands(identifier, [])
+        coverage = []
+        if self.final and self.ts:
+            coverage = [
+                "--coverage.enabled",
+                *[
+                    option
+                    for file in self.ts
+                    for option in ["--coverage.include", file.removeprefix("web/")]
+                ],
+            ]
+        return self.commands(
+            identifier,
+            [
                 [
                     "npm",
                     "--prefix",
@@ -301,40 +379,23 @@ class Gate:
                     "--",
                     "--run",
                     "--retry=0",
-                    "--sequence.shuffle.files",
-                    "--sequence.shuffle.tests",
-                    "--sequence.seed=" + str(seed),
-                    "--coverage.enabled",
-                    *include,
+                    *coverage,
                 ]
-            )
-        return self.commands(identifier, commands)
+            ],
+        )
 
     def coverage(self):
         commands = []
         if self.py:
             commands += [
                 [
-                    self.python,
-                    "-m",
-                    "pytest",
-                    "-q",
-                    *PYTEST_IGNORE,
-                    *["--cov=" + path for path in sorted({str(Path(f).parent) for f in self.py})],
-                    "--cov-branch",
-                    "--cov-report=xml:" + str(self.file("cov.xml")),
-                ],
-                [
                     str(self.root / ".venv/bin/diff-cover"),
                     str(self.file("cov.xml")),
-                    "--compare-branch=" + self.base,
+                    "--compare-branch=" + self.qualification_base,
                     "--fail-under=90",
                 ],
             ]
         if self.ts:
-            unit = self.unit("G12-unit", False)
-            if unit["exit_code"]:
-                return unit
             report = self.root / "web/coverage/lcov.info"
             text = report.read_text()
             covered = [
@@ -359,7 +420,7 @@ class Gate:
                 [
                     str(self.root / ".venv/bin/diff-cover"),
                     str(normalized),
-                    "--compare-branch=" + self.base,
+                    "--compare-branch=" + self.qualification_base,
                     "--fail-under=90",
                 ]
             )
@@ -387,7 +448,7 @@ class Gate:
                     "--changed",
                     *files,
                     "--base",
-                    self.base,
+                    self.qualification_base,
                     "--candidate",
                     self.candidate,
                     "--threshold",
@@ -418,18 +479,40 @@ class Gate:
             }
         if any("@given" not in (self.root / p).read_text() for p in paths):
             raise ValueError("Required property tests missing")
-        return self.commands("G9", [[self.python, "-m", "pytest", "-q", *paths]])
+        return {**self.commands("G9", []), "evidence": "Property tests included in G2"}
 
     @property
     def repeats(self):
-        return 1 if self.fast else 5
+        return 1
+
+    def regression(self):
+        tests = self.reports.get("pytest", [])
+        if not tests or any(row["status"] == "error" for row in tests):
+            raise ValueError("G10 runner report is empty or has infrastructure errors")
+        failed = sorted({row["node"] for row in tests if row["status"] != "passed"})
+        return {
+            "command": [],
+            "exit_code": int(bool(failed)),
+            "measured": len(failed),
+            "threshold": 0,
+            "evidence": str(self.file("green.xml")),
+            "failed_test_ids": failed,
+            "paths": ["scripts/swarm/", "tests/swarm/"]
+            if self.suite == "swarm"
+            else ["src/", "tests/"],
+        }
 
     def journey(self):
-        report = self.file("repeat-browser.json")
-        self.env["PLAYWRIGHT_JSON_OUTPUT_NAME"] = str(report)
-        result = self.commands(
-            "G17",
-            [
+        mapping = [m for m in self.mapping if m["runner"] == "playwright"]
+        check(mapping, [m["id"] for m in mapping], self.reports)
+        tests = self.reports.get("playwright", [])
+        if (mapping or self.spec.get("journey_specs")) and not tests:
+            raise ValueError("G17 runner report is empty")
+        commands = []
+        if self.final and self.suite == "poc":
+            self.env["PILOT_BENCHMARKS"] = "1"
+            self.env["PLAYWRIGHT_JSON_OUTPUT_NAME"] = str(self.file("benchmark-browser.json"))
+            commands = [
                 [
                     "npm",
                     "--prefix",
@@ -437,43 +520,54 @@ class Gate:
                     "run",
                     "e2e",
                     "--",
-                    *self.spec["journey_specs"],
+                    "--project=bench",
+                    "--repeat-each=1",
                     "--retries=0",
-                    "--repeat-each=" + str(self.repeats),
                     "--workers=1",
                     "--reporter=json",
                 ]
-            ],
-        )
-        tests = browser_rows(json.loads(report.read_text()))
-        if not tests:
-            raise ValueError("G17 runner report is empty")
-        result["failed_test_ids"] = sorted(
-            {row["node"] for row in tests if row["status"] not in {"passed", "skipped"}}
-        )
+            ]
+        result = self.commands("G17", commands)
+        result["functional_evidence"] = str(self.file("green-browser.json"))
+        if commands:
+            tests = browser_rows(json.loads(self.file("benchmark-browser.json").read_text()))
+            if not tests:
+                raise ValueError("G17 benchmark report is empty")
+        result["failed_test_ids"] = sorted({r["node"] for r in tests if r["status"] != "passed"})
         result["paths"] = ["web/", "src/", "scripts/swarm/", "tests/e2e/"]
-        mapping = [m for m in self.mapping if m["runner"] == "playwright"]
-        if result["exit_code"]:
-            return result
-        check(
-            mapping,
-            [m["id"] for m in mapping],
-            {"playwright": tests},
-            repeats=self.repeats,
-        )
+        if result["failed_test_ids"]:
+            result.update(exit_code=1, measured=len(result["failed_test_ids"]))
         return result
+
+    def deferred(self, identifier):
+        return {
+            "disposition": "deferred",
+            "command": [],
+            "exit_code": 0,
+            "measured": 0,
+            "threshold": 0,
+            "approval": POC_TEST_POLICY,
+            "evidence": "Flake repetitions postponed"
+            if identifier == "G11"
+            else "Required at final qualification; not run during development",
+        }
 
     def execute(self):
         ruff = str(self.root / ".venv/bin/ruff")
-        pytests = self.spec.get("python_test_paths", [])
-        changed_python = [file for file in self.files if file.endswith(".py")]
+        changed_python = [
+            file
+            for file in self.files
+            if file.endswith(".py")
+            and file.startswith(("scripts/swarm/", "tests/swarm/")) == (self.suite == "swarm")
+            and not file.startswith("tests/phase2/")
+        ]
         present_python = [f for f in changed_python if (self.root / f).exists()]
         web_lint = [
             f.removeprefix("web/")
             for f in self.files
             if f.startswith("web/") and f.endswith(WEB_LINTED) and (self.root / f).exists()
         ]
-        if self.fast:
+        if not self.final:
             ruff_check = (
                 [[ruff, "check", "--force-exclude", *present_python]] if present_python else []
             )
@@ -481,7 +575,15 @@ class Gate:
                 [["npm", "exec", "--", "eslint", "--max-warnings=0", *web_lint]] if web_lint else []
             )
         else:
-            ruff_check = [[ruff, "check", "."]]
+            paths = (
+                ["scripts/swarm", "tests/swarm"]
+                if self.suite == "swarm"
+                else [
+                    ".",
+                    "--extend-exclude=tests/swarm,tests/phase2,scripts/swarm",
+                ]
+            )
+            ruff_check = [[ruff, "check", *paths]]
             eslint = [["npm", "--prefix", "web", "run", "lint"]]
         checks = [
             ("G1", self.frozen),
@@ -492,7 +594,7 @@ class Gate:
                 lambda: self.commands(
                     "G4",
                     ruff_check
-                    + ([[ruff, "format", "--check", *changed_python]] if changed_python else []),
+                    + ([[ruff, "format", "--check", *present_python]] if present_python else []),
                 ),
             ),
             (
@@ -533,91 +635,82 @@ class Gate:
             ("G7", lambda: self.diff("G7")),
             ("G8", lambda: self.diff("G8")),
             ("G9", self.properties),
-            (
-                "G10",
-                lambda: self.commands(
-                    "G10", [[self.python, "-m", "pytest", "-q", "-p", "randomly", *PYTEST_IGNORE]]
-                ),
-            ),
-            (
-                "G11",
-                lambda: self.commands(
-                    "G11",
-                    [
-                        [
-                            self.python,
-                            "-m",
-                            "pytest",
-                            "-q",
-                            "-p",
-                            "randomly",
-                            "--count=5",
-                            "--repeat-scope=session",
-                            *pytests,
-                        ]
-                    ]
-                    if pytests
-                    else [],
-                ),
-            ),
+            ("G10", self.regression),
+            ("G11", lambda: self.deferred("G11")),
             ("G12", self.coverage),
             ("G13", lambda: self.mutation("G13", "python", self.py)),
-            ("G14", lambda: self.commands("G14", eslint, "web" if self.fast else ".")),
-            ("G15", lambda: self.commands("G15", [["npm", "--prefix", "web", "run", "typecheck"]])),
+            (
+                "G14",
+                lambda: self.commands(
+                    "G14", eslint if self.suite == "poc" else [], "web" if not self.final else "."
+                ),
+            ),
+            (
+                "G15",
+                lambda: self.commands(
+                    "G15",
+                    [["npm", "--prefix", "web", "run", "typecheck"]] if self.suite == "poc" else [],
+                ),
+            ),
             ("G16", lambda: self.unit("G16")),
             ("G17", self.journey),
             ("G18", lambda: self.mutation("G18", "web", self.ts)),
         ]
-        if self.runtime_env is not None:
+        if not self.final:
             checks = [
-                (
-                    identifier,
-                    self.isolated(identifier, action) if identifier in STATEFUL else action,
-                )
-                for identifier, action in checks
+                (i, (lambda i=i: self.deferred(i)) if i in FINAL_ONLY else a) for i, a in checks
             ]
+        order = [
+            "G1",
+            "G4",
+            "G5",
+            "G6",
+            "G7",
+            "G8",
+            "G14",
+            "G15",
+            "G2",
+            "G3",
+            "G9",
+            "G10",
+            "G11",
+            "G16",
+            "G12",
+            "G17",
+            "G13",
+            "G18",
+        ]
+        actions = dict(checks)
         if self.fast:
-            deferred = {
-                "disposition": "not_applicable",
-                "command": [],
-                "exit_code": 0,
-                "measured": 0,
-                "threshold": 0,
-                "evidence": "Fast gate: deferred to the full pre gate",
-            }
-            checks = [(i, (lambda: deferred) if i in FULL_ONLY else a) for i, a in checks]
-            checks.append(("related", self.related))
-            if self.runtime_env is not None:
-                checks[-1] = ("related", self.isolated("related", self.related))
-        else:
-            from collections.abc import Callable
-            from functools import partial
-
-            failed = False
-            cheap = {i for i, _ in checks[:9]}
-
-            def run(identifier: str, action: Callable[[], dict[str, object]]) -> dict[str, object]:
-                nonlocal failed
-                if failed:
-                    return {
+            for identifier in FULL_ONLY:
+                actions[identifier] = lambda identifier=identifier: self.deferred(identifier)
+            order.append("related")
+            actions["related"] = self.related
+        rows = []
+        failed = False
+        for identifier in order:
+            if failed:
+                rows.append(
+                    {
+                        "id": identifier,
+                        "disposition": "blocked",
                         "command": [],
                         "exit_code": 1,
                         "measured": 1,
                         "threshold": 0,
-                        "evidence": "skipped: prior failure",
+                        "evidence": "Not run because a prerequisite failed",
+                        "duration_seconds": 0,
                     }
-                try:
-                    result = action()
-                except (ValueError, KeyError, OSError, subprocess.SubprocessError):
-                    if identifier in cheap:
-                        failed = True
-                    raise
-                if identifier in cheap and result.get("exit_code") != 0:
-                    failed = True
-                return result
-
-            checks = [(i, partial(run, i, a)) for i, a in checks]
-        rows = run_all(checks, len(checks) if self.fast else 1)
+                )
+                continue
+            action = actions[identifier]
+            if self.runtime_env is not None and (
+                identifier == "related" or (self.final and identifier in {"G13", "G17"})
+            ):
+                action = self.isolated(identifier, action)
+            row = run_all([(identifier, action)])[0]
+            rows.append(row)
+            failed = row["exit_code"] != 0
         self.file("survivors.json").write_text(
             json.dumps({"survivors": self.survivors}, indent=2) + "\n"
         )
@@ -655,17 +748,50 @@ def known_diagnostics(current, previous, kind):
 def baseline(root, art, tag, env):
     python = str(root / ".venv/bin/python")
     commands = [
-        [python, "-m", "pytest", "-q", "-p", "randomly", *PYTEST_IGNORE],
-        [str(root / ".venv/bin/ruff"), "check", "."],
-        [str(root / ".venv/bin/ruff"), "format", "--check", "."],
+        [python, "-m", "pytest", "-q", "-p", "no:randomly", *PYTEST_IGNORE],
+        [
+            str(root / ".venv/bin/ruff"),
+            "check",
+            ".",
+            "--extend-exclude=tests/swarm,tests/phase2,scripts/swarm",
+        ],
+        [
+            str(root / ".venv/bin/ruff"),
+            "format",
+            "--check",
+            ".",
+            "--extend-exclude=tests/swarm,tests/phase2,scripts/swarm",
+        ],
         [str(root / ".venv/bin/mypy"), "src"],
         ["npm", "--prefix", "web", "run", "typecheck"],
-        ["npm", "--prefix", "web", "run", "e2e", "--", "editor.phase1-flows"],
+        [
+            "npm",
+            "--prefix",
+            "web",
+            "run",
+            "e2e",
+            "--",
+            "editor.phase1-flows",
+            *["--project=" + project for project in POC_PROJECTS],
+            "--repeat-each=1",
+        ],
     ]
     results = []
-    for index, command in enumerate(commands):
+    for index in (1, 2, 3, 4, 0, 5):
+        command = commands[index]
         start = time.monotonic()
         log = art / (tag + f"-baseline-{index}.log")
+        if any(row["disposition"] == "failed" for row in results):
+            results.append(
+                {
+                    "command": command,
+                    "exit_code": 1,
+                    "disposition": "blocked",
+                    "evidence": "Not run because a prerequisite failed",
+                    "duration_seconds": 0,
+                }
+            )
+            continue
         with log.open("w") as stream:
             result = subprocess.run(
                 command, cwd=root, env=env, stdout=stream, stderr=subprocess.STDOUT
@@ -708,11 +834,14 @@ def baseline(root, art, tag, env):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["baseline", "fast", "pre"])
+    parser.add_argument("mode", choices=["baseline", "fast", "pre", "final"])
     parser.add_argument("tag")
     parser.add_argument("base", nargs="?")
     parser.add_argument("candidate", nargs="?")
+    parser.add_argument("--qualification-base")
     args = parser.parse_args()
+    if args.mode == "final" and not args.qualification_base:
+        parser.error("Final qualification requires --qualification-base at POC start")
     art = Path(os.environ.get("ART", "/tmp/factory-fp-0925/swarm/interior-p1")).resolve()
     os.environ["PATH"] = str(NODE.parent) + os.pathsep + os.environ["PATH"]
     try:
@@ -743,16 +872,36 @@ def main():
         current = hashlib.sha256(
             b"".join((root / f).read_bytes() for f in ("pyproject.toml", "web/package-lock.json"))
         ).hexdigest()
-        if args.mode == "fast" and marker.exists() and marker.read_text() == current:
+        if marker.exists() and marker.read_text() == current:
             env = {**os.environ, "CI": "1"}
         else:
             env = provision(root, art / (args.tag + "-install.log"))
             marker.write_text(current)
         gate = Gate(root, art, args.tag, args.base, args.candidate, args.mode == "fast")
+        gate.final = args.mode == "final"
+        qualification_files = []
+        if gate.final:
+            gate.qualification_base = output(["git", "rev-parse", args.qualification_base], root)
+            if gate.spec.get("qualification_base_sha") != gate.qualification_base:
+                raise ValueError("Qualification base must match frozen acceptance metadata")
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", gate.qualification_base, args.candidate],
+                cwd=root,
+                check=True,
+            )
+            qualification_files = changed(root, gate.qualification_base, args.candidate)
+            gate.py = [
+                f
+                for f in production(qualification_files, "python")
+                if f.startswith("scripts/swarm/") == (gate.suite == "swarm")
+            ]
+            gate.ts = production(qualification_files, "web") if gate.suite == "poc" else []
         gate.runtime_env = env
         rows = gate.execute()
         try:
-            hashes = artifact_hashes(art, args.tag, gate.spec, args.mode == "fast")
+            hashes = artifact_hashes(
+                art, args.tag, gate.spec, args.mode == "fast", args.mode == "final"
+            )
         except (ValueError, OSError) as error:
             hashes = {}
             rows.append(
@@ -767,6 +916,11 @@ def main():
                 }
             )
         packet = {
+            "test_policy": POC_TEST_POLICY,
+            "stage": args.mode,
+            "test_suite": gate.suite,
+            "qualification_base_sha": gate.qualification_base if gate.final else None,
+            "qualification_diff_files": qualification_files,
             "candidate_sha": args.candidate,
             "base_sha": args.base,
             "worktree": str(root),

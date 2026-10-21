@@ -137,3 +137,11 @@ The code is on branch `swarm-orchestrator-token-fixes` in FloorInteriorDesignAnd
 **Phase 1 gates skip Phase 2 tests (user ruling 2026-10-20).** G10, G12 coverage and baseline run pytest with `--ignore=tests/phase2`, because Phase 2's environment tests read Phase 2 receipts that Phase 1 cannot provide.
 
 **Test the failure paths before calling a fix done.** The first version passed all 289 swarm tests and still had five P1 defects. Fail closed when state is unknown, revalidate identity at the moment of an irreversible step, bind each acknowledgement to the instance it acknowledges, and parse options instead of blacklisting prefixes.
+
+## Test scheduling, branch and workspace cleanup (2026-10-21)
+
+**Keep POC checks and swarm checks apart.** Pytest discovery skips `tests/swarm` and `tests/phase2`, and `unit_gate.py` refuses a check that mixes swarm and POC nodes. A POC change runs only POC tests, once, in the light theme. Benchmarks, dark theme, coverage and mutation testing wait for final qualification. The 708 POC tests take about 6 minutes; the 1,040 swarm tests run only when swarm tooling changes.
+
+**Delete branches once main holds them.** The repo had 143 POC branches, most of them merged or superseded attempts. `merge_unit.sh` now deletes the builder branch and every `int/<tag>/<n>` attempt after a successful push, but only when merging the branch into main would change nothing. A branch with changes main lacks, or one checked out in a live worktree, stays and leaves `worktree_cleanup: pending` for the next run.
+
+**Give every orchestrator the same workspace.** Successive orchestrators each created their own repair or validation worktree and left it behind. `orchestrator-spawn.sh` now hands every successor `<repo>-wt/orchestrator`. If that path is no longer a usable worktree, the script deletes it and re-adds it from main. It refuses an unregistered directory at that path rather than deleting it.

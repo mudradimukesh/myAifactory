@@ -161,6 +161,9 @@ def test_prepare_skips_orphaned_attempt_after_receipt(integration_fixture, tmp_p
         "unknown_status",
         "pushed_drift",
         "corrupt_diff",
+        "builder_checked_out",
+        "builder_moved",
+        "superseded_attempt",
     ],
 )
 def test_merge_exact_reviewed_commit(integration_fixture, tmp_path, scenario):
@@ -171,7 +174,8 @@ def test_merge_exact_reviewed_commit(integration_fixture, tmp_path, scenario):
     git(tmp_path, "init", "--bare", str(remote))
     git(repo, "remote", "add", "interior", str(remote))
     git(repo, "push", "interior", "main")
-    subprocess.run([*command, "feature", "builder"], env=env, check=True, capture_output=True)
+    for _ in range(2 if scenario == "superseded_attempt" else 1):
+        subprocess.run([*command, "feature", "builder"], env=env, check=True, capture_output=True)
     receipt = json.loads((art / "feature-candidate.json").read_text())
     candidate_root = Path(receipt["worktree"])
     (candidate_root / ".venv").symlink_to(sys.prefix, target_is_directory=True)
@@ -230,6 +234,15 @@ def test_merge_exact_reviewed_commit(integration_fixture, tmp_path, scenario):
         (art / "PAUSE").write_text("hold")
     elif scenario == "push_failure":
         git(repo, "remote", "set-url", "interior", str(tmp_path / "unavailable.git"))
+    elif scenario == "builder_checked_out":
+        git(repo, "worktree", "add", str(tmp_path / "builder-wt"), "builder")
+    elif scenario == "builder_moved":
+        moved = tmp_path / "builder-wt"
+        git(repo, "worktree", "add", str(moved), "builder")
+        (moved / "later").write_text("builder work after the reviewed commit")
+        git(moved, "add", "later")
+        git(moved, "commit", "-m", "later")
+        git(repo, "worktree", "remove", str(moved))
     before = git(repo, "rev-parse", "main")
     result = subprocess.run([*merge, "feature"], env=env, capture_output=True, text=True)
     saved = json.loads((art / "feature-candidate.json").read_text())
@@ -255,8 +268,26 @@ def test_merge_exact_reviewed_commit(integration_fixture, tmp_path, scenario):
     assert (repo / "user-untracked").read_text() == "preserve"
     assert json.loads((art / "feature-candidate.json").read_text())["status"] == "pushed"
     assert not candidate_root.exists()
-    assert git(repo, "rev-parse", "int/feature/1") == receipt["candidate_sha"]
-    assert json.loads((art / "feature-candidate.json").read_text())["worktree_cleanup"] == "done"
+    saved = json.loads((art / "feature-candidate.json").read_text())
+    assert saved["builder_branch"] == "builder"
+    if scenario in {"builder_checked_out", "builder_moved"}:
+        assert saved["worktree_cleanup"].startswith("pending: branch builder ")
+        assert (
+            git(repo, "branch", "--format=%(refname:short)", "--list", "int/feature/1", "builder")
+            == "builder"
+        )
+        if scenario == "builder_moved":
+            assert git(repo, "rev-parse", "builder~1") == receipt["builder_sha"]
+            return
+        git(repo, "worktree", "remove", str(tmp_path / "builder-wt"))
+        result = subprocess.run([*merge, "feature"], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        saved = json.loads((art / "feature-candidate.json").read_text())
+    assert saved["worktree_cleanup"] == "done"
+    assert git(repo, "branch", "--format=%(refname:short)", "--list", "int/feature/*") == ""
+    assert (
+        git(repo, "branch", "--format=%(refname:short)", "--list", "int/feature/1", "builder") == ""
+    )
     if scenario == "pushed_drift":
         (repo / "later").write_text("main moved after push")
         git(repo, "add", "later")

@@ -97,6 +97,39 @@ def packet():
     return candidate, gate, review
 
 
+def test_development_deferrals_cannot_pass_as_final_or_hide_failures(checks):
+    candidate, gate, _ = packet()
+    gate.update(test_policy=checks.POC_TEST_POLICY, stage="pre", test_suite="poc")
+    for row in gate["gates"]:
+        if row["id"] in checks.FINAL_ONLY | {"G11"}:
+            row.update(
+                disposition="deferred",
+                command=[],
+                approval=checks.POC_TEST_POLICY,
+                evidence="Deferred by the user to final qualification",
+            )
+    checks.gates_valid(gate, candidate, {}, gate["fingerprint"])
+    gate["stage"] = "final"
+    gate["qualification_base_sha"] = "a" * 40
+    with pytest.raises(ValueError, match="Unauthorized test deferral"):
+        checks.gates_valid(
+            gate, candidate, {"qualification_base_sha": "a" * 40}, gate["fingerprint"]
+        )
+    gate["stage"] = "pre"
+    gate["gates"][1]["exit_code"] = 1
+    with pytest.raises(ValueError, match="G2 failed"):
+        checks.gates_valid(gate, candidate, {}, gate["fingerprint"])
+    gate["gates"][1].update(
+        exit_code=0,
+        disposition="deferred",
+        command=[],
+        approval=checks.POC_TEST_POLICY,
+        evidence="Not authorized",
+    )
+    with pytest.raises(ValueError, match="Unauthorized test deferral"):
+        checks.gates_valid(gate, candidate, {}, gate["fingerprint"])
+
+
 def test_complete_packet_passes_and_duplicates_fail(checks):
     candidate, gate, review = packet()
     checks.validate(
@@ -362,15 +395,8 @@ def test_g17_runner_report_validation(
     report_kind: str,
 ) -> None:
     gate = gate_module.Gate(tmp_path, tmp_path, "sample", "base", "candidate", fast=True)
-    gate.mapping = [
-        {
-            "id": "J1",
-            "runner": "playwright",
-            "test_node": "journey.spec.ts::journey",
-            "projects": ["chromium"],
-            "oracle": "spec_literal",
-        }
-    ]
+    gate.final = True
+    gate.reports["playwright"] = [{"node": "journey.spec.ts::journey", "status": "passed"}]
     document: dict[str, object] = {
         "suites": [
             {
@@ -407,9 +433,9 @@ def test_g17_runner_report_validation(
             "run",
             "e2e",
             "--",
-            "journey.spec.ts",
-            "--retries=0",
+            "--project=bench",
             "--repeat-each=1",
+            "--retries=0",
             "--workers=1",
             "--reporter=json",
         ]
@@ -433,7 +459,7 @@ def test_g17_runner_report_validation(
             gate.journey()
     elif report_kind in {"empty", "error"}:
         message = (
-            "G17 runner report is empty" if report_kind == "empty" else "infrastructure errors"
+            "G17 benchmark report is empty" if report_kind == "empty" else "infrastructure errors"
         )
         with pytest.raises(ValueError, match=message):
             gate.journey()
@@ -456,11 +482,11 @@ def test_gate_execute_stops_after_cheap_gate_error(
 
     monkeypatch.setattr(gate_module.subprocess, "run", unexpected_command)
     rows = gate.execute()
-    assert [row["id"] for row in rows] == [f"G{i}" for i in range(1, 19)]
+    assert {row["id"] for row in rows} == {f"G{i}" for i in range(1, 19)}
     assert rows[0]["exit_code"] == 1
     assert "sample-s1-tests.json" in rows[0]["error"]
     assert all(row["exit_code"] == 1 for row in rows[1:])
-    assert all(row["evidence"] == "skipped: prior failure" for row in rows[1:])
+    assert all(row["disposition"] == "blocked" for row in rows[1:])
     assert json.loads(gate.file("survivors.json").read_text()) == {"survivors": []}
 
 

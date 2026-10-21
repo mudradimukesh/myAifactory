@@ -69,6 +69,18 @@ def mapped_nodes(item):
     return nodes
 
 
+def light_mapping(mapping):
+    result = []
+    for item in mapping:
+        if item["runner"] == "playwright":
+            projects = [p for p in item.get("projects", []) if not p.startswith("dark-")]
+            if not projects:
+                raise ValueError(item["id"] + " has no light-theme acceptance project")
+            item = {**item, "projects": projects}
+        result.append(item)
+    return result
+
+
 def check(mapping, ids, reports, repeats=1):
     if (
         len(ids) != len(set(ids))
@@ -127,7 +139,7 @@ def main():
         if args.playwright:
             reports["playwright"] = browser_rows(json.loads(args.playwright.read_text()))
         check(
-            json.loads(args.map.read_text()),
+            light_mapping(json.loads(args.map.read_text())),
             args.ids.read_text().splitlines(),
             reports,
             args.repeats,

@@ -34,16 +34,58 @@ def test_swarm_only_change_gets_python_gate_commands(
     module = importlib.import_module("unit_gate")
     changed_file = "scripts/swarm/gate_evidence.py"
     (tmp_path / "probe-acceptance.md").write_text("```json\n{}\n```\n")
-    (tmp_path / "probe-test-map.json").write_text(json.dumps([]))
+    mapping = [
+        {
+            "id": "A1",
+            "runner": "pytest",
+            "oracle": "spec_literal",
+            "test_node": "tests/swarm/test_gate_evidence.py::test_behavior",
+        }
+    ]
+    (tmp_path / "probe-test-map.json").write_text(json.dumps(mapping))
+    (tmp_path / "probe-s1-tests.json").write_text(json.dumps({"tests_commit": "tests"}))
+    (tmp_path / "probe-red.json").write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "tests_commit": "tests",
+                "test_map_sha256": module.digest(tmp_path / "probe-test-map.json"),
+            }
+        )
+    )
+    (tmp_path / "probe-ids.txt").write_text("A1\n")
     monkeypatch.setattr(module, "changed", lambda *args: [changed_file])
     gate = module.Gate(tmp_path, tmp_path, "probe", "base", "candidate")
-    monkeypatch.setattr(gate, "commands", lambda name, commands, cwd=".": {"command": commands})
+    gate.final = True
+    monkeypatch.setattr(
+        gate,
+        "commands",
+        lambda name, commands, cwd=".": {
+            "command": commands,
+            "exit_code": 0,
+            "measured": 0,
+            "threshold": 0,
+        },
+    )
+    monkeypatch.setattr(gate, "frozen", lambda: {"exit_code": 0})
+    monkeypatch.setattr(gate, "diff", lambda *args: {"exit_code": 0})
+    monkeypatch.setattr(gate, "mutation", lambda *args: {"exit_code": 0})
     monkeypatch.setattr(
         module,
-        "run_all",
-        lambda checks, workers=1: dict(checks)[identifier](),
+        "python_rows",
+        lambda path: [
+            {
+                "node": mapping[0]["test_node"],
+                "project": "pytest",
+                "status": "passed",
+            }
+        ],
     )
-    commands = gate.execute()["command"]
+    rows = {row["id"]: row for row in gate.execute()}
+    assert all(row["exit_code"] == 0 for row in rows.values())
+    commands = rows[identifier]["command"]
+    if identifier == "G12":
+        commands = [*rows["G2"]["command"], *commands]
     assert commands, f"{identifier} must emit Python commands for {changed_file}"
     if identifier == "G12":
         assert (
