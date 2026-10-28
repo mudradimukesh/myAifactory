@@ -38,14 +38,57 @@ fi
 [[ $pane =~ ^[0-9]+$ ]] || { echo "no active $target pane_id in $run" >&2; exit 1; }
 wezterm cli list --format json | jq -e --argjson p "$pane" 'any(.[]; .pane_id == $p)' >/dev/null \
   || { echo "$target pane $pane is not open; nothing sent" >&2; exit 1; }
-# The Claude Code composer is the box from the last prompt-glyph line to the next border
-# line; every line in it is draft text. Without a closing border the state is unknown.
+# The recipient's client follows from its transcript: Codex rollouts live under
+# .codex/sessions, everything else is Claude Code. The Claude composer is the box from
+# the last ❯ line to the next border line; every line in it is draft text, and without
+# a closing border the state is unknown. The Codex rule is documented in composer().
+codex=0
+[[ $transcript == */.codex/sessions/* ]] && codex=1
 composer() {
+  if (( codex )); then
+    # Codex draws its empty-composer placeholder dimmed (SGR 2) and typed text never
+    # dimmed. The composer is empty only when its last › line is that dimmed
+    # placeholder; any other content there is a draft, so emptiness never depends on
+    # parsing draft text. Without a status line below the prompt the state is unknown.
+    wezterm cli get-text --pane-id "$pane" --escapes | awk '
+      { raw[NR] = $0; plain = $0; gsub(/\033\[[0-9;:]*[A-Za-z]|\033\([A-Z0-9]/, "", plain); line[NR] = plain }
+      END {
+        for (j = NR; j > 0 && line[j] !~ /^[[:space:]]*›/; j--) {}
+        for (i = j + 1; j > 0 && i <= NR && line[i] !~ /^  [^ ?][^·]* · [~\/]/; i++) {}
+        if (j < 1 || i > NR) { print "(composer state unknown)"; exit }
+        text = line[j]; sub(/^[[:space:]]*›[[:space:]]*/, "", text); sub(/[[:space:]]+$/, "", text)
+        if (text == "Ask Codex to do anything" && raw[j] ~ /\033\[(0;)?2m(\033\[[0-9;:]*m)*As/) { print ""; exit }
+        for (k = j + 1; k < i; k++) text = text " " line[k]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", text)
+        print (text == "" ? "(draft)" : text)
+      }'
+    return
+  fi
   wezterm cli get-text --pane-id "$pane" | awk '
-    /^[[:space:]]*❯/ { inbox = 1; text = ""; closed = 0; sub(/^[[:space:]]*❯/, ""); text = $0; next }
-    inbox && /^[[:space:]]*(─)+[[:space:]]*$/ { inbox = 0; closed = 1; next }
-    inbox { text = text " " $0 }
-    END { if (!closed) { print "(composer state unknown)"; exit } gsub(/^[[:space:]]+|[[:space:]]+$/, "", text); print text }'
+    { line[NR] = $0 }
+    END {
+      for (j = NR; j > 0 && line[j] !~ /^[[:space:]]*❯/; j--) {}
+      for (i = j + 1; i <= NR && line[i] !~ /^[[:space:]]*(─)+[[:space:]]*$/; i++) {}
+      if (j < 1 || i > NR) { print "(composer state unknown)"; exit }
+      text = line[j]; sub(/^[[:space:]]*❯/, "", text)
+      for (k = j + 1; k < i; k++) text = text " " line[k]
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", text)
+      print text
+    }'
+}
+# The live Codex queue is the block between the last "Queued follow-up inputs" heading
+# and its "edit last queued message" hint, with only blank lines between the hint and
+# the composer. Anything else is history and yields nothing.
+queue() {
+  wezterm cli get-text --pane-id "$pane" | awk '
+    { line[NR] = $0 }
+    END {
+      for (j = NR; j > 0 && line[j] !~ /^[[:space:]]*›/; j--) {}
+      for (h = j - 1; h > 0 && line[h] ~ /^[[:space:]]*$/; h--) {}
+      if (h < 1 || line[h] !~ /edit last queued message/) exit
+      for (start = h - 1; start > 0 && line[start] !~ /Queued follow-up inputs/; start--) {}
+      for (k = start + 1; start > 0 && k < h; k++) print line[k]
+    }'
 }
 draft=$(composer)
 [[ -z $draft ]] || { echo "$target pane $pane composer is not empty; nothing sent or logged: ${draft:0:60}" >&2; exit 3; }
@@ -59,8 +102,28 @@ if (( log )); then
 fi
 wezterm cli send-text --pane-id "$pane" --no-paste "$message"
 wezterm cli send-text --pane-id "$pane" --no-paste $'\r'
+# A working Codex turn ignores Enter and keeps the text in the composer; Tab queues it,
+# and Codex submits queued input when the turn ends. A queued message is accepted once
+# the composer is readable and clear of the marker and the live queue shows it. Both
+# the composer and the queue wrap long messages, so marker matches ignore whitespace.
+if (( codex )); then
+  sleep 1
+  compact=${marker// /}
+  before=$(composer)
+  if [[ ${before//[[:space:]]/} == *"$compact"* ]]; then
+    wezterm cli send-text --pane-id "$pane" --no-paste $'\t'
+    sleep 1
+    after=$(composer)
+    if [[ $after != "(composer state unknown)" && ${after//[[:space:]]/} != *"$compact"* ]] \
+      && queue | tr -d '[:space:]' | grep -qF -- "$compact"; then
+      echo "queued for $target pane $pane $marker"
+      exit 0
+    fi
+  fi
+fi
 # Delivery means a new transcript record, after the send, that is a typed user message
-# (string or text blocks, no tool result) containing the marker.
+# containing the marker: a Claude user row (string or text blocks, no tool result) or a
+# Codex user message item (input_text blocks).
 for (( i = 0; i < wait_s; i++ )); do
   sleep 1
   if tail -c +"$(( offset + 1 ))" "$transcript" | python3 -c '
@@ -74,6 +137,11 @@ for line in sys.stdin:
     content = (row.get("message") or {}).get("content") if row.get("type") == "user" else None
     if isinstance(content, list) and all(b.get("type") == "text" for b in content):
         content = "".join(b.get("text", "") for b in content)
+    payload = row.get("payload") if row.get("type") == "response_item" else None
+    if isinstance(payload, dict) and payload.get("type") == "message" and payload.get("role") == "user":
+        blocks = payload.get("content")
+        if isinstance(blocks, list) and all(b.get("type") == "input_text" for b in blocks):
+            content = "".join(b.get("text", "") for b in blocks)
     if isinstance(content, str) and marker in content:
         sys.exit(0)
 sys.exit(1)' "$marker"; then

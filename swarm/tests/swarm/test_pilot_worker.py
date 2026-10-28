@@ -228,7 +228,7 @@ sys.exit(7 if scenario=='error' else 0)
         saved = json.loads(run.read_text())
         if scenario != "start_timeout":
             assert receipt["usage_delta"]["new_tokens"] == 18
-        if scenario in {"start_timeout", "grandchild", "error", "budget"}:
+        if scenario in {"start_timeout", "error"}:
             assert saved["runs"]["launch"]["usage_status"] == "unknown"
         else:
             assert saved["runs"]["launch"]["usage_status"] == "known"

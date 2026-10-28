@@ -571,7 +571,7 @@ def test_bin_pilot_context_override_preserves_branch_default(
         "tool_name": "Write",
         "tool_input": {"file_path": str(hook_run["tmp_path"] / "output.txt"), "content": "work"},
     }
-    for used in (100000, 120000, 120001) if override is None else (100000,):
+    for used in (90000, 120000, 120001) if override is None else (120000,):
         hook_run["original"].write_text(
             json.dumps({"message": {"usage": {"input_tokens": used}}}) + "\n"
         )

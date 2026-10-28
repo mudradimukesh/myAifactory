@@ -65,5 +65,6 @@
     "excludedCommands": [
       "bash scripts/swarm/outside/*.sh"
     ]
-  }
+  },
+  "promptSuggestionEnabled": false
 }

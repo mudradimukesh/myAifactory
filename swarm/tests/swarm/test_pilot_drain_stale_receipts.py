@@ -189,7 +189,6 @@ def test_stale_targets_require_delivery_to_current_owners(lead, draining, kind, 
         "wrong-message",
         "wrong-identity",
         "no-receipt-id",
-        "unregistered-orchestrator",
         "no-active-lead",
     ],
 )
@@ -206,8 +205,6 @@ def test_replacement_delivery_does_not_bypass_recipient_checks(lead, draining, c
     if case == "wrong-identity":
         transcript = path.parent / "current-orch.jsonl"
         transcript.write_text(transcript.read_text().replace("current-orch", "intruder"))
-    if case == "unregistered-orchestrator":
-        state["inventory"]["threads"][-1]["complete"] = True
     if case == "no-active-lead":
         state["active_lead"] = None
     path.write_text(json.dumps(state))
@@ -408,3 +405,551 @@ def test_complete_lead_inventory_without_pane_allows_current_delivery(lead, drai
             del row["pane_id"]
     deliver(state, ["current-orch", "current-lead"])
     retire(lead, path, state)
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+def test_retired_orchestrator_leaves_only_the_successor_recipient(lead, draining, delivered):
+    path, state, _, panes = draining
+    panes[:] = [202]
+    for row in state["inventory"]["threads"]:
+        row["complete"] = True
+    deliver(state, ["current-lead"] if delivered else [])
+    if delivered:
+        receipt = retire(lead, path, state)
+        assert {r.get("session_id", r["identity"]) for r in receipt["notification_receipts"]} == {
+            "current-lead"
+        }
+    else:
+        path.write_text(json.dumps(state))
+        with pytest.raises(ValueError, match="Native completion notification receipt is missing"):
+            lead.retire_draining(path, "drained")
+
+
+@pytest.mark.parametrize("orchestrator", [True, False])
+def test_drain_ready_targets_the_orchestrator_only_while_one_is_active(
+    lead, draining, monkeypatch, orchestrator
+):
+    path, state, _, _ = draining
+    del state["draining_leads"]["drained"]["completion"]
+    (path.parent / "handoff").mkdir()
+    (path.parent / "handoff/lead-drained-drain.md").write_text("Finished work\n")
+    for row in state["inventory"]["threads"]:
+        row["complete"] = row["session_id"] != "current-orch" or not orchestrator
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+    monkeypatch.setattr(lead, "verify_draining", lambda path, drain: None)
+    completion = lead.drain_ready(path, "drained")
+    expected = ["current-orch", "current-lead"] if orchestrator else ["current-lead"]
+    assert [t["identity"] for t in completion["targets"]] == expected
+
+
+def test_drain_ready_still_requires_the_successor(lead, draining, monkeypatch):
+    path, state, _, _ = draining
+    del state["draining_leads"]["drained"]["completion"]
+    (path.parent / "handoff").mkdir()
+    (path.parent / "handoff/lead-drained-drain.md").write_text("Finished work\n")
+    state["active_lead"] = None
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+    monkeypatch.setattr(lead, "verify_draining", lambda path, drain: None)
+    monkeypatch.setenv("DRAIN_READY_WAIT", "0")
+    with pytest.raises(ValueError, match="Completion recipient identity/transcript is incomplete"):
+        lead.drain_ready(path, "drained")
+    assert "completion" not in json.loads(path.read_text())["draining_leads"]["drained"]
+
+
+def wait_for(lead, monkeypatch, path, change):
+    # Applies the change to run.json at the first poll, as a handoff landing mid-wait.
+    sleeps = []
+
+    def sleep(seconds):
+        if not sleeps:
+            current = json.loads(path.read_text())
+            change(current)
+            path.write_text(json.dumps(current))
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(lead.time, "sleep", sleep)
+    return sleeps
+
+
+def test_drain_ready_waits_for_the_successor_to_be_recorded(lead, draining, monkeypatch):
+    path, state, _, _ = draining
+    del state["draining_leads"]["drained"]["completion"]
+    (path.parent / "handoff").mkdir()
+    (path.parent / "handoff/lead-drained-drain.md").write_text("Finished work\n")
+    successor = state["active_lead"]
+    state["active_lead"] = {k: v for k, v in successor.items() if k != "pane"}
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+    monkeypatch.setattr(lead, "verify_draining", lambda path, drain: None)
+    sleeps = wait_for(lead, monkeypatch, path, lambda s: s.update(active_lead=successor))
+    completion = lead.drain_ready(path, "drained")
+    assert sleeps and "current-lead" in [t["identity"] for t in completion["targets"]]
+
+
+def test_drain_ready_waits_for_its_own_handoff_to_commit(lead, draining, monkeypatch):
+    path, state, _, _ = draining
+    drain = state["draining_leads"].pop("drained")
+    del drain["completion"]
+    state["handoff"] = {"token": "t", "predecessor": drain["lead"]}
+    (path.parent / "handoff").mkdir()
+    (path.parent / "handoff/lead-drained-drain.md").write_text("Finished work\n")
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+    monkeypatch.setattr(lead, "verify_draining", lambda path, drain: None)
+    sleeps = wait_for(
+        lead, monkeypatch, path, lambda s: s.update(handoff={}, draining_leads={"drained": drain})
+    )
+    assert lead.drain_ready(path, "drained")["report"].endswith("lead-drained-drain.md")
+    assert sleeps
+
+
+def test_drain_ready_refuses_an_unrelated_session_without_waiting(lead, draining, monkeypatch):
+    path, state, _, _ = draining
+    path.write_text(json.dumps(state))
+    sleeps = wait_for(lead, monkeypatch, path, lambda s: None)
+    with pytest.raises(ValueError, match="Lead is not registered as draining"):
+        lead.drain_ready(path, "stranger")
+    assert not sleeps
+
+
+def test_drain_ready_wait_ends_at_the_deadline(lead, draining, monkeypatch):
+    path, state, _, _ = draining
+    del state["draining_leads"]["drained"]["completion"]
+    (path.parent / "handoff").mkdir()
+    (path.parent / "handoff/lead-drained-drain.md").write_text("Finished work\n")
+    state["active_lead"] = None
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+    monkeypatch.setattr(lead, "verify_draining", lambda path, drain: None)
+    monkeypatch.setenv("DRAIN_READY_WAIT", "30")
+    clock = [0.0]
+    monkeypatch.setattr(lead.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        lead.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    with pytest.raises(ValueError, match="Completion recipient identity/transcript is incomplete"):
+        lead.drain_ready(path, "drained")
+    assert 30 <= clock[0] <= 35
+
+
+def test_drain_ready_short_deadline_never_sleeps_past_it(lead, draining, monkeypatch):
+    path, state, _, _ = draining
+    del state["draining_leads"]["drained"]["completion"]
+    (path.parent / "handoff").mkdir()
+    (path.parent / "handoff/lead-drained-drain.md").write_text("Finished work\n")
+    successor = state["active_lead"]
+    state["active_lead"] = None
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+    monkeypatch.setattr(lead, "verify_draining", lambda path, drain: None)
+    monkeypatch.setenv("DRAIN_READY_WAIT", "1")
+    clock = [0.0]
+    monkeypatch.setattr(lead.time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds):
+        clock[0] += seconds
+        current = json.loads(path.read_text())
+        current["active_lead"] = successor
+        path.write_text(json.dumps(current))
+
+    monkeypatch.setattr(lead.time, "sleep", sleep)
+    # The successor appears exactly at the deadline, so one last attempt still runs.
+    assert lead.drain_ready(path, "drained")
+    assert clock[0] == 1
+
+
+def test_drain_ready_refuses_when_the_successor_appears_after_the_deadline(
+    lead, draining, monkeypatch
+):
+    path, state, _, _ = draining
+    del state["draining_leads"]["drained"]["completion"]
+    (path.parent / "handoff").mkdir()
+    (path.parent / "handoff/lead-drained-drain.md").write_text("Finished work\n")
+    state["active_lead"] = None
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+    monkeypatch.setattr(lead, "verify_draining", lambda path, drain: None)
+    monkeypatch.setenv("DRAIN_READY_WAIT", "1")
+    clock = [0.0]
+    monkeypatch.setattr(lead.time, "monotonic", lambda: clock[0])
+    successor = {**state["draining_leads"]["drained"]["lead"], "pid": 900002}
+    successor.update(model_session_id="current-lead", pane="202")
+
+    def overshoot(seconds):
+        # The successor is registered while the sleep overshoots the deadline.
+        clock[0] += 5
+        current = json.loads(path.read_text())
+        current["active_lead"] = successor
+        path.write_text(json.dumps(current))
+
+    monkeypatch.setattr(lead.time, "sleep", overshoot)
+    with pytest.raises(ValueError, match="Completion recipient"):
+        lead.drain_ready(path, "drained")
+    assert "completion" not in json.loads(path.read_text())["draining_leads"]["drained"]
+
+
+def test_drain_ready_refuses_unfinished_work_at_once_while_recipients_are_incomplete(
+    lead, draining, monkeypatch
+):
+    path, state, _, _ = draining
+    del state["draining_leads"]["drained"]["completion"]
+    state["active_lead"] = None
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+
+    def busy(path, drain):
+        raise ValueError("Owned job process survives")
+
+    monkeypatch.setattr(lead, "verify_draining", busy)
+    sleeps = wait_for(lead, monkeypatch, path, lambda s: None)
+    with pytest.raises(ValueError, match="Owned job process survives"):
+        lead.drain_ready(path, "drained")
+    assert not sleeps
+
+
+@pytest.mark.parametrize(
+    "unfinished",
+    [
+        None,
+        "active run",
+        "scoped active run",
+        "unknown usage",
+        "reviewer",
+        "job survivor",
+        "job receipt incomplete",
+        "live gate",
+        "gate stop survivor",
+    ],
+)
+def test_drain_finished_requires_all_owned_work_final(lead, draining, unfinished):
+    path, state, table, _ = draining
+    drain = state["draining_leads"]["drained"]
+    del drain["completion"]
+    receipt = Path(drain["jobs"][0]["receipt"])
+    child = identity(700001)
+    if unfinished == "active run":
+        state["reservations"]["a"] = {"parent_session_id": "drained", "active_run": "a"}
+    if unfinished == "scoped active run":
+        drain["scopes"] = [str(path.parent / "wt")]
+        state["reservations"]["b"] = {"worktree": str(path.parent / "wt/u"), "active_run": "b"}
+    if unfinished == "unknown usage":
+        state["runs"]["job"]["usage_status"] = "unknown"
+    if unfinished == "reviewer":
+        state["inventory"]["sessions"].append(
+            {"session_id": "r", "role": "reviewer", "parent_session_id": "drained"}
+        )
+    if unfinished == "job survivor":
+        table[child["pid"]] = child
+        receipt.write_text(
+            json.dumps(
+                {
+                    "remaining_processes": [],
+                    "child_exit": 0,
+                    "owned_processes": {str(child["pid"]): child},
+                }
+            )
+        )
+    if unfinished == "job receipt incomplete":
+        receipt.write_text(json.dumps({"remaining_processes": [], "owned_processes": {}}))
+    if unfinished == "live gate":
+        table[child["pid"]] = child
+        drain["gates"] = [child]
+    if unfinished == "gate stop survivor":
+        stop = path.parent / "gate-stop.json"
+        stop.write_text(json.dumps({"remaining_processes": [child["pid"]], "owned_processes": {}}))
+        drain["gate_stop_receipts"] = {"1": str(stop)}
+    path.write_text(json.dumps(state))
+    if unfinished is None:
+        lead.drain_finished(path, state, "drained", drain)
+    else:
+        with pytest.raises(ValueError):
+            lead.drain_finished(path, state, "drained", drain)
+
+
+@pytest.mark.parametrize("recipient", ["successor", "orchestrator"])
+@pytest.mark.parametrize(
+    "field,value", [("identity", None), ("pane", "invalid"), ("transcript", "")]
+)
+def test_drain_ready_identifies_incomplete_recipient(
+    lead, draining, monkeypatch, recipient, field, value
+):
+    path, state, _, _ = draining
+    del state["draining_leads"]["drained"]["completion"]
+    (path.parent / "handoff").mkdir()
+    (path.parent / "handoff/lead-drained-drain.md").write_text("Finished work\n")
+    if recipient == "orchestrator":
+        row = state["inventory"]["threads"][-1]
+        key = {"identity": "thread_id", "pane": "pane_id", "transcript": "transcript_path"}[field]
+    elif field == "transcript":
+        row = next(r for r in state["inventory"]["sessions"] if r["session_id"] == "current-lead")
+        key = "transcript_path"
+    else:
+        row = state["active_lead"]
+        key = {"identity": "model_session_id", "pane": "pane"}[field]
+    row[key] = value
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+    monkeypatch.setattr(lead, "verify_draining", lambda path, drain: None)
+    monkeypatch.setenv("DRAIN_READY_WAIT", "0")
+    with pytest.raises(lead.DrainNotReady) as error:
+        lead.drain_ready(path, "drained")
+    detail = json.loads(str(error.value).split(": ", 1)[1])
+    assert detail["recipient"] == recipient
+    assert field in detail["invalid_fields"]
+    assert detail[field] == value
+    assert detail["run_path"] == str(path.resolve())
+    assert "completion" not in json.loads(path.read_text())["draining_leads"]["drained"]
+
+
+@pytest.mark.parametrize("commit_fails", [False, True])
+def test_drain_ready_retries_missing_transcript_without_masking_commit_failure(
+    lead, draining, monkeypatch, commit_fails
+):
+    path, state, _, _ = draining
+    del state["draining_leads"]["drained"]["completion"]
+    (path.parent / "handoff").mkdir()
+    (path.parent / "handoff/lead-drained-drain.md").write_text("Finished work\n")
+    row = next(r for r in state["inventory"]["sessions"] if r["session_id"] == "current-lead")
+    transcript = row.pop("transcript_path")
+    path.write_text(json.dumps(state))
+    monkeypatch.setattr(lead, "originating_lead", lambda state: state["active_lead"])
+    monkeypatch.setattr(lead, "verify_draining", lambda path, drain: None)
+
+    def register(state):
+        row = next(r for r in state["inventory"]["sessions"] if r["session_id"] == "current-lead")
+        row["transcript_path"] = transcript
+
+    sleeps = wait_for(lead, monkeypatch, path, register)
+    if commit_fails:
+
+        def refuse(*args):
+            raise ValueError("Draining lead still owns active jobs")
+
+        monkeypatch.setattr(lead, "transact", refuse)
+        with pytest.raises(ValueError, match="still owns active jobs"):
+            lead.drain_ready(path, "drained")
+        assert "completion" not in json.loads(path.read_text())["draining_leads"]["drained"]
+    else:
+        completion = lead.drain_ready(path, "drained")
+        assert completion["targets"][-1]["transcript_path"] == transcript
+    assert sleeps == [5]
+
+
+@pytest.mark.parametrize("completion", [False, True])
+@pytest.mark.parametrize("action", ["exit", "retire"])
+def test_unbound_reviewer_unknown_usage_blocks_drain(
+    lead, draining, monkeypatch, completion, action
+):
+    import sys
+
+    import pilot_guard
+
+    path, state, _, _ = draining
+    drain = state["draining_leads"]["drained"]
+    drain["lead"]["pane"] = "301"
+    if not completion:
+        del drain["completion"]
+    reviewer = {"session_id": "drained/agent", "role": "reviewer", "parent_session_id": "drained"}
+    state["inventory"]["sessions"].append(reviewer)
+    pilot_guard.reviewer_stop_unbound(
+        state,
+        {"agent_transcript_path": str(path.parent / "missing.jsonl")},
+        "agent",
+        reviewer,
+        path,
+    )
+    run = state["runs"]["reviewer-drained/agent"]
+    assert run["complete"] and run["usage_status"] == "unknown"
+    assert "parent_session_id" not in run and "allocation_id" not in run
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    monkeypatch.setitem(sys.modules, "pilot_lead", lead)
+    monkeypatch.setattr(pilot_guard, "originating_lead", lambda s: s["active_lead"])
+    monkeypatch.setattr(pilot_guard, "check_action", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match=r"reviewer.*accounting"):
+        if action == "retire":
+            lead.retire_draining(path, "drained")
+        else:
+            pilot_guard.check(
+                {
+                    "session_id": "drained",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "wezterm cli kill-pane --pane-id 301"},
+                },
+                state,
+                path,
+                100,
+                95000,
+            )
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("accounting", ["missing", "incomplete", "known", "foreign unknown"])
+def test_owned_reviewer_requires_final_accounting(lead, draining, accounting):
+    path, state, _, _ = draining
+    drain = state["draining_leads"]["drained"]
+    del drain["completion"]
+    state["inventory"]["sessions"].append(
+        {
+            "session_id": "review",
+            "role": "reviewer",
+            "complete": True,
+            "parent_session_id": "other" if accounting == "foreign unknown" else "drained",
+        }
+    )
+    if accounting != "missing":
+        state["runs"]["review"] = {
+            "session_id": "review",
+            "complete": accounting != "incomplete",
+            "usage_status": "unknown" if accounting == "foreign unknown" else "known",
+        }
+    path.write_text(json.dumps(state))
+    if accounting in {"known", "foreign unknown"}:
+        lead.drain_finished(path, state, "drained", drain)
+    else:
+        with pytest.raises(ValueError, match=r"reviewer.*accounting"):
+            lead.drain_finished(path, state, "drained", drain)
+
+
+@pytest.mark.parametrize("unfinished", ["builder", "reviewer", "gate", "usage", None])
+def test_completion_pointer_does_not_bypass_finished_checks(
+    lead, draining, monkeypatch, unfinished
+):
+    import sys
+
+    import pilot_guard
+
+    path, state, table, _ = draining
+    drain = state["draining_leads"]["drained"]
+    drain["lead"]["pane"] = "301"
+    table[drain["lead"]["pid"]] = drain["lead"]
+    if unfinished == "builder":
+        state["reservations"]["b"] = {"parent_session_id": "drained", "active_run": "b"}
+    elif unfinished == "reviewer":
+        state["inventory"]["sessions"].append(
+            {
+                "session_id": "r",
+                "role": "reviewer",
+                "parent_session_id": "drained",
+                "complete": False,
+            }
+        )
+        state["runs"]["r"] = {"session_id": "r", "complete": True, "usage_status": "known"}
+    elif unfinished == "gate":
+        gate = identity(700001)
+        drain["gates"] = [gate]
+        table[gate["pid"]] = gate
+    elif unfinished == "usage":
+        state["runs"]["b"] = {
+            "parent_session_id": "drained",
+            "complete": True,
+            "usage_status": "unknown",
+        }
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    monkeypatch.setitem(sys.modules, "pilot_lead", lead)
+    monkeypatch.setattr(pilot_guard, "originating_lead", lambda s: s["active_lead"])
+    monkeypatch.setattr(pilot_guard, "check_action", lambda *args, **kwargs: None)
+    event = {
+        "session_id": "drained",
+        "tool_name": "Bash",
+        "tool_input": {"command": "wezterm cli kill-pane --pane-id 301"},
+    }
+    if unfinished is None:
+        assert pilot_guard.check(event, state, path, 100, 95000)
+    else:
+        with pytest.raises(ValueError):
+            pilot_guard.check(event, state, path, 100, 95000)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("completion", [False, True])
+@pytest.mark.parametrize("transcript", ["missing", "no usage", "directory", "known"])
+def test_self_exit_requires_readable_lead_usage(
+    lead, draining, monkeypatch, completion, transcript
+):
+    import sys
+
+    import pilot_guard
+
+    path, state, table, _ = draining
+    drain = state["draining_leads"]["drained"]
+    drain["lead"]["pane"] = "301"
+    table[drain["lead"]["pid"]] = drain["lead"]
+    if not completion:
+        del drain["completion"]
+    file = path.parent / "drained.jsonl"
+    if transcript == "missing":
+        file.unlink()
+    elif transcript == "no usage":
+        file.write_text("{}\n")
+    elif transcript == "directory":
+        file.unlink()
+        file.mkdir()
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    monkeypatch.setitem(sys.modules, "pilot_lead", lead)
+    monkeypatch.setattr(pilot_guard, "originating_lead", lambda s: s["active_lead"])
+    monkeypatch.setattr(pilot_guard, "check_action", lambda *args, **kwargs: None)
+    event = {
+        "session_id": "drained",
+        "tool_name": "Bash",
+        "tool_input": {"command": "wezterm cli kill-pane --pane-id 301"},
+    }
+    if transcript == "known":
+        assert pilot_guard.check(event, state, path, 100, 95000)
+    else:
+        with pytest.raises(ValueError, match="lead final usage is unknown"):
+            pilot_guard.check(event, state, path, 100, 95000)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("unfinished", ["reviewer", "gate", "worker usage", "lead usage", None])
+def test_stop_rechecks_finished_work_before_retire_start(lead, draining, monkeypatch, unfinished):
+    path, state, table, _ = draining
+    active = state.pop("draining_leads")["drained"]["lead"]
+    state["active_lead"] = active
+    table[active["pid"]] = active
+    if unfinished == "reviewer":
+        state["inventory"]["sessions"].append(
+            {
+                "session_id": "drained/r",
+                "role": "reviewer",
+                "parent_session_id": "drained",
+                "complete": False,
+            }
+        )
+        state["runs"]["r"] = {"session_id": "drained/r", "complete": False, "usage_status": "known"}
+    elif unfinished == "gate":
+        gate = identity(700001, ppid=active["pid"], command="python3 unit_gate.py")
+        table[gate["pid"]] = gate
+    elif unfinished == "worker usage":
+        state["runs"]["worker"] = {
+            "parent_session_id": "drained",
+            "complete": True,
+            "usage_status": "unknown",
+        }
+    elif unfinished == "lead usage":
+        (path.parent / "drained.jsonl").unlink()
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    stopped = []
+
+    def stop(pid, *args, **kwargs):
+        stopped.append(pid)
+        table.pop(pid, None)
+        return [], []
+
+    monkeypatch.setattr(lead, "stop", stop)
+    if unfinished is None:
+        lead.stop_active(path)
+        assert stopped == [active["pid"]]
+        assert json.loads(path.read_text())["active_lead"] is None
+    else:
+        with pytest.raises(ValueError):
+            lead.stop_active(path)
+        assert stopped == []
+        assert path.read_bytes() == before
+        assert not (path.parent / "leads").exists()

@@ -2,3 +2,4 @@ node_modules/
 .state/
 .scratch/
 coverage/
+__pycache__/

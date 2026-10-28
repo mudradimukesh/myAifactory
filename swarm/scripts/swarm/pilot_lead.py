@@ -170,28 +170,35 @@ def launch(path, env, token):
         PILOT_LEAD_OVERLAP="1",
     )
     prompt += (
-        "\nAt your context cap, use the exact standalone native --handoff-begin command. "
+        "\nAt your context cap, run exactly "
+        "/tmp/factory-fp-0925/swarm/bin/interior-lead.sh --handoff-begin with no other "
+        "arguments, then /tmp/factory-fp-0925/swarm/bin/interior-lead.sh --handoff-start "
+        "<token> with the token it prints. No other handoff command exists. "
+        "With no builder, reviewer or gate running, the handoff is sequential: the controller "
+        "retires you after the successor acknowledges and your lead scopes pass to it, so no "
+        "drain, --drain-ready or --drain-retire step follows. "
         "The overlap-enabled controller keeps your owned jobs with you as drain-only and "
         "adopts one dispatch successor for independent registered worktree scopes. "
-        "Never transfer or restart running jobs. Register exact lead scopes through the "
-        "orchestrator before the cap. A draining lead may only read results, write its "
-        "handoff/lead-<session>-drain.md report and call --drain-ready <session>. "
-        "That command returns persisted completion pointers for the orchestrator and "
-        "current successor; deliver them through the approved literal WezTerm text and "
-        "separate carriage-return path, preserving drafts and native receipts. "
-        "The orchestrator verifies receipts, drain and final accounting through "
-        "--drain-retire <session>. All six-slot, owner, approval, hold and gate controls remain."
+        "Never transfer or restart running jobs. Register exact lead scopes with "
+        "run_state.py register-lead-scopes before the cap. A draining lead may only read "
+        "results, write its handoff/lead-<session>-drain.md report and call --drain-ready "
+        "<session>. It waits up to 30 minutes while your handoff commits and the successor "
+        "is recorded, so run it in the background. It returns persisted completion "
+        "pointers for the current "
+        "successor lead, and for the orchestrator only while one is registered; deliver them "
+        "through the approved literal WezTerm text and separate carriage-return path, "
+        "preserving drafts and native receipts. The successor lead runs --drain-retire "
+        "<session>, which verifies receipts, drain and final accounting natively. "
+        "All owner, approval, hold and gate controls remain."
         " Your gate stays attached to you and retains its native exit notification. "
-        "On each owned builder/reviewer/gate completion, send the existing orchestrator "
-        "alert with exact task/process/receipt identity immediately so accounting can "
-        "finish; do not wait for drain-ready before alerting. You consume and report "
-        "your existing results, the orchestrator owns final drain/accounting, and the "
-        "dispatch successor consumes the accepted evidence pointer after release. "
+        "Each owned builder/reviewer/gate completion is accounted by its launcher receipt; "
+        "consume and report your existing results, and the dispatch successor consumes the "
+        "accepted evidence pointer after release. "
         "An unresolved recorded gate blocks overlapping successor gates/benchmarks, "
         "but not independent registered builder scopes. Never poll for an exit."
         " Once your --drain-ready completion pointer is delivered, or your lead work is "
         "finished with no owned job running, close your own pane with the exact command "
-        'wezterm cli kill-pane --pane-id "$WEZTERM_PANE". The orchestrator\'s '
+        'wezterm cli kill-pane --pane-id "$WEZTERM_PANE". The successor\'s '
         "--drain-retire accepts the exited lead."
     )
     try:
@@ -271,7 +278,12 @@ def initial(path, env):
     try:
         successor = launch(path, env, token)
         capture(successor["pid"], owned)
-        transact(path, "spawner", "handoff-commit", {"token": token, "successor": successor})
+        transact(
+            path,
+            "spawner",
+            "handoff-commit",
+            {"token": token, "successor": successor, **successor_transcript(successor, env)},
+        )
         return successor
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         if successor:
@@ -286,6 +298,26 @@ def initial(path, env):
         raise
 
 
+def successor_transcript(successor, env):
+    # Record the successor's transcript at commit so its predecessor can address the
+    # completion pointer before the successor's first tool call records it.
+    from codex_launch import events, find_transcript
+
+    session = successor["model_session_id"]
+    projects = Path(env.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))) / "projects"
+    transcript = find_transcript(projects, session)
+    if (
+        transcript is None
+        or not transcript.is_file()
+        or transcript.is_symlink()
+        or not transcript.resolve().is_relative_to(projects.resolve())
+        or not any(row.get("sessionId") == session for row in events(transcript))
+        or any(row.get("sessionId") not in (None, session) for row in events(transcript))
+    ):
+        return {}
+    return {"transcript_path": str(transcript.resolve())}
+
+
 def retire(path, transfer):
     predecessor = transfer["predecessor"]
     owned = {predecessor["pid"]: predecessor}
@@ -296,6 +328,32 @@ def retire(path, transfer):
     )
     if remaining:
         raise ValueError("Predecessor survived retirement")
+    from pilot_guard import claude_usage
+
+    session = predecessor["model_session_id"]
+    row = next(
+        (
+            r
+            for r in json.loads(path.read_text()).get("inventory", {}).get("sessions", [])
+            if r.get("session_id") == session and r.get("role") == "lead"
+        ),
+        None,
+    )
+    if row is None:
+        return
+    usage = claude_usage(Path(row["transcript_path"])) if row.get("transcript_path") else None
+    transact(
+        path,
+        "orchestrator",
+        "record-run",
+        {
+            "run_id": "lead-" + session,
+            "session_id": session,
+            "role": "lead",
+            "complete": True,
+            **(usage if usage is not None else {"usage_status": "unknown"}),
+        },
+    )
 
 
 def controller(path, env, token):
@@ -341,10 +399,19 @@ def controller(path, env, token):
             raise ValueError("Frozen snapshot changed")
         validate_pinned_state(path, transfer)
         check_action(read(path), path, "launch:lead")
+        # Resolved before retirement, so a lookup failure aborts with the predecessor alive.
+        transcript = successor_transcript(successor, env)
         if not concurrent:
-            drain_jobs(read(path), transfer["predecessor"])
+            state = read(path)
+            drain_jobs(state, transfer["predecessor"], allow_exited=True)
+            drain_finished(path, state, transfer["predecessor"]["model_session_id"])
             retire(path, state_transfer)
-        transact(path, "spawner", "handoff-commit", {"token": token, "successor": successor})
+        transact(
+            path,
+            "spawner",
+            "handoff-commit",
+            {"token": token, "successor": successor, **transcript},
+        )
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         if successor:
             signals, remaining = stop(successor["pid"], owned)
@@ -392,34 +459,42 @@ def drain_jobs(state, lead, scoped=False, allow_exited=False):
     for pid, row in owned.items():
         if pid == lead["pid"] or row.get("status", "").startswith("Z"):
             continue
-        if any(
-            Path(word.strip("'\"")).name in {"unit_gate.py", "unit_gate.sh", "red_check.py"}
-            for word in row["command"].split()
-        ):
+        if is_gate(row["command"]):
             raise ValueError(f"Wait for running gate PID {pid} to finish before handoff")
+
+
+def is_gate(command):
+    words = [Path(w.strip("'\"")).name for w in command.split()]
+    if words and words[0].startswith(("python", "sh", "bash", "zsh")):
+        words = [w for w in words[1:] if not w.startswith("-")]
+    return bool(words) and words[0] in {"unit_gate.py", "unit_gate.sh", "red_check.py"}
 
 
 def begin(path, concurrent=False):
     state = read(path)
     lead = originating_lead(state)
     scopes = state.get("lead_scopes", {}).get(lead.get("model_session_id"), [])
+    gates = []
+    if concurrent:
+        owned = {}
+        capture(lead["pid"], owned)
+        gates = [
+            row for row in owned.values() if row["pid"] != lead["pid"] and is_gate(row["command"])
+        ]
+        concurrent = (
+            bool(gates)
+            or any(r.get("active_run") for r in state.get("reservations", {}).values())
+            or any(
+                s.get("role") == "reviewer" and not s.get("complete")
+                for s in state.get("inventory", {}).get("sessions", [])
+            )
+        )
     if concurrent:
         if not scopes:
             raise ValueError("Concurrent handoff requires registered lead scopes")
         for reservation in state.get("reservations", {}).values():
             if reservation.get("active_run") and not reservation.get("parent_session_id"):
                 raise ValueError("Running job has no registered lead owner")
-        owned = {}
-        capture(lead["pid"], owned)
-        gates = [
-            row
-            for row in owned.values()
-            if row["pid"] != lead["pid"]
-            and any(
-                Path(word.strip("'\"")).name in {"unit_gate.py", "unit_gate.sh", "red_check.py"}
-                for word in row["command"].split()
-            )
-        ]
     else:
         drain_jobs(state, lead)
     token = str(uuid.uuid4())
@@ -574,8 +649,6 @@ def start_handoff(path, env, token):
 
 
 def stop_active(path):
-    from pilot_guard import claude_usage
-
     state = read(path)
     active = state.get("active_lead")
     if not active:
@@ -587,6 +660,7 @@ def stop_active(path):
     )
     if not exited and not same_identity(active, live):
         raise ValueError("Lead identity cannot be verified for retirement")
+    drain_finished(path, state, active["model_session_id"])
     owned = {active["pid"]: active}
     transact(path, "spawner", "retire-start", {"predecessor": active, "owned_processes": owned})
     signals, remaining = stop(active["pid"], owned, descendants=False) if not exited else ([], [])
@@ -597,8 +671,7 @@ def stop_active(path):
     if remaining:
         raise ValueError("Lead retirement incomplete")
     session = active["model_session_id"]
-    row = next(r for r in state["inventory"]["sessions"] if r["session_id"] == session)
-    usage = claude_usage(Path(row["transcript_path"])) if row.get("transcript_path") else None
+    _, usage = lead_usage(state, session)
     transact(
         path,
         "orchestrator",
@@ -608,7 +681,7 @@ def stop_active(path):
             "session_id": session,
             "role": "lead",
             "complete": True,
-            **(usage if usage is not None else {"usage_status": "unknown"}),
+            **usage,
         },
     )
     transact(path, "spawner", "retire-commit", {"predecessor": active})
@@ -685,10 +758,33 @@ def stop_draining_gate(path, session, pid):
         raise ValueError("Owned gate cleanup incomplete")
 
 
+class DrainNotReady(ValueError):
+    pass
+
+
 def drain_ready(path, session):
+    # A lead hands off and drains in one step, so wait while its handoff commits and its
+    # successor is recorded instead of refusing a lead that owns no running job.
+    deadline = time.monotonic() + int(os.environ.get("DRAIN_READY_WAIT", "1800"))
+    while True:
+        try:
+            return drain_ready_once(path, session)
+        except DrainNotReady:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise
+            time.sleep(min(5, left))
+            if time.monotonic() > deadline:
+                raise
+
+
+def drain_ready_once(path, session):
     state = read(path)
     drain = state.get("draining_leads", {}).get(session)
     if not drain:
+        predecessor = (state.get("handoff") or {}).get("predecessor") or {}
+        if predecessor.get("model_session_id") == session:
+            raise DrainNotReady("Lead is not registered as draining")
         raise ValueError("Lead is not registered as draining")
     originating_lead({**state, "active_lead": drain["lead"]})
     verify_draining(path, drain)
@@ -707,13 +803,21 @@ def drain_ready(path, session):
     )
     successor = state.get("active_lead") or {}
     targets = []
-    for identity, pane, transcript in [
-        (
-            orchestrator.get("thread_id"),
-            orchestrator.get("pane_id"),
-            orchestrator.get("transcript_path"),
+    for recipient, identity, pane, transcript in [
+        *(
+            [
+                (
+                    "orchestrator",
+                    orchestrator.get("thread_id"),
+                    orchestrator.get("pane_id"),
+                    orchestrator.get("transcript_path"),
+                )
+            ]
+            if orchestrator
+            else []
         ),
         (
+            "successor",
             successor.get("model_session_id"),
             successor.get("pane"),
             next(
@@ -726,8 +830,30 @@ def drain_ready(path, session):
             ),
         ),
     ]:
-        if not identity or pane is None or not str(pane).isdigit() or not transcript:
-            raise ValueError("Completion recipient identity/transcript is incomplete")
+        invalid_fields = [
+            field
+            for field, invalid in (
+                ("identity", not identity),
+                ("pane", pane is None or not str(pane).isdigit()),
+                ("transcript", not transcript),
+            )
+            if invalid
+        ]
+        if invalid_fields:
+            raise DrainNotReady(
+                "Completion recipient identity/transcript is incomplete: "
+                + json.dumps(
+                    {
+                        "recipient": recipient,
+                        "invalid_fields": invalid_fields,
+                        "identity": identity,
+                        "pane": pane,
+                        "transcript": transcript,
+                        "run_path": str(path.resolve()),
+                        "updated_at": state.get("updated_at"),
+                    }
+                )
+            )
         targets.append({"identity": identity, "pane": str(pane), "transcript_path": transcript})
     completion = {
         "report": str(report),
@@ -951,6 +1077,76 @@ def lead_continuation_receipt(
     )
 
 
+def lead_usage(state, session):
+    transcript = next(
+        (
+            r.get("transcript_path")
+            for r in state.get("inventory", {}).get("sessions", [])
+            if r.get("session_id") == session and r.get("role") == "lead"
+        ),
+        None,
+    )
+    from pilot_guard import claude_usage
+
+    try:
+        usage = claude_usage(Path(transcript)) if transcript else None
+    except (OSError, UnicodeError):
+        usage = None
+    if usage is None:
+        raise ValueError("Draining lead final usage is unknown before retirement")
+    return transcript, usage
+
+
+def drain_finished(path, state, session, drain=None):
+    if drain is None:
+        active = state.get("active_lead") or {}
+        if active.get("model_session_id") != session:
+            raise ValueError("Retirement lead identity changed")
+        drain = state.get("draining_leads", {}).get(session) or {
+            "lead": active,
+            "scopes": state.get("lead_scopes", {}).get(session, []),
+        }
+    # Everything the draining lead owns has finished, with known final accounting.
+    allocations = {
+        allocation
+        for allocation, reservation in state.get("reservations", {}).items()
+        if reservation.get("parent_session_id") == session
+        or any(
+            Path(reservation.get("worktree", "/")).resolve().is_relative_to(Path(scope).resolve())
+            for scope in drain.get("scopes", [])
+        )
+    }
+    if any(state["reservations"][allocation].get("active_run") for allocation in allocations):
+        raise ValueError("Draining lead still owns active jobs")
+    if any(
+        (not run.get("complete") or run.get("usage_status") != "known")
+        and (run.get("parent_session_id") == session or run.get("allocation_id") in allocations)
+        for run in state.get("runs", {}).values()
+    ):
+        raise ValueError("Draining job final accounting is incomplete")
+    reviewers = {
+        row.get("session_id")
+        for row in state.get("inventory", {}).get("sessions", [])
+        if row.get("role") == "reviewer" and row.get("parent_session_id") == session
+    }
+    for reviewer in reviewers:
+        runs = [run for run in state.get("runs", {}).values() if run.get("session_id") == reviewer]
+        if (
+            not reviewer
+            or not runs
+            or any(not run.get("complete") or run.get("usage_status") != "known" for run in runs)
+        ):
+            raise ValueError("Draining reviewer final accounting is incomplete")
+    table = verify_draining(
+        path,
+        drain
+        if drain.get("completion") or drain.get("retirement")
+        else {**drain, "retirement": {"exited_without_completion": True}},
+    )
+    lead_usage(state, session)
+    return table
+
+
 def retire_draining(path, session):
     state = read(path)
     drain = state.get("draining_leads", {}).get(session)
@@ -980,29 +1176,7 @@ def retire_draining(path, session):
             )
         ):
             raise ValueError("Draining completion is not ready")
-    allocations = {
-        allocation
-        for allocation, reservation in state.get("reservations", {}).items()
-        if reservation.get("parent_session_id") == session
-        or any(
-            Path(reservation.get("worktree", "/")).resolve().is_relative_to(Path(scope).resolve())
-            for scope in drain.get("scopes", [])
-        )
-    }
-    if any(state["reservations"][allocation].get("active_run") for allocation in allocations):
-        raise ValueError("Draining lead still owns active jobs")
-    if any(
-        (not run.get("complete") or run.get("usage_status") != "known")
-        and (run.get("parent_session_id") == session or run.get("allocation_id") in allocations)
-        for run in state.get("runs", {}).values()
-    ):
-        raise ValueError("Draining job final accounting is incomplete")
-    table = verify_draining(
-        path,
-        drain
-        if completion or drain.get("retirement")
-        else {**drain, "retirement": {"exited_without_completion": True}},
-    )
+    table = drain_finished(path, state, session, drain)
     live = table.get(lead["pid"])
     exited = live is None or (
         live.get("status", "").startswith("Z")
@@ -1012,18 +1186,7 @@ def retire_draining(path, session):
         raise ValueError("Draining lead survived retirement")
     if completion and sha(Path(completion["report"])) != completion["report_sha256"]:
         raise ValueError("Completion report changed")
-    transcript = next(
-        (
-            r.get("transcript_path")
-            for r in state.get("inventory", {}).get("sessions", [])
-            if r.get("session_id") == session and r.get("role") == "lead"
-        ),
-        None,
-    )
-    from pilot_guard import claude_usage
-
-    if not transcript or claude_usage(Path(transcript)) is None:
-        raise ValueError("Draining lead final usage is unknown before retirement")
+    transcript, _ = lead_usage(state, session)
 
     def completion_receipt(target: dict[str, str]) -> Mapping[str, str | int | None] | None:
         found: Mapping[str, str | int | None] | None = None
@@ -1138,10 +1301,16 @@ def retire_draining(path, session):
             )
             replacements = []
             for identity, pane, transcript_path in [
-                (
-                    orchestrator.get("thread_id"),
-                    orchestrator.get("pane_id"),
-                    orchestrator.get("transcript_path"),
+                *(
+                    [
+                        (
+                            orchestrator.get("thread_id"),
+                            orchestrator.get("pane_id"),
+                            orchestrator.get("transcript_path"),
+                        )
+                    ]
+                    if orchestrator
+                    else []
                 ),
                 (
                     active.get("model_session_id"),
@@ -1205,9 +1374,10 @@ def retire_draining(path, session):
     )
     if remaining:
         raise ValueError("Draining lead survived retirement")
-    usage = claude_usage(Path(transcript))
-    if usage is None:
-        raise ValueError("Retired lead final usage is unknown")
+    try:
+        _, usage = lead_usage(state, session)
+    except ValueError as error:
+        raise ValueError("Retired lead final usage is unknown") from error
     transact(
         path,
         "orchestrator",

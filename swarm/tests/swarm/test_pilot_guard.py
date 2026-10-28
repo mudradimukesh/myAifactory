@@ -131,6 +131,27 @@ def test_frozen_lead_cannot_dispatch_but_can_snapshot(guard, tmp_path, monkeypat
     )
 
 
+def test_frozen_lead_may_start_only_its_own_drain_ready(guard, tmp_path, monkeypatch):
+    s = state()
+    s["dispatch_frozen"] = True
+    monkeypatch.setattr(guard, "originating_lead", lambda state: state["active_lead"])
+    launcher = "/tmp/factory-fp-0925/swarm/bin/interior-lead.sh"
+    assert guard.check(
+        event("Bash", command=launcher + " --drain-ready lead-session"),
+        s,
+        tmp_path / "run.json",
+        100,
+        83000,
+    )
+    for command in [
+        launcher + " --drain-ready other-session",
+        launcher + " --drain-ready lead-session && true",
+        launcher + " --drain-retire lead-session",
+    ]:
+        with pytest.raises(ValueError):
+            guard.check(event("Bash", command=command), s, tmp_path / "run.json", 100, 83000)
+
+
 def test_inactive_successor_can_only_ack_or_read(guard, tmp_path, monkeypatch):
     s = state()
     s["handoff"]["successor_session_id"] = "successor"
@@ -907,19 +928,33 @@ def test_reviewer_hook_prints_related_row_note(
 
 
 @pytest.mark.parametrize(
-    "command, completion, allowed",
+    "command, completion, finished, allowed",
     [
-        ('wezterm cli kill-pane --pane-id "$WEZTERM_PANE"', True, True),
-        ("wezterm cli kill-pane --pane-id 232", True, True),
-        ("wezterm cli kill-pane --pane-id 239", True, False),
-        ('wezterm cli kill-pane --pane-id "$WEZTERM_PANE"', False, False),
+        ('wezterm cli kill-pane --pane-id "$WEZTERM_PANE"', True, False, False),
+        ("wezterm cli kill-pane --pane-id 232", True, False, False),
+        ("wezterm cli kill-pane --pane-id 239", True, True, False),
+        ('wezterm cli kill-pane --pane-id "$WEZTERM_PANE"', False, True, True),
+        ("wezterm cli kill-pane --pane-id 232", False, True, True),
+        ("wezterm cli kill-pane --pane-id 239", False, True, False),
+        ('wezterm cli kill-pane --pane-id "$WEZTERM_PANE" ; true', False, True, False),
+        ('wezterm cli kill-pane --pane-id "$WEZTERM_PANE"', False, False, False),
     ],
 )
-def test_draining_lead_closes_only_its_own_pane_after_drain_ready(
-    guard, tmp_path, monkeypatch, command, completion, allowed
+def test_draining_lead_closes_only_its_own_pane_when_finished(
+    guard, tmp_path, monkeypatch, command, completion, finished, allowed
 ):
+    import pilot_lead
+
     monkeypatch.setattr(guard, "originating_lead", lambda state: state["active_lead"])
     monkeypatch.setattr(guard, "check_action", lambda *args, **kwargs: None)
+    calls = []
+
+    def drain_finished(path, state, session, drain):
+        calls.append(session)
+        if not finished:
+            raise ValueError("Draining job final accounting is incomplete")
+
+    monkeypatch.setattr(pilot_lead, "drain_finished", drain_finished)
     s = state()
     s["draining_leads"] = {
         "lead-session": {
@@ -937,6 +972,27 @@ def test_draining_lead_closes_only_its_own_pane_after_drain_ready(
     else:
         with pytest.raises(ValueError):
             guard.check(e, s, tmp_path / "run.json", 100, 95000)
+    assert calls == ([] if "239" in command or ";" in command else ["lead-session"])
+
+
+def test_foreign_session_cannot_close_a_draining_pane(guard, tmp_path, monkeypatch):
+    def refuse(state):
+        raise ValueError("Caller is not a descendant of the active lead")
+
+    monkeypatch.setattr(guard, "originating_lead", refuse)
+    monkeypatch.setattr(guard, "check_action", lambda *args, **kwargs: None)
+    s = state()
+    s["draining_leads"] = {
+        "lead-session": {"scopes": [], "gates": [], "lead": {"pid": 42, "pane": "232"}}
+    }
+    with pytest.raises(ValueError, match="not a descendant"):
+        guard.check(
+            event("Bash", command="wezterm cli kill-pane --pane-id 232"),
+            s,
+            tmp_path / "run.json",
+            100,
+            95000,
+        )
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,20 @@
+{
+  "disableAllHooks": true,
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": []
+  },
+  "permissions": {
+    "deny": [
+      "Edit(//**)",
+      "Write(//**)",
+      "NotebookEdit(//**)",
+      "WebFetch",
+      "WebSearch",
+      "Agent"
+    ],
+    "allow": ["Read", "Glob", "Grep"]
+  }
+}

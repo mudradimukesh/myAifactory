@@ -52,6 +52,14 @@
       "Bash(/tmp/factory-fp-0925/swarm/bin/alert-orchestrator.sh *)",
       "Bash(/tmp/factory-fp-0925/swarm/bin/interior-lead.sh --handoff-begin)",
       "Bash(/tmp/factory-fp-0925/swarm/bin/interior-lead.sh --handoff-start *)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/interior-lead.sh --drain-ready *)",
+      "Bash(/tmp/factory-fp-0925/swarm/bin/interior-lead.sh --drain-retire *)",
+      "Bash(/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/.venv/bin/python /tmp/factory-fp-0925/swarm/bin/run_state.py --run '/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/research_notes/Non-Phase-2 integration-20261021/run.json' --as orchestrator assign --data *)",
+      "Bash(/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/.venv/bin/python /tmp/factory-fp-0925/swarm/bin/run_state.py --run '/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/research_notes/Non-Phase-2 integration-20261021/run.json' --as orchestrator register-lead-scopes --data *)",
+      "Bash(/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/.venv/bin/python /tmp/factory-fp-0925/swarm/bin/run_state.py --run '/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/research_notes/Non-Phase-2 integration-20261021/run.json' --as orchestrator release-drain-scope --data *)",
+      "Bash(/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/.venv/bin/python /tmp/factory-fp-0925/swarm/bin/run_state.py --run '/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/research_notes/Non-Phase-2 integration-20261021/run.json' --as orchestrator add-blocker --data *)",
+      "Bash(/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/.venv/bin/python /tmp/factory-fp-0925/swarm/bin/run_state.py --run '/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/research_notes/Non-Phase-2 integration-20261021/run.json' --as orchestrator close-blocker --data *)",
+      "Bash(/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/.venv/bin/python /tmp/factory-fp-0925/swarm/bin/run_state.py --run '/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer/research_notes/Non-Phase-2 integration-20261021/run.json' --as orchestrator set-lifecycle --data *)",
       "Bash(/tmp/factory-fp-0925/swarm/bin/merge_unit.sh *)",
       "Bash(/tmp/factory-fp-0925/swarm/bin/prepare_candidate.sh *)",
       "Bash(/tmp/factory-fp-0925/swarm/bin/unit_gate.sh *)",
@@ -104,6 +112,7 @@
       "The user authorized Jev priority/evidence integration through existing P1 call sites, existing provider and separate POC spend ledger. Preserve deterministic gates, independent review, ownership hooks and caps. No credential exploration, new paid routes, unsafe mode, direct ledger edits or gate waivers are authorized."
     ]
   },
+  "promptSuggestionEnabled": false,
   "verbose": false,
   "viewMode": "focus",
   "env": {

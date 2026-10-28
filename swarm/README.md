@@ -2,7 +2,7 @@
 
 This directory holds the orchestrator, lead, builder and gate tooling that ran the FloorInteriorDesignAndRenderer Phase 1 swarm. Copy it into a new project to start a swarm there.
 
-The kit comes from commit `00cfe5b` on branch `p1-premain-candidate/1` of FloorInteriorDesignAndRenderer: the project's pre-main swarm tooling merged with the token, succession and worktree fixes from session 8f3b47cf, the remaining gate test repairs, and per-gate database and API runtimes. Read [the loop lessons](../docs/orchestrator-lead-loop-lessons.md) before running it.
+The kit comes from commit `aadb2dfb` on `main` of FloorInteriorDesignAndRenderer (remote `interior`), the tooling the NP2 pilot ran on 2026-10-28, plus `claude-reviewer-settings.json`, which exists only in BIN. Read [the loop lessons](../docs/orchestrator-lead-loop-lessons.md) before running it. To monitor or restart the running NP2 pilot, follow [the monitor runbook](MONITOR.md).
 
 ## Layout
 
@@ -68,7 +68,7 @@ Run the suite from the host project with its Python environment:
 .venv/bin/python -m pytest -q -p no:randomly tests/swarm
 ```
 
-Run standalone in this directory, 996 tests pass. The others need a host project: the `task_env` tests need `web/node_modules`, and the quality-dependency and mypy tests need its `pyproject.toml`. The three swarm tests that failed on pre-main (`test_codex_launch`, `test_fp_guard_hook_env`, `test_reviewer_start_usage`) were repaired in this version.
+Run standalone in this directory, 1306 tests pass. The other 59 need a host project and all pass in FloorInteriorDesignAndRenderer at `aadb2dfb`: the `task_env` and TypeScript comment-lint tests need `web/node_modules`, the reviewer-cwd and default-collection tests need the project tree, and the quality-dependency and mypy tests need its `pyproject.toml`.
 
 ## Known limits
 

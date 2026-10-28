@@ -1,0 +1,23 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
+    "network": {
+      "allowLocalBinding": true
+    }
+  },
+  "permissions": {
+    "deny": [
+      "Edit(//tmp/factory-fp-0925/swarm/bin/**)",
+      "Write(//tmp/factory-fp-0925/swarm/bin/**)",
+      "Edit(//private/tmp/factory-fp-0925/swarm/bin/**)",
+      "Write(//private/tmp/factory-fp-0925/swarm/bin/**)"
+    ],
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep"
+    ]
+  }
+}

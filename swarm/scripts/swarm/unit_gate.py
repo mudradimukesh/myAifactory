@@ -6,12 +6,15 @@ import re
 import subprocess
 import time
 from collections import Counter
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 from acceptance_check import browser_rows, check, light_mapping, mapped_nodes
 from acceptance_check import python_rows as read_python_rows
 from diff_lint import check as lint_diff
+from evidence_write import LINEAGE, validate_lineage
 from gate_evidence import (
     FINAL_ONLY,
     NODE,
@@ -28,25 +31,21 @@ from gate_evidence import (
     retire_worktree,
     runtime,
 )
+from gate_types import Action, BaselineRow, Check, GateRow, Reports, Rows
 from integration import resolve_base
+from mutation_gate import Survivor
 
 python_rows = read_python_rows
 
 
-def run_all(checks, workers=1):
-    def run(item):
+def run_all(checks: list[Check], workers: int = 1) -> Rows:
+    def run(item: Check) -> GateRow:
         identifier, action = item
         started = time.monotonic()
         try:
             result = action()
         except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
-            result = {
-                "exit_code": 1,
-                "measured": 1,
-                "threshold": 0,
-                "command": [],
-                "error": str(error),
-            }
+            result = GateRow(exit_code=1, measured=1, threshold=0, command=[], error=str(error))
         return {
             "id": identifier,
             "disposition": "retained",
@@ -68,7 +67,7 @@ WEB_LINTED = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 
 class Gate:
     # Provisioned environment for per-gate runtimes; None runs gates without a runtime.
-    runtime_env = None
+    runtime_env: dict[str, str] | None = None
 
     art: Path
     tag: str
@@ -76,9 +75,14 @@ class Gate:
     final = False
     suite = "poc"
 
-    def __init__(self, root, art, tag, base, candidate, fast=False):
+    def __init__(
+        self, root: Path, art: Path, tag: str, base: str, candidate: str, **modes: bool
+    ) -> None:
+        unknown = set(modes) - {"fast"}
+        if unknown:
+            raise TypeError("Unknown gate options: " + ", ".join(sorted(unknown)))
         self.root, self.art, self.tag, self.base, self.candidate = root, art, tag, base, candidate
-        self.fast = fast
+        self.fast = modes.get("fast", False)
         self.qualification_base = base
         self.spec = acceptance(art / (tag + "-acceptance.md"))
         self.files = changed(root, base, candidate)
@@ -101,18 +105,18 @@ class Gate:
         self.py = [f for f in self.py if f.startswith("scripts/swarm/") == (self.suite == "swarm")]
         if self.suite == "swarm":
             self.ts = []
-        self.reports = {}
-        self.survivors = []
+        self.reports: Reports = {}
+        self.survivors: list[Survivor] = []
 
-    def isolated(self, identifier, action):
-        def run():
+    def isolated[T](self, identifier: str, action: Callable[[], T]) -> Callable[[], T]:
+        def run() -> T:
             name = (
                 self.tag
                 + ("-fast" if self.fast else "-final" if self.final else "")
                 + "-"
                 + identifier
             )
-            with runtime(self.root, self.art, name, self.runtime_env) as configured:
+            with runtime(self.root, self.art, name, self.runtime_env or {}) as configured:
                 shared = self.env
                 self.env = {**shared, **configured}
                 try:
@@ -129,15 +133,15 @@ class Gate:
         prefix = "fast-" if self.fast else "final-" if self.final else ""
         return self.input(prefix + suffix)
 
-    def commands(self, gate, commands, cwd="."):
+    def commands(self, gate: str, commands: list[list[str]], cwd: str = ".") -> GateRow:
         report = self.file("G10-tests.xml")
         if gate == "G10":
             commands = [[*command, "--junitxml=" + str(report)] for command in commands]
-        codes = []
+        codes: list[int] = []
         with self.file(gate + ".log").open("w") as log:
             for index, command in enumerate(commands):
 
-                def launch(command=command):
+                def launch(command: list[str] = command) -> subprocess.CompletedProcess[bytes]:
                     return subprocess.run(
                         command,
                         cwd=self.root / cwd,
@@ -154,7 +158,7 @@ class Gate:
                 codes.append(completed.returncode)
                 if completed.returncode:
                     break
-        result = {
+        result: GateRow = {
             "command": commands,
             "exit_code": max([abs(c) for c in codes], default=0),
             "measured": sum(c != 0 for c in codes),
@@ -173,9 +177,15 @@ class Gate:
             result["paths"] = ["src/", "tests/", "scripts/swarm/"]
         return result
 
-    def frozen(self):
+    def frozen(self) -> GateRow:
         record = json.loads(self.input("s1-tests.json").read_text())
         hashes = self.input("s1-tests.sha256").read_text().splitlines()
+        if (
+            "lineage" in record
+            and validate_lineage(self.root, self.art, self.tag, record)
+            != self.input("s1-tests.sha256").read_bytes()
+        ):
+            raise ValueError(LINEAGE + "final inventory differs")
         if not hashes:
             raise ValueError("Frozen hashes missing")
         for row in hashes:
@@ -203,16 +213,27 @@ class Gate:
             "threshold": 0,
         }
 
-    def green(self):
+    def red_proof(self) -> None:
         red = json.loads(self.input("red.json").read_text())
         frozen = json.loads(self.input("s1-tests.json").read_text())
+        bound = frozen
+        if "lineage" in frozen:
+            validate_lineage(self.root, self.art, self.tag, frozen)
+            bound = frozen["lineage"]["root"]
+        predecessor = red.get("predecessor")
         if (
             not red["passed"]
-            or red["tests_commit"] != frozen["tests_commit"]
+            or not isinstance(predecessor, str)
+            or not predecessor
+            or (red["tests_commit"], predecessor)
+            != (bound["tests_commit"], bound.get("predecessor"))
             or red["test_map_sha256"] != digest(self.input("test-map.json"))
         ):
             raise ValueError("Red proof differs from frozen tests")
-        commands = []
+
+    def green(self) -> GateRow:
+        self.red_proof()
+        commands: list[list[str]] = []
         nodes = self.python_nodes()
         if self.final or self.suite == "swarm":
             nodes = ["tests/swarm"] if self.suite == "swarm" else ["tests", *PYTEST_IGNORE]
@@ -278,7 +299,7 @@ class Gate:
             )
         return result
 
-    def python_nodes(self):
+    def python_nodes(self) -> list[str]:
         present = [f for f in self.files if (self.root / f).exists()]
         stems = [Path(f).stem for f in present if f.endswith(".py") and not f.startswith("tests/")]
         importing = [
@@ -314,7 +335,7 @@ class Gate:
         files = {n for n in nodes if "::" not in n}
         return [n for n in nodes if "::" not in n or n.split("::")[0] not in files]
 
-    def related(self):
+    def related(self) -> GateRow:
         present = [f for f in self.files if (self.root / f).exists()]
         nodes = self.python_nodes()
         web = [f.removeprefix("web/") for f in present if f.startswith("web/src/")]
@@ -338,11 +359,11 @@ class Gate:
             )
         return self.commands("related", commands)
 
-    def mapped(self):
+    def mapped(self) -> GateRow:
         check(self.mapping, self.input("ids.txt").read_text().splitlines(), self.reports)
         return {"command": ["acceptance_check.py"], "exit_code": 0, "measured": 0, "threshold": 0}
 
-    def diff(self, identifier):
+    def diff(self, identifier: str) -> GateRow:
         errors = lint_diff(self.root, self.base, self.candidate, 1000)
         selected = [
             e for e in errors if (e["reason"] == "file exceeds line limit") == (identifier == "G8")
@@ -355,7 +376,7 @@ class Gate:
             "errors": selected,
         }
 
-    def unit(self, identifier):
+    def unit(self, identifier: str) -> GateRow:
         if self.suite == "swarm":
             return self.commands(identifier, [])
         coverage = []
@@ -384,8 +405,8 @@ class Gate:
             ],
         )
 
-    def coverage(self):
-        commands = []
+    def coverage(self) -> GateRow:
+        commands: list[list[str]] = []
         if self.py:
             commands += [
                 [
@@ -426,7 +447,7 @@ class Gate:
             )
         return self.commands("G12", commands)
 
-    def mutation(self, identifier, language, files):
+    def mutation(self, identifier: str, language: str, files: list[str]) -> GateRow:
         if not files:
             return {
                 "disposition": "not_applicable",
@@ -463,10 +484,10 @@ class Gate:
         if packet.exists():
             content = json.loads(packet.read_text())
             self.survivors.extend(content["survivors"])
-            result.update(measured=content["score"], threshold=70, comparison="min")
+            result.update({"measured": content["score"], "threshold": 70, "comparison": "min"})
         return result
 
-    def properties(self):
+    def properties(self) -> GateRow:
         paths = self.spec.get("property_test_paths", [])
         if not paths:
             return {
@@ -482,10 +503,10 @@ class Gate:
         return {**self.commands("G9", []), "evidence": "Property tests included in G2"}
 
     @property
-    def repeats(self):
+    def repeats(self) -> int:
         return 1
 
-    def regression(self):
+    def regression(self) -> GateRow:
         tests = self.reports.get("pytest", [])
         if not tests or any(row["status"] == "error" for row in tests):
             raise ValueError("G10 runner report is empty or has infrastructure errors")
@@ -502,7 +523,7 @@ class Gate:
             else ["src/", "tests/"],
         }
 
-    def journey(self):
+    def journey(self) -> GateRow:
         mapping = [m for m in self.mapping if m["runner"] == "playwright"]
         check(mapping, [m["id"] for m in mapping], self.reports)
         tests = self.reports.get("playwright", [])
@@ -536,10 +557,10 @@ class Gate:
         result["failed_test_ids"] = sorted({r["node"] for r in tests if r["status"] != "passed"})
         result["paths"] = ["web/", "src/", "scripts/swarm/", "tests/e2e/"]
         if result["failed_test_ids"]:
-            result.update(exit_code=1, measured=len(result["failed_test_ids"]))
+            result.update({"exit_code": 1, "measured": len(result["failed_test_ids"])})
         return result
 
-    def deferred(self, identifier):
+    def deferred(self, identifier: str) -> GateRow:
         return {
             "disposition": "deferred",
             "command": [],
@@ -552,7 +573,7 @@ class Gate:
             else "Required at final qualification; not run during development",
         }
 
-    def execute(self):
+    def execute(self) -> Rows:
         ruff = str(self.root / ".venv/bin/ruff")
         changed_python = [
             file
@@ -585,7 +606,7 @@ class Gate:
             )
             ruff_check = [[ruff, "check", *paths]]
             eslint = [["npm", "--prefix", "web", "run", "lint"]]
-        checks = [
+        checks: list[Check] = [
             ("G1", self.frozen),
             ("G2", self.green),
             ("G3", self.mapped),
@@ -657,9 +678,7 @@ class Gate:
             ("G18", lambda: self.mutation("G18", "web", self.ts)),
         ]
         if not self.final:
-            checks = [
-                (i, (lambda i=i: self.deferred(i)) if i in FINAL_ONLY else a) for i, a in checks
-            ]
+            checks = [(i, partial(self.deferred, i) if i in FINAL_ONLY else a) for i, a in checks]
         order = [
             "G1",
             "G4",
@@ -680,13 +699,13 @@ class Gate:
             "G13",
             "G18",
         ]
-        actions = dict(checks)
+        actions: dict[str, Action] = dict(checks)
         if self.fast:
             for identifier in FULL_ONLY:
-                actions[identifier] = lambda identifier=identifier: self.deferred(identifier)
+                actions[identifier] = partial(self.deferred, identifier)
             order.append("related")
             actions["related"] = self.related
-        rows = []
+        rows: Rows = []
         failed = False
         for identifier in order:
             if failed:
@@ -717,8 +736,8 @@ class Gate:
         return rows
 
 
-def format_diagnostics(text):
-    paths = []
+def format_diagnostics(text: str) -> list[str]:
+    paths: list[str] = []
     lines = text.splitlines()
     for index, line in enumerate(lines):
         if line.startswith("error:"):
@@ -735,7 +754,7 @@ def format_diagnostics(text):
     return paths
 
 
-def known_diagnostics(current, previous, kind):
+def known_diagnostics(current: str, previous: str, kind: str) -> bool:
     if kind == "format":
         actual = Counter(format_diagnostics(current))
         recorded = Counter(format_diagnostics(previous))
@@ -745,7 +764,7 @@ def known_diagnostics(current, previous, kind):
     return bool(actual) and not (actual - recorded)
 
 
-def baseline(root, art, tag, env):
+def baseline(root: Path, art: Path, tag: str, env: Mapping[str, str]) -> bool:
     python = str(root / ".venv/bin/python")
     commands = [
         [python, "-m", "pytest", "-q", "-p", "no:randomly", *PYTEST_IGNORE],
@@ -776,7 +795,7 @@ def baseline(root, art, tag, env):
             "--repeat-each=1",
         ],
     ]
-    results = []
+    results: list[BaselineRow] = []
     for index in (1, 2, 3, 4, 0, 5):
         command = commands[index]
         start = time.monotonic()
@@ -832,7 +851,7 @@ def baseline(root, art, tag, env):
     return any(r["disposition"] == "failed" for r in results)
 
 
-def main():
+def parse_arguments() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["baseline", "fast", "pre", "final"])
     parser.add_argument("tag")
@@ -842,100 +861,133 @@ def main():
     args = parser.parse_args()
     if args.mode == "final" and not args.qualification_base:
         parser.error("Final qualification requires --qualification-base at POC start")
+    return parser, args
+
+
+def run_baseline(art: Path, tag: str) -> int:
+    repo = Path.cwd()
+    _, sha = resolve_base(repo)
+    root = art / "baseline" / (tag + "-" + str(time.time_ns()))
+    subprocess.run(["git", "worktree", "add", "--detach", str(root), sha], cwd=repo, check=True)
+    try:
+        env = provision(root, art / (tag + "-baseline-install.log"))
+        with runtime(root, art, tag + "-baseline", env) as env:
+            return int(baseline(root, art, tag, env))
+    finally:
+        if kept := retire_worktree(repo, root):
+            print("baseline worktree kept at " + str(root) + ": " + kept)
+
+
+def candidate_root(art: Path, args: argparse.Namespace) -> Path:
+    receipt = json.loads((art / (args.tag + "-candidate.json")).read_text())
+    root = Path(receipt["worktree"])
+    if receipt["candidate_sha"] != args.candidate or receipt["main_sha"] != args.base:
+        raise ValueError("Candidate arguments differ from receipt")
+    if output(["git", "rev-parse", "HEAD"], root) != args.candidate:
+        raise ValueError("Wrong candidate checkout")
+    if output(["git", "status", "--porcelain", "--untracked-files=no"], root):
+        raise ValueError("Candidate has unrelated tracked changes")
+    return root
+
+
+def candidate_environment(root: Path, art: Path, tag: str) -> dict[str, str]:
+    marker = root / ".venv/provision.sha256"
+    current = hashlib.sha256(
+        b"".join((root / f).read_bytes() for f in ("pyproject.toml", "web/package-lock.json"))
+    ).hexdigest()
+    if marker.exists() and marker.read_text() == current:
+        return {**os.environ, "CI": "1"}
+    env: dict[str, str] = provision(root, art / (tag + "-install.log"))
+    marker.write_text(current)
+    return env
+
+
+def qualify(gate: Gate, root: Path, qualification_base: str, candidate: str) -> list[str]:
+    gate.qualification_base = output(["git", "rev-parse", qualification_base], root)
+    if gate.spec.get("qualification_base_sha") != gate.qualification_base:
+        raise ValueError("Qualification base must match frozen acceptance metadata")
+    subprocess.run(
+        ["git", "merge-base", "--is-ancestor", gate.qualification_base, candidate],
+        cwd=root,
+        check=True,
+    )
+    qualification_files = changed(root, gate.qualification_base, candidate)
+    gate.py = [
+        f
+        for f in production(qualification_files, "python")
+        if f.startswith("scripts/swarm/") == (gate.suite == "swarm")
+    ]
+    gate.ts = production(qualification_files, "web") if gate.suite == "poc" else []
+    return list(qualification_files)
+
+
+def packet_hashes(art: Path, args: argparse.Namespace, gate: Gate, rows: Rows) -> dict[str, str]:
+    try:
+        return dict(
+            artifact_hashes(art, args.tag, gate.spec, args.mode == "fast", args.mode == "final")
+        )
+    except (ValueError, OSError) as error:
+        rows.append(
+            {
+                "id": "packet",
+                "disposition": "failed",
+                "command": ["artifact_hashes"],
+                "exit_code": 1,
+                "measured": 1,
+                "threshold": 0,
+                "error": str(error),
+            }
+        )
+        return {}
+
+
+def write_packet(
+    gate: Gate, root: Path, args: argparse.Namespace, result: tuple[Rows, list[str], dict[str, str]]
+) -> None:
+    rows, qualification_files, hashes = result
+    packet = {
+        "test_policy": POC_TEST_POLICY,
+        "stage": args.mode,
+        "test_suite": gate.suite,
+        "qualification_base_sha": gate.qualification_base if gate.final else None,
+        "qualification_diff_files": qualification_files,
+        "candidate_sha": args.candidate,
+        "base_sha": args.base,
+        "worktree": str(root),
+        "tree": output(["git", "rev-parse", "HEAD^{tree}"], root),
+        "fingerprint": fingerprint(root),
+        "diff_files": gate.files,
+        "gates": rows,
+        "artifact_hashes": hashes,
+    }
+    gate.file("gate.json").write_text(json.dumps(packet, indent=2) + "\n")
+
+
+def run_candidate(art: Path, args: argparse.Namespace) -> int:
+    root = candidate_root(art, args)
+    env = candidate_environment(root, art, args.tag)
+    gate = Gate(root, art, args.tag, args.base, args.candidate, fast=args.mode == "fast")
+    gate.final = args.mode == "final"
+    qualification_files = []
+    if gate.final:
+        qualification_files = qualify(gate, root, args.qualification_base, args.candidate)
+    gate.runtime_env = env
+    rows = gate.execute()
+    hashes = packet_hashes(art, args, gate, rows)
+    write_packet(gate, root, args, (rows, qualification_files, hashes))
+    failures = [r for r in rows if r["exit_code"] != 0]
+    for line in json.dumps(failures, indent=2).splitlines()[:100]:
+        if failures:
+            print(line)
+    return int(bool(failures))
+
+
+def main() -> int:
+    parser, args = parse_arguments()
     art = Path(os.environ.get("ART", "/tmp/factory-fp-0925/swarm/interior-p1")).resolve()
     os.environ["PATH"] = str(NODE.parent) + os.pathsep + os.environ["PATH"]
     try:
-        if args.mode == "baseline":
-            repo = Path.cwd()
-            _, sha = resolve_base(repo)
-            root = art / "baseline" / (args.tag + "-" + str(time.time_ns()))
-            subprocess.run(
-                ["git", "worktree", "add", "--detach", str(root), sha], cwd=repo, check=True
-            )
-            try:
-                env = provision(root, art / (args.tag + "-baseline-install.log"))
-                with runtime(root, art, args.tag + "-baseline", env) as env:
-                    return int(baseline(root, art, args.tag, env))
-            finally:
-                kept = retire_worktree(repo, root)
-                if kept:
-                    print("baseline worktree kept at " + str(root) + ": " + kept)
-        receipt = json.loads((art / (args.tag + "-candidate.json")).read_text())
-        root = Path(receipt["worktree"])
-        if receipt["candidate_sha"] != args.candidate or receipt["main_sha"] != args.base:
-            raise ValueError("Candidate arguments differ from receipt")
-        if output(["git", "rev-parse", "HEAD"], root) != args.candidate:
-            raise ValueError("Wrong candidate checkout")
-        if output(["git", "status", "--porcelain", "--untracked-files=no"], root):
-            raise ValueError("Candidate has unrelated tracked changes")
-        marker = root / ".venv/provision.sha256"
-        current = hashlib.sha256(
-            b"".join((root / f).read_bytes() for f in ("pyproject.toml", "web/package-lock.json"))
-        ).hexdigest()
-        if marker.exists() and marker.read_text() == current:
-            env = {**os.environ, "CI": "1"}
-        else:
-            env = provision(root, art / (args.tag + "-install.log"))
-            marker.write_text(current)
-        gate = Gate(root, art, args.tag, args.base, args.candidate, args.mode == "fast")
-        gate.final = args.mode == "final"
-        qualification_files = []
-        if gate.final:
-            gate.qualification_base = output(["git", "rev-parse", args.qualification_base], root)
-            if gate.spec.get("qualification_base_sha") != gate.qualification_base:
-                raise ValueError("Qualification base must match frozen acceptance metadata")
-            subprocess.run(
-                ["git", "merge-base", "--is-ancestor", gate.qualification_base, args.candidate],
-                cwd=root,
-                check=True,
-            )
-            qualification_files = changed(root, gate.qualification_base, args.candidate)
-            gate.py = [
-                f
-                for f in production(qualification_files, "python")
-                if f.startswith("scripts/swarm/") == (gate.suite == "swarm")
-            ]
-            gate.ts = production(qualification_files, "web") if gate.suite == "poc" else []
-        gate.runtime_env = env
-        rows = gate.execute()
-        try:
-            hashes = artifact_hashes(
-                art, args.tag, gate.spec, args.mode == "fast", args.mode == "final"
-            )
-        except (ValueError, OSError) as error:
-            hashes = {}
-            rows.append(
-                {
-                    "id": "packet",
-                    "disposition": "failed",
-                    "command": ["artifact_hashes"],
-                    "exit_code": 1,
-                    "measured": 1,
-                    "threshold": 0,
-                    "error": str(error),
-                }
-            )
-        packet = {
-            "test_policy": POC_TEST_POLICY,
-            "stage": args.mode,
-            "test_suite": gate.suite,
-            "qualification_base_sha": gate.qualification_base if gate.final else None,
-            "qualification_diff_files": qualification_files,
-            "candidate_sha": args.candidate,
-            "base_sha": args.base,
-            "worktree": str(root),
-            "tree": output(["git", "rev-parse", "HEAD^{tree}"], root),
-            "fingerprint": fingerprint(root),
-            "diff_files": gate.files,
-            "gates": rows,
-            "artifact_hashes": hashes,
-        }
-        gate.file("gate.json").write_text(json.dumps(packet, indent=2) + "\n")
-        failures = [r for r in rows if r["exit_code"] != 0]
-        for line in json.dumps(failures, indent=2).splitlines()[:100]:
-            if failures:
-                print(line)
-        return int(bool(failures))
+        return run_baseline(art, args.tag) if args.mode == "baseline" else run_candidate(art, args)
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         parser.exit(1, "FAIL: " + str(error) + "\n")
 

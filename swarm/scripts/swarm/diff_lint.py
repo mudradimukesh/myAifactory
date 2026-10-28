@@ -44,21 +44,23 @@ def python_violations(text: str, lines: set[int]) -> list[tuple[int, str]]:
     return errors
 
 
-def ts_comments(root: Path, text: str) -> list[int]:
+def ts_comments(root: Path, name: str, text: str) -> list[int]:
     program = (
         "const ts=require('typescript');let s='';process.stdin.on('data"
-        "',b=>s+=b);process.stdin.on('end',()=>{const scanner=ts.create"
-        "Scanner(ts.ScriptTarget.Latest,false,ts.LanguageVariant.JSX,s)"
-        ";let token;const lines=[];while((token=scanner.scan())!==ts.Sy"
-        "ntaxKind.EndOfFileToken){if(token===ts.SyntaxKind.SingleLineCo"
-        "mmentTrivia||token===ts.SyntaxKind.MultiLineCommentTrivia){con"
-        "st start=s.slice(0,scanner.getTokenPos()).split('\\n').length;c"
-        "onst count=scanner.getTokenText().split('\\n').length;for(let i"
-        "=0;i<count;i++)lines.push(start+i)}}console.log(JSON.stringify"
-        "(lines))});"
+        "',b=>s+=b);process.stdin.on('end',()=>{const file=ts.createSour"
+        "ceFile(process.argv[1],s,ts.ScriptTarget.Latest,true);const li"
+        "nes=[];const seen=new Set();const visit=node=>{const kids=node"
+        ".getChildren(file);if(kids.length){kids.forEach(visit);return}"
+        "if(node.kind===ts.SyntaxKind.JsxText)return;const found=(ts.ge"
+        "tLeadingCommentRanges(s,node.pos)||[]).concat(ts.getTrailingCo"
+        "mmentRanges(s,node.pos)||[]);for(const c of found){if(seen.has"
+        "(c.pos))continue;seen.add(c.pos);const start=s.slice(0,c.pos)."
+        "split('\\n').length;const count=s.slice(c.pos,c.end).split('"
+        "\\n').length;for(let i=0;i<count;i++)lines.push(start+i)}};vi"
+        "sit(file);console.log(JSON.stringify(lines))});"
     )
     result = subprocess.run(
-        ["node", "-e", program],
+        ["node", "-e", program, name],
         cwd=root / "web",
         input=text,
         text=True,
@@ -69,8 +71,7 @@ def ts_comments(root: Path, text: str) -> list[int]:
     return lines
 
 
-def check(root: Path, base: str, candidate: str, max_lines: int) -> list[dict[str, str | int]]:
-    errors: list[dict[str, str | int]] = []
+def fixture_literals(root: Path) -> set[str]:
     literals: set[str] = set()
     manifest = root / "corpus/manifest-p1-dev.csv"
     if manifest.exists():
@@ -79,6 +80,35 @@ def check(root: Path, base: str, candidate: str, max_lines: int) -> list[dict[st
                 if value and ("family" in key or "sha256" in key):
                     literals.add(value)
     literals.update(p.stem for p in (root / "tests/fixtures").rglob("*") if p.is_file())
+    return literals
+
+
+def file_findings(
+    root: Path, file: str, text: str, lines: set[int], literals: set[str]
+) -> list[tuple[int, str]]:
+    findings: list[tuple[int, str]] = []
+    if file.endswith(".py"):
+        findings = python_violations(text, lines)
+    elif file.endswith((".ts", ".tsx")):
+        findings = [
+            (i, "banned construct")
+            for i, line in enumerate(text.splitlines(), 1)
+            if i in lines and BANNED.search(line)
+        ]
+        findings += [(i, "added comment") for i in ts_comments(root, file, text) if i in lines]
+    if file.startswith(("src/", "web/src/")):
+        for i, line in enumerate(text.splitlines(), 1):
+            if i in lines and any(
+                re.search(r"(?<![\w-])" + re.escape(value) + r"(?![\w-])", line)
+                for value in literals
+            ):
+                findings.append((i, "fixture literal"))
+    return findings
+
+
+def check(root: Path, base: str, candidate: str, max_lines: int) -> list[dict[str, str | int]]:
+    errors: list[dict[str, str | int]] = []
+    literals = fixture_literals(root)
     for file in changed(root, base, candidate):
         path = root / file
         if not path.is_file():
@@ -92,24 +122,7 @@ def check(root: Path, base: str, candidate: str, max_lines: int) -> list[dict[st
                 {"file": file, "line": max_lines + 1, "reason": "file exceeds line limit"}
             )
         patch = output(["git", "diff", "--unified=0", base, candidate, "--", file], root)
-        lines = added_lines(patch)
-        findings = []
-        if file.endswith(".py"):
-            findings = python_violations(text, lines)
-        elif file.endswith((".ts", ".tsx")):
-            findings = [
-                (i, "banned construct")
-                for i, line in enumerate(text.splitlines(), 1)
-                if i in lines and BANNED.search(line)
-            ]
-            findings += [(i, "added comment") for i in ts_comments(root, text) if i in lines]
-        if file.startswith(("src/", "web/src/")):
-            for i, line in enumerate(text.splitlines(), 1):
-                if i in lines and any(
-                    re.search(r"(?<![\w-])" + re.escape(value) + r"(?![\w-])", line)
-                    for value in literals
-                ):
-                    findings.append((i, "fixture literal"))
+        findings = file_findings(root, file, text, added_lines(patch), literals)
         errors += [{"file": file, "line": i, "reason": reason} for i, reason in findings]
     return errors
 

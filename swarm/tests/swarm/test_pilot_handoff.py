@@ -120,7 +120,9 @@ def test_handoff_never_commits_when_retirement_fails(lead, tmp_path, monkeypatch
     assert "handoff-commit" not in calls
 
 
-@pytest.mark.parametrize("kind", ["valid", "wrong_hash", "missing_job", "no_ack"])
+@pytest.mark.parametrize(
+    "kind", ["valid", "wrong_hash", "missing_job", "no_ack", "unknown_ack", "transcript_error"]
+)
 def test_controller_with_stub_claude_processes(lead, tmp_path, monkeypatch, kind):
     import subprocess
 
@@ -160,6 +162,10 @@ def test_controller_with_stub_claude_processes(lead, tmp_path, monkeypatch, kind
                 }
             )
         )
+    transcript = tmp_path / "predecessor.jsonl"
+    transcript.write_text(
+        json.dumps({"message": {"id": "usage", "usage": {"input_tokens": 1}}}) + "\n"
+    )
     path = tmp_path / "run.json"
     path.write_text(
         json.dumps(
@@ -170,7 +176,24 @@ def test_controller_with_stub_claude_processes(lead, tmp_path, monkeypatch, kind
                 "active_lead": predecessor,
                 "dispatch_frozen": True,
                 "handoff": transfer,
-                "inventory": {"sessions": []},
+                "inventory": {
+                    "sessions": [
+                        {
+                            "session_id": predecessor["model_session_id"],
+                            "role": "lead",
+                            "transcript_path": str(transcript),
+                        },
+                        {
+                            "session_id": "reviewer",
+                            "role": "reviewer",
+                            "parent_session_id": predecessor["model_session_id"],
+                            "complete": True,
+                        },
+                    ]
+                },
+                "runs": {
+                    "review": {"session_id": "reviewer", "complete": True, "usage_status": "known"}
+                },
                 "reservations": {},
                 "consumed": {"overall": 0, "preparation": 0},
                 "ceilings": {"overall": 1000, "preparation": 1000},
@@ -178,6 +201,22 @@ def test_controller_with_stub_claude_processes(lead, tmp_path, monkeypatch, kind
         )
     )
     monkeypatch.setattr(lead, "launch", lambda *args: spawn())
+    original_ack = lead.validate_ack
+
+    def acknowledge(*args):
+        original_ack(*args)
+        if kind == "unknown_ack":
+            state = json.loads(path.read_text())
+            state["runs"]["review"]["usage_status"] = "unknown"
+            path.write_text(json.dumps(state))
+
+    monkeypatch.setattr(lead, "validate_ack", acknowledge)
+    if kind == "transcript_error":
+
+        def duplicate(successor, env):
+            raise ValueError("Multiple transcripts for session")
+
+        monkeypatch.setattr(lead, "successor_transcript", duplicate)
     original_stop = lead.stop
 
     def reap_stop(pid, owned, **kwargs):
@@ -191,7 +230,9 @@ def test_controller_with_stub_claude_processes(lead, tmp_path, monkeypatch, kind
             assert json.loads(path.read_text())["active_lead"]["pid"] == children[1].pid
             assert children[0].poll() is not None
         else:
-            with pytest.raises(ValueError):
+            with pytest.raises(
+                ValueError, match="reviewer final accounting" if kind == "unknown_ack" else None
+            ):
                 lead.controller(path, {"PILOT_ACK_TIMEOUT": "0.1"}, "t")
             state = json.loads(path.read_text())
             assert state["active_lead"]["pid"] == children[0].pid
@@ -252,14 +293,27 @@ def test_terminal_cleanup_retires_only_verified_owner(lead, tmp_path):
         [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
     )
     identity = {**lead.processes()[child.pid], "model_session_id": "fixture"}
+    transcript = tmp_path / "fixture.jsonl"
+    transcript.write_text(
+        json.dumps({"message": {"id": "usage", "usage": {"input_tokens": 1}}}) + "\n"
+    )
     path = tmp_path / "run.json"
     path.write_text(
         json.dumps(
             {
                 "lifecycle": "complete",
                 "active_lead": identity,
-                "inventory": {"sessions": [{"session_id": "fixture", "role": "lead"}]},
+                "inventory": {
+                    "sessions": [
+                        {
+                            "session_id": "fixture",
+                            "role": "lead",
+                            "transcript_path": str(transcript),
+                        }
+                    ]
+                },
                 "reservations": {},
+                "consumed": {},
                 "handoff": None,
                 "dispatch_frozen": False,
             }
@@ -284,14 +338,27 @@ def test_terminal_cleanup_retires_exited_lead(lead, tmp_path):
     identity = {**lead.processes()[child.pid], "model_session_id": "fixture"}
     child.terminate()
     child.wait(timeout=3)
+    transcript = tmp_path / "fixture.jsonl"
+    transcript.write_text(
+        json.dumps({"message": {"id": "usage", "usage": {"input_tokens": 1}}}) + "\n"
+    )
     path = tmp_path / "run.json"
     path.write_text(
         json.dumps(
             {
                 "lifecycle": "complete",
                 "active_lead": identity,
-                "inventory": {"sessions": [{"session_id": "fixture", "role": "lead"}]},
+                "inventory": {
+                    "sessions": [
+                        {
+                            "session_id": "fixture",
+                            "role": "lead",
+                            "transcript_path": str(transcript),
+                        }
+                    ]
+                },
                 "reservations": {},
+                "consumed": {},
                 "handoff": None,
                 "dispatch_frozen": False,
             }
@@ -469,9 +536,11 @@ def test_handoff_retirement_preserves_builder_and_gate_descendants(lead, tmp_pat
         owned = {}
         lead.capture(child.pid, owned)
         assert all(pid in owned for pid in jobs)
+        (tmp_path / "run.json").write_text("{}")
+        predecessor = {**owned[child.pid], "model_session_id": "fixture"}
         lead.retire(
             tmp_path / "run.json",
-            {"token": "jobs", "predecessor": owned[child.pid], "owned_processes": owned},
+            {"token": "jobs", "predecessor": predecessor, "owned_processes": owned},
         )
         child.wait(timeout=2)
         table = lead.processes()
@@ -548,6 +617,8 @@ def test_successor_prompt_reads_only_pid_and_current_delta(lead, tmp_path, monke
     assert "background controller verifies ACK" in prompt
     assert "Do not idle, poll or end your turn" in prompt
     assert pinned.read_text() not in prompt
+    assert "interior-lead.sh --handoff-begin with no other arguments" in prompt
+    assert "interior-lead.sh --handoff-start <token>" in prompt
     lead.write(handoff / "t-successor.json", {"token": "t", "successor": {"pid": 123}})
     assert (handoff / "t-successor.json").read_text().splitlines()[3].strip() == '"pid": 123'
 
@@ -696,6 +767,12 @@ def test_initial_launch_through_fake_wezterm_and_claude(lead, tmp_path, monkeypa
         saved = json.loads(path.read_text())
         assert saved["active_lead"]["pid"] == identity["pid"]
         assert not saved["dispatch_frozen"]
+        transcript = tmp_path / "lead.jsonl"
+        transcript.write_text(
+            json.dumps({"message": {"id": "usage", "usage": {"input_tokens": 1}}}) + "\n"
+        )
+        saved["inventory"]["sessions"][-1]["transcript_path"] = str(transcript)
+        path.write_text(json.dumps(saved))
     finally:
         lead.stop_active(path)
 
@@ -789,3 +866,196 @@ def test_handoff_registers_jobs_before_detached_controller_launch(
         else ["drain", "register", "spawn", "register"]
     )
     assert log.read_text() == "controller output\n"
+
+
+@pytest.mark.parametrize("busy", [None, "builder", "reviewer", "gate"])
+def test_begin_drains_only_when_work_is_running(lead, tmp_path, monkeypatch, busy):
+    path = tmp_path / "run.json"
+    state_file = tmp_path / "prompts/phase-1/state.md"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text("state\n")
+    scope = str(tmp_path / "scope")
+    state = {"reservations": {}, "inventory": {"sessions": []}, "lead_scopes": {"s": [scope]}}
+    if busy == "builder":
+        state["reservations"] = {"r": {"active_run": "run-1", "parent_session_id": "s"}}
+    if busy == "reviewer":
+        state["inventory"]["sessions"] = [{"role": "reviewer", "complete": False}]
+    path.write_text(json.dumps(state))
+    mutations = []
+    drained = []
+    monkeypatch.setenv("REPO", str(tmp_path))
+    monkeypatch.setattr(lead, "originating_lead", lambda _: {"pid": 123, "model_session_id": "s"})
+    gate = {"pid": 77, "command": "python unit_gate.py pre"}
+
+    def fake_capture(pid, owned):
+        if busy == "gate":
+            owned[77] = gate
+        return {}
+
+    monkeypatch.setattr(lead, "capture", fake_capture)
+    monkeypatch.setattr(lead, "drain_jobs", lambda *args: drained.append(args))
+    monkeypatch.setattr(lead, "transact", lambda *args: mutations.append(args))
+    lead.begin(path, concurrent=True)
+    transfer = mutations[-1][-1]
+    if busy:
+        assert transfer["mode"] == "concurrent"
+        assert transfer["drain_gates"] == ([gate] if busy == "gate" else [])
+        assert transfer["drain_scopes"] == [scope]
+        assert drained == []
+    else:
+        assert "mode" not in transfer
+        assert len(drained) == 1
+
+
+def test_begin_with_running_job_still_requires_scopes(lead, tmp_path, monkeypatch):
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"reservations": {"r": {"active_run": "run-1"}}}))
+    monkeypatch.setattr(lead, "originating_lead", lambda _: {"pid": 123, "model_session_id": "s"})
+    monkeypatch.setattr(lead, "capture", lambda pid, owned: {})
+    monkeypatch.setattr(lead, "transact", lambda *args: pytest.fail("froze without scopes"))
+    with pytest.raises(ValueError, match="requires registered lead scopes"):
+        lead.begin(path, concurrent=True)
+
+
+def test_sequential_retirement_records_predecessor_usage(lead, tmp_path, monkeypatch):
+    transcript = tmp_path / "old.jsonl"
+    usage = {"input_tokens": 3, "cache_creation_input_tokens": 2, "output_tokens": 5}
+    row = {"message": {"id": "m", "usage": {**usage, "cache_read_input_tokens": 9}}}
+    transcript.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n")
+    path = tmp_path / "run.json"
+    session = {"session_id": "old", "role": "lead", "transcript_path": str(transcript)}
+    path.write_text(json.dumps({"inventory": {"sessions": [session]}}))
+    (tmp_path / "handoff").mkdir()
+    predecessor = {"pid": 999999, "pgid": 999999, "started_at": "x", "model_session_id": "old"}
+    mutations = []
+    monkeypatch.setattr(lead, "transact", lambda *args: mutations.append(args))
+    lead.retire(path, {"token": "t", "predecessor": predecessor})
+    assert mutations == [
+        (
+            path,
+            "orchestrator",
+            "record-run",
+            {
+                "run_id": "lead-old",
+                "session_id": "old",
+                "role": "lead",
+                "complete": True,
+                "new_tokens": 10,
+                "cache_reads": 9,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "gate"),
+    [
+        ("python unit_gate.py pre", True),
+        ("/usr/bin/python3 -u /repo/scripts/swarm/unit_gate.py pre", True),
+        ("/bin/zsh scripts/swarm/unit_gate.sh", True),
+        ("/repo/scripts/swarm/red_check.py --unit u", True),
+        ("node /opt/codex exec Run scripts/swarm/unit_gate.py pre and report", False),
+        ("python3 builder.py --note red_check.py", False),
+        ("/bin/zsh -c python3 unit_gate.py", False),
+    ],
+)
+def test_gate_matches_only_the_executable_argument(lead, tmp_path, monkeypatch, command, gate):
+    path = tmp_path / "run.json"
+    state_file = tmp_path / "prompts/phase-1/state.md"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text("state\n")
+    state = {"reservations": {}, "inventory": {"sessions": []}, "lead_scopes": {"s": ["x"]}}
+    path.write_text(json.dumps(state))
+    monkeypatch.setenv("REPO", str(tmp_path))
+    monkeypatch.setattr(lead, "originating_lead", lambda _: {"pid": 123, "model_session_id": "s"})
+    row = {"pid": 77, "command": command}
+    monkeypatch.setattr(lead, "capture", lambda pid, owned: owned.update({77: row}) or {})
+    monkeypatch.setattr(lead, "drain_jobs", lambda *args: None)
+    mutations = []
+    monkeypatch.setattr(lead, "transact", lambda *args: mutations.append(args))
+    lead.begin(path, concurrent=True)
+    assert len(mutations[-1][-1].get("drain_gates", [])) == int(gate)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "found",
+        "none",
+        "duplicate",
+        "foreign content",
+        "mixed content",
+        "symlink",
+        "directory",
+        "no identity",
+        "project symlink",
+    ],
+)
+def test_successor_transcript_requires_its_own_session_file(lead, tmp_path, case):
+    successor = {"pid": 1, "model_session_id": "new"}
+    env = {"CLAUDE_CONFIG_DIR": str(tmp_path)}
+    own = json.dumps({"type": "user", "sessionId": "new"}) + "\n"
+    foreign = json.dumps({"type": "user", "sessionId": "other"}) + "\n"
+    file = tmp_path / "projects" / "repo" / "new.jsonl"
+    file.parent.mkdir(parents=True)
+    if case == "directory":
+        file.mkdir()
+    elif case == "project symlink":
+        file.parent.rmdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / file.name).write_text(own)
+        file.parent.symlink_to(outside, target_is_directory=True)
+    elif case != "none":
+        content = {
+            "foreign content": foreign,
+            "mixed content": own + foreign,
+            "no identity": "{}\n",
+        }.get(case, own)
+        if case == "symlink":
+            target = tmp_path / "outside.jsonl"
+            target.write_text(own)
+            file.symlink_to(target)
+        else:
+            file.write_text(content)
+    if case == "duplicate":
+        second = tmp_path / "projects" / "other-repo" / "new.jsonl"
+        second.parent.mkdir()
+        second.write_text(own)
+        with pytest.raises(ValueError, match="Multiple transcripts"):
+            lead.successor_transcript(successor, env)
+        return
+    expected = {"transcript_path": str(file.resolve())} if case == "found" else {}
+    assert lead.successor_transcript(successor, env) == expected
+
+
+def test_drain_ready_cli_reports_incomplete_snapshot_then_succeeds(lead, tmp_path):
+    import os
+    import subprocess
+
+    path = tmp_path / "run.json"
+    owner = {**lead.processes()[os.getpid()], "model_session_id": "old"}
+    state = {
+        "updated_at": "fixture-snapshot",
+        "active_lead": {"model_session_id": "new", "pane": "123"},
+        "draining_leads": {"old": {"lead": owner, "jobs": [], "gates": [], "scopes": []}},
+        "inventory": {"sessions": [{"session_id": "new", "role": "lead"}], "threads": []},
+    }
+    path.write_text(json.dumps(state))
+    (tmp_path / "handoff").mkdir()
+    (tmp_path / "handoff/lead-old-drain.md").write_text("All owned work finished\n")
+    env = {**os.environ, "PILOT_RUN": str(path), "DRAIN_READY_WAIT": "0"}
+    command = [sys.executable, str(ROOT / "scripts/swarm/pilot_lead.py"), "--drain-ready", "old"]
+    refused = subprocess.run(command, env=env, capture_output=True, text=True, timeout=20)
+    assert refused.returncode == 2, refused.stderr
+    assert '"invalid_fields": ["transcript"]' in refused.stderr
+    assert '"updated_at": "fixture-snapshot"' in refused.stderr
+    assert json.loads(path.read_text()) == state
+    state["inventory"]["sessions"][0]["transcript_path"] = str(tmp_path / "new.jsonl")
+    path.write_text(json.dumps(state))
+    completed = subprocess.run(command, env=env, capture_output=True, text=True, timeout=20)
+    assert completed.returncode == 0, completed.stderr
+    assert (
+        json.loads(completed.stdout)
+        == json.loads(path.read_text())["draining_leads"]["old"]["completion"]
+    )

@@ -998,6 +998,97 @@ def test_reviewer_admission_and_usage_preserve_inventory_metadata(
     assert saved["runs"]["r"]["usage_status"] == "known"
 
 
+@pytest.mark.parametrize(
+    "transcript", ["valid", "wrong name", "missing", "relative", "symlink", None]
+)
+def test_handoff_commit_records_only_the_successors_own_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript: str | None
+) -> None:
+    path = tmp_path / "run.json"
+    state = bootstrap(path)
+    predecessor: RunRecord = {
+        "pid": 42,
+        "pgid": 42,
+        "os_session": 7,
+        "started_at": "old",
+        "command": "claude",
+        "model_session_id": "old-session",
+    }
+    successor: RunRecord = {
+        **predecessor,
+        "pid": 43,
+        "started_at": "new",
+        "model_session_id": "new",
+    }
+    real = tmp_path / "projects" / "repo" / "new.jsonl"
+    real.parent.mkdir(parents=True)
+    real.write_text("{}\n")
+    other = real.with_name("other.jsonl")
+    other.write_text("{}\n")
+    link = tmp_path / "link" / "new.jsonl"
+    link.parent.mkdir()
+    link.symlink_to(other)
+    monkeypatch.chdir(real.parent)
+    given = {
+        "valid": str(real),
+        "wrong name": str(other),
+        "missing": str(real.with_name("absent.jsonl")),
+        "relative": "new.jsonl",
+        "symlink": str(link),
+    }
+    data: RunRecord = {"token": "transfer", "successor": successor}
+    if transcript:
+        data["transcript_path"] = given[transcript]
+    state["active_lead"] = predecessor
+    state["handoff"] = {
+        "token": "transfer",
+        "predecessor": predecessor,
+        "mode": "concurrent",
+        "drain_scopes": [str(tmp_path / "held")],
+    }
+    state["dispatch_frozen"] = True
+    monkeypatch.setattr(run_state, "processes", lambda: {42: predecessor, 43: successor})
+    run_state.apply(state, "spawner", "handoff-commit", data, path)
+    row = state["inventory"]["sessions"][-1]
+    assert row["session_id"] == "new"
+    assert "transcript_path" not in state["active_lead"]
+    if transcript == "valid":
+        assert row["transcript_path"] == str(real)
+    else:
+        assert "transcript_path" not in row
+
+
+@pytest.mark.parametrize("update", ["alias", "different"])
+def test_record_run_keeps_the_recorded_lead_transcript(tmp_path: Path, update: str) -> None:
+    path = tmp_path / "run.json"
+    state = bootstrap(path)
+    real = tmp_path / "projects" / "new.jsonl"
+    real.parent.mkdir()
+    real.write_text("{}\n")
+    other = tmp_path / "projects" / "elsewhere.jsonl"
+    other.write_text("{}\n")
+    alias = tmp_path / "alias"
+    alias.symlink_to(real.parent)
+    state.setdefault("inventory", {"threads": [], "sessions": []})["sessions"].append(
+        {"session_id": "new", "role": "lead", "transcript_path": str(real), "complete": False}
+    )
+    data: RunRecord = {
+        "run_id": "lead-new",
+        "session_id": "new",
+        "role": "lead",
+        "complete": False,
+        "new_tokens": 1,
+        "cache_reads": 0,
+        "transcript_path": str(alias / "new.jsonl" if update == "alias" else other),
+    }
+    if update == "alias":
+        run_state.apply(state, "orchestrator", "record-run", data, path)
+    else:
+        with pytest.raises(ValueError, match="conflicts"):
+            run_state.apply(state, "orchestrator", "record-run", data, path)
+    assert state["inventory"]["sessions"][-1]["transcript_path"] == str(real)
+
+
 def test_concurrent_handoff_preserves_drain_owner_and_jobs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1157,3 +1248,123 @@ def test_lifecycle_and_blocker_updates_persist_reasons(tmp_path: Path) -> None:
     assert state["blockers"][0]["status"] == "closed"
     assert state["blockers"][0]["resolution"] == "resolved"
     assert datetime.fromisoformat(state["blockers"][0]["closed_at"]).tzinfo == UTC
+
+
+@pytest.mark.parametrize("predecessor_alive", [False, True])
+def test_sequential_handoff_passes_lead_scopes_to_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, predecessor_alive: bool
+) -> None:
+    path = tmp_path / "run.json"
+    state = bootstrap(path)
+    predecessor: RunRecord = {
+        "pid": 42,
+        "pgid": 42,
+        "os_session": 7,
+        "started_at": "old",
+        "command": "claude",
+        "model_session_id": "old-session",
+    }
+    successor: RunRecord = {
+        **predecessor,
+        "pid": 43,
+        "started_at": "new",
+        "model_session_id": "new",
+    }
+    scopes = [str(tmp_path / "a"), str(tmp_path / "b")]
+    state["active_lead"] = predecessor
+    state["lead_scopes"] = {"old-session": scopes, "other": [str(tmp_path / "c")]}
+    state["handoff"] = {"token": "transfer", "predecessor": predecessor}
+    state["dispatch_frozen"] = True
+    table = {42: predecessor, 43: successor} if predecessor_alive else {43: successor}
+    monkeypatch.setattr(run_state, "processes", lambda: table)
+    data: RunRecord = {"token": "transfer", "successor": successor}
+    if predecessor_alive:
+        with pytest.raises(ValueError, match="Predecessor still alive"):
+            run_state.apply(state, "spawner", "handoff-commit", data, path)
+        assert state["lead_scopes"]["old-session"] == scopes
+        return
+    run_state.apply(state, "spawner", "handoff-commit", data, path)
+    assert state["lead_scopes"] == {"new": scopes, "other": [str(tmp_path / "c")]}
+    assert "draining_leads" not in state
+
+
+def test_drain_retire_passes_lead_scopes_to_active_lead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "run.json"
+    state = bootstrap(path)
+    lead: RunRecord = {"pid": 42, "pgid": 42, "started_at": "old", "model_session_id": "old"}
+    held = str(tmp_path / "held")
+    state["active_lead"] = {"pid": 43, "model_session_id": "new"}
+    state["lead_scopes"] = {"old": [held], "new": [str(tmp_path / "own")]}
+    state["draining_leads"] = {
+        "old": {"lead": lead, "scopes": [held], "completion": {"reason": "finished"}}
+    }
+    state["runs"] = {"lead-old": {"complete": True, "usage_status": "known"}}
+    monkeypatch.setattr(run_state, "processes", lambda: {})
+    run_state.apply(
+        state, "spawner", "drain-retire", {"session_id": "old", "receipt": "done"}, path
+    )
+    assert state["lead_scopes"] == {"new": sorted([held, str(tmp_path / "own")])}
+
+
+def test_drain_retire_keeps_scopes_without_active_lead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "run.json"
+    state = bootstrap(path)
+    lead: RunRecord = {"pid": 42, "pgid": 42, "started_at": "old", "model_session_id": "old"}
+    held = str(tmp_path / "held")
+    state["lead_scopes"] = {"old": [held]}
+    state["draining_leads"] = {
+        "old": {"lead": lead, "scopes": [held], "completion": {"reason": "finished"}}
+    }
+    state["runs"] = {"lead-old": {"complete": True, "usage_status": "known"}}
+    monkeypatch.setattr(run_state, "processes", lambda: {})
+    run_state.apply(
+        state, "spawner", "drain-retire", {"session_id": "old", "receipt": "done"}, path
+    )
+    assert state["lead_scopes"] == {"old": [held]}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--run", "OTHER"],
+        ["--as", "launcher"],
+        ["--data", "{}"],
+        ["--run=OTHER"],
+        ["--ru", "OTHER"],
+        ["--a", "launcher"],
+        ["--d", "{}"],
+    ],
+)
+def test_repeated_option_is_refused_before_any_transaction(
+    tmp_path: Path, extra: list[str]
+) -> None:
+    pinned = tmp_path / "pinned.json"
+    other = tmp_path / "other.json"
+    for path in (pinned, other):
+        path.write_text(json.dumps({"blockers": []}))
+    before = {path: path.read_text() for path in (pinned, other)}
+    data = json.dumps({"id": "b", "actions": ["merge"], "reason": "test"})
+    args = [word.replace("OTHER", str(other)) for word in extra]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--run",
+            str(pinned),
+            "--as",
+            "orchestrator",
+            "add-blocker",
+            "--data",
+            data,
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "may be given only once" in result.stderr or "unrecognized arguments" in result.stderr
+    assert {path: path.read_text() for path in (pinned, other)} == before

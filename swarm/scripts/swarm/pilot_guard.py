@@ -478,7 +478,11 @@ def check(event, state, path, used, cap):
                 return True
         kill = ["wezterm", "cli", "kill-pane", "--pane-id"]
         own_pane = [[str(draining["lead"].get("pane"))], ["$WEZTERM_PANE"]]
-        if completion and words[:4] == kill and words[4:] in own_pane:
+        if words[:4] == kill and words[4:] in own_pane:
+            # Recheck retirement's finished-work requirements even after completion was recorded.
+            from pilot_lead import drain_finished
+
+            drain_finished(path, state, session, draining)
             return True
         raise ValueError("A draining lead may only report and finalize its owned jobs")
     reviewer = next(
@@ -729,6 +733,8 @@ def check(event, state, path, used, cap):
     if words == [launcher, "--handoff-begin"]:
         return True
     if transfer.get("token") and words == [launcher, "--handoff-start", transfer["token"]]:
+        return True
+    if state.get("dispatch_frozen") and words == [launcher, "--drain-ready", session]:
         return True
     snapshot = path.parent / "handoff" / (str(transfer.get("token")) + ".md")
     if (

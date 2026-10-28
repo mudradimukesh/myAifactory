@@ -133,18 +133,7 @@ def test_development_deferrals_cannot_pass_as_final_or_hide_failures(checks):
 def test_complete_packet_passes_and_duplicates_fail(checks):
     candidate, gate, review = packet()
     checks.validate(
-        candidate,
-        gate,
-        ["A1"],
-        {"product_ids": []},
-        [review],
-        [],
-        {"survivors": []},
-        {"python": "fixture"},
-    )
-    gate["gates"].append(gate["gates"][0])
-    with pytest.raises(ValueError):
-        checks.validate(
+        checks.Packet(
             candidate,
             gate,
             ["A1"],
@@ -153,6 +142,21 @@ def test_complete_packet_passes_and_duplicates_fail(checks):
             [],
             {"survivors": []},
             {"python": "fixture"},
+        )
+    )
+    gate["gates"].append(gate["gates"][0])
+    with pytest.raises(ValueError):
+        checks.validate(
+            checks.Packet(
+                candidate,
+                gate,
+                ["A1"],
+                {"product_ids": []},
+                [review],
+                [],
+                {"survivors": []},
+                {"python": "fixture"},
+            )
         )
 
 
@@ -196,7 +200,9 @@ def test_review_defects_fail_closed(checks, defect):
         acceptance["product_ids"] = ["A1"]
     with pytest.raises(ValueError):
         checks.validate(
-            candidate, gate, ["A1"], acceptance, [review], findings, survivors, fingerprint
+            checks.Packet(
+                candidate, gate, ["A1"], acceptance, [review], findings, survivors, fingerprint
+            )
         )
 
 
@@ -206,14 +212,16 @@ def test_gate_cannot_authorize_its_own_mutation_waiver(checks):
     gate["gates"][12].update(disposition="waived", approval="U8")
     with pytest.raises(ValueError, match="Unapproved"):
         checks.validate(
-            candidate,
-            gate,
-            ["A1"],
-            {"product_ids": []},
-            [review],
-            [],
-            {"survivors": []},
-            {"python": "fixture"},
+            checks.Packet(
+                candidate,
+                gate,
+                ["A1"],
+                {"product_ids": []},
+                [review],
+                [],
+                {"survivors": []},
+                {"python": "fixture"},
+            )
         )
 
 

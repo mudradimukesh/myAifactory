@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 
 from run_state import DEFAULT_RUN
@@ -8,6 +9,8 @@ from run_state import DEFAULT_RUN
 DEFAULT_REPO = (
     "/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer"
 )
+CONTINUE_MAX = 3
+LEAD_KEYS = ("FP_LEAD", "LEAD_AGENT", "FP_LEAD_SPAWN", "PILOT_LEAD_OVERLAP", "FP_CAP_FRACTION")
 
 
 def assignment(state, target, env):
@@ -21,7 +24,42 @@ def assignment(state, target, env):
     for name, field in (("MODEL", "model"), ("EFFORT", "effort")):
         if name in env and env[name] != selected[field]:
             raise ValueError(name + " does not match authorized assignment")
+    provider = selected.get("provider", "codex")
+    if provider not in {"codex", "claude"}:
+        raise ValueError("Unknown provider " + str(provider))
+    if (provider == "claude") != selected["model"].startswith("claude-"):
+        raise ValueError("Model " + selected["model"] + " does not match provider " + provider)
+    if provider == "claude" and env.get("OUTPUT_SCHEMA"):
+        raise ValueError("OUTPUT_SCHEMA is supported only for codex")
     return selected
+
+
+def claude_command(
+    target: str, selected: dict[str, str], message: str, session: str, writable: list[Path]
+) -> list[str]:
+    result = [
+        "claude",
+        "-p",
+        "--model",
+        selected["model"],
+        "--effort",
+        selected["effort"],
+        "--disable-slash-commands",
+        "--settings",
+        str(Path(__file__).with_name("claude-builder-settings.json")),
+        "--permission-mode",
+        "acceptEdits",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ]
+    for directory in writable:
+        result += ["--add-dir", str(directory)]
+    if target.startswith("resume:"):
+        result += ["--resume", target.removeprefix("resume:")]
+    else:
+        result += ["--session-id", session]
+    return [*result, message]
 
 
 def command(target, selected, repo, reply, message, env):
@@ -96,6 +134,36 @@ def events(path: Path | None, offset: int = 0) -> list[dict[str, object]]:
     return result
 
 
+SUPERVISOR_STOPS = {"BUDGET", "CONTEXT", "SURVIVING_DESCENDANT"}
+
+
+def transcript_complete(path: Path) -> bool:
+    data = path.read_bytes()
+    if not data.endswith(b"\n"):
+        return False
+    lines = [line for line in data.splitlines() if line.strip()]
+    try:
+        return bool(lines) and isinstance(json.loads(lines[-1]), dict)
+    except (ValueError, UnicodeError):
+        return False
+
+
+def ended_in_error(event_path: Path, rollout: Path, offset: int, claude: bool) -> bool:
+    if claude:
+        result = claude_result(event_path)
+        return bool(result and result.get("is_error"))
+    for row in events(rollout, offset):
+        payload = row.get("payload")
+        if (
+            row.get("type") == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "task_complete"
+            and payload.get("error")
+        ):
+            return True
+    return False
+
+
 def drift(path, offset, selected):
     result = set()
     for row in events(path, offset):
@@ -132,6 +200,74 @@ def find_rollout(home, thread):
     if len(paths) > 1:
         raise ValueError("Multiple rollouts for thread")
     return paths[0] if paths else None
+
+
+def find_transcript(projects: Path, session: str) -> Path | None:
+    paths = list(projects.glob("*/" + session + ".jsonl"))
+    if len(paths) > 1:
+        raise ValueError("Multiple transcripts for session")
+    return paths[0] if paths else None
+
+
+def claude_messages(path: Path, offset: int) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for row in events(path, offset):
+        message = row.get("message")
+        if row.get("type") == "assistant" and isinstance(message, dict):
+            result.append(message)
+    return result
+
+
+def zero_usage(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        return all(zero_usage(item) for item in value.values())
+    return type(value) is int and value == 0
+
+
+def claude_drift(path: Path, offset: int, selected: dict[str, str]) -> list[str]:
+    for message in claude_messages(path, offset):
+        counters = message.get("usage")
+        synthetic = (
+            message.get("model") == "<synthetic>"
+            and isinstance(counters, dict)
+            and all(type(counters.get(key)) is int for key in ("input_tokens", "output_tokens"))
+            and zero_usage(counters)
+        )
+        if message.get("model") != selected["model"] and not synthetic:
+            return ["MODEL_DRIFT"]
+    return []
+
+
+def claude_context(path: Path, offset: int) -> int:
+    for message in reversed(claude_messages(path, offset)):
+        counters = message.get("usage")
+        if isinstance(counters, dict) and counters and message.get("model") != "<synthetic>":
+            return sum(
+                counters.get(key, 0)
+                for key in (
+                    "input_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                )
+            )
+    return 0
+
+
+def handoff_prompt(path: Path) -> str:
+    return (
+        "Stop now: your token allowance is almost spent. Do not start new work. Commit only "
+        "changes whose tests pass. Then write " + str(path) + " with the commits made, what "
+        "remains, the exact next steps and any open questions, and end your reply."
+    )
+
+
+def claude_result(path: Path) -> dict[str, object] | None:
+    for row in reversed(events(path)):
+        if row.get("type") == "result":
+            return row
+    return None
 
 
 def persist(path, value):
@@ -179,9 +315,18 @@ def supervise(directory, tag, target, message_file, env):
     allocation = env["ALLOCATION_ID"]
     run_id = tag
     home = Path(env.get("CODEX_HOME", str(Path.home() / ".codex")))
+    projects = Path(env.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))) / "projects"
+    claude = selected.get("provider") == "claude"
     thread = target.removeprefix("resume:") if target.startswith("resume:") else None
-    rollout = find_rollout(home, thread) if thread else None
-    starting = usage(rollout) if rollout else None
+    session = thread or str(uuid.uuid4())
+    if claude:
+        from pilot_guard import claude_usage
+
+        rollout = find_transcript(projects, thread) if thread else None
+        starting = claude_usage(rollout) if rollout else None
+    else:
+        rollout = find_rollout(home, thread) if thread else None
+        starting = usage(rollout) if rollout else None
     if thread and starting is None:
         raise ValueError("Resume starting usage is unknown")
     offset = rollout.stat().st_size if rollout else 0
@@ -191,6 +336,21 @@ def supervise(directory, tag, target, message_file, env):
         rule = builder_rule(builder_brief)
         if rule not in message:
             message += "\n\n" + rule
+    child_env = dict(env)
+    if claude:
+        common = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+        )
+        if common.returncode or not common.stdout.strip():
+            raise ValueError("Builder worktree has no git directory: " + str(repo))
+        writable = [Path(common.stdout.strip()), directory]
+        cmd = claude_command(target, selected, message, session, writable)
+        for key in LEAD_KEYS:
+            child_env.pop(key, None)
+    else:
+        cmd = command(target, selected, repo, reply, message, env)
     transact(
         run_path,
         "launcher",
@@ -202,7 +362,6 @@ def supervise(directory, tag, target, message_file, env):
             "allowance": int(env["ALLOWANCE"]),
         },
     )
-    cmd = command(target, selected, repo, reply, message, env)
     receipt = {
         "run_id": run_id,
         "allocation_id": allocation,
@@ -220,12 +379,15 @@ def supervise(directory, tag, target, message_file, env):
     owned = {}
     child = None
     status = "FAIL"
+    supervised = False
+    handoff = directory / (tag + "-handoff.md")
+    cutoff = env.get("ROLE", "builder") == "builder" and claude
     try:
         with event_path.open("x") as output:
             child = subprocess.Popen(
                 cmd,
                 cwd=repo,
-                env=dict(env),
+                env=child_env,
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=subprocess.STDOUT,
@@ -256,7 +418,13 @@ def supervise(directory, tag, target, message_file, env):
             child_exit = child.poll()
             if child_exit is not None:
                 table.pop(child.pid, None)
-            for row in events(event_path):
+            if not claude:
+                started = events(event_path)
+            elif find_transcript(projects, session):
+                started = [{"type": "thread.started", "thread_id": session}]
+            else:
+                started = []
+            for row in started:
                 if row.get("type") == "thread.started":
                     observed = row["thread_id"]
                     if not isinstance(observed, str):
@@ -277,11 +445,78 @@ def supervise(directory, tag, target, message_file, env):
                         )
                     receipt["thread_id"] = thread
             if thread and rollout is None:
-                rollout = find_rollout(home, thread)
-            problems = drift(rollout, offset, selected) if rollout else []
+                rollout = (
+                    find_transcript(projects, thread) if claude else find_rollout(home, thread)
+                )
+            problems = (
+                (claude_drift if claude else drift)(rollout, offset, selected) if rollout else []
+            )
             if problems:
                 stop_reason = problems[0]
-            current = usage(rollout) if rollout else None
+            if claude:
+                current = claude_usage(rollout) if rollout else None
+                if current and rollout:
+                    before = starting or {"new_tokens": 0, "cache_reads": 0}
+                    receipt["usage_delta"] = {
+                        key: current[key] - before[key] for key in ("new_tokens", "cache_reads")
+                    }
+                    receipt["final_cumulative_usage"] = current
+                    transact(
+                        run_path,
+                        "launcher",
+                        "record-run",
+                        {
+                            "allocation_id": allocation,
+                            "run_id": run_id,
+                            "thread_id": thread,
+                            **receipt["usage_delta"],
+                            "transcript_path": str(rollout),
+                            "complete": False,
+                        },
+                    )
+                    updated = json.loads(run_path.read_text())
+                    reservation = updated["reservations"][allocation]
+                    if reservation["observed"] >= reservation["allowance"]:
+                        stop_reason = "BUDGET"
+                    if claude_context(rollout, offset) > int(env.get("TRIGGER", "230000")):
+                        stop_reason = "CONTEXT"
+                    threshold = reservation["allowance"] - int(env.get("HANDOFF_RESERVE", "15000"))
+                    if not stop_reason and cutoff and reservation["observed"] >= threshold:
+                        cutoff = False
+                        _, remaining = stop(
+                            child.pid,
+                            owned,
+                            float(env.get("PILOT_STOP_INT", "30")),
+                            float(env.get("PILOT_STOP_TERM", "15")),
+                            child.poll,
+                        )
+                        if remaining:
+                            stop_reason = "SURVIVING_DESCENDANT"
+                        else:
+                            cmd = claude_command(
+                                "resume:" + session,
+                                selected,
+                                handoff_prompt(handoff),
+                                session,
+                                writable,
+                            )
+                            with event_path.open("a") as output:
+                                child = subprocess.Popen(
+                                    cmd,
+                                    cwd=repo,
+                                    env=child_env,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=output,
+                                    stderr=subprocess.STDOUT,
+                                    start_new_session=True,
+                                )
+                            capture(child.pid, owned)
+                            receipt.update(handoff_argv=cmd, handoff_started_at=utc())
+                            print("HANDOFF_CUTOFF", tag, flush=True)
+                            continue
+                current = None
+            else:
+                current = usage(rollout) if rollout else None
             if current:
                 before = starting or {
                     "input_tokens": 0,
@@ -355,7 +590,12 @@ def supervise(directory, tag, target, message_file, env):
                 if lingering:
                     stop_reason = "SURVIVING_DESCENDANT"
                     break
-                for row in reversed(events(rollout, offset)):
+                result = claude_result(event_path) if claude else None
+                if result and result.get("is_error"):
+                    stop_reason = str(result.get("subtype") or "error")
+                elif result and isinstance(result.get("result"), str):
+                    reply.write_text(result["result"])
+                for row in [] if claude else reversed(events(rollout, offset)):
                     payload = row.get("payload", {})
                     if not isinstance(payload, dict):
                         continue
@@ -378,9 +618,13 @@ def supervise(directory, tag, target, message_file, env):
                 )
                 if stop_reason == "server_overloaded":
                     status = "CAPACITY"
+                if status == "REPLY" and "handoff_started_at" in receipt:
+                    status = "HANDOFF"
+                    receipt["handoff_path"] = str(handoff) if handoff.exists() else None
                 break
             time.sleep(float(env.get("PILOT_TICK", "1")))
         receipt["stop_reason"] = stop_reason
+        supervised = True
     finally:
         if child:
             try:
@@ -398,11 +642,49 @@ def supervise(directory, tag, target, message_file, env):
             if remaining:
                 status = "FAIL"
                 receipt["ownership_blocked"] = True
+        final = None
         if (
-            "usage_delta" in receipt
-            and receipt.get("child_exit") == 0
-            and not receipt.get("stop_reason")
+            supervised
+            and rollout
+            and not receipt.get("remaining_processes")
+            and "supervision_error" not in receipt
+            and (
+                (receipt.get("child_exit") == 0 and not receipt.get("stop_reason"))
+                or receipt.get("stop_reason") in SUPERVISOR_STOPS
+            )
+            and transcript_complete(rollout)
+            and not (claude_drift if claude else drift)(rollout, offset, selected)
+            and not ended_in_error(event_path, rollout, offset, claude)
         ):
+            final = claude_usage(rollout) if claude else usage(rollout)
+            if final and claude:
+                before = starting or {"new_tokens": 0, "cache_reads": 0}
+                receipt["usage_delta"] = {
+                    key: final[key] - before[key] for key in ("new_tokens", "cache_reads")
+                }
+                receipt["final_cumulative_usage"] = final
+            elif final:
+                before = starting or {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0,
+                }
+                receipt["usage_delta"] = {
+                    "new_tokens": (
+                        final["input_tokens"]
+                        - final.get("cached_input_tokens", 0)
+                        + final["output_tokens"]
+                    )
+                    - (
+                        before["input_tokens"]
+                        - before.get("cached_input_tokens", 0)
+                        + before["output_tokens"]
+                    ),
+                    "cache_reads": final.get("cached_input_tokens", 0)
+                    - before.get("cached_input_tokens", 0),
+                }
+                receipt["final_cumulative_usage"] = final
+        if final:
             receipt["usage_status"] = "known"
             transact(
                 run_path,
@@ -440,7 +722,82 @@ def supervise(directory, tag, target, message_file, env):
         receipt.update(status=status, ended_at=utc())
         persist(receipt_path, receipt)
     print(status, tag, "exit=" + str(receipt.get("child_exit")), flush=True)
-    return 0 if status == "REPLY" else 1
+    return 0 if status in {"REPLY", "HANDOFF"} else 1
+
+
+def continue_builder(directory, tag, target, message_file, env, supervisor=supervise):
+    import hashlib
+    import subprocess
+
+    code = supervisor(directory, tag, target, message_file, env)
+    run_path = Path(env.get("PILOT_RUN", str(DEFAULT_RUN)))
+    if env.get("ROLE", "builder") != "builder" or directory.resolve() != run_path.parent.resolve():
+        return code
+    if target.startswith("resume:"):
+        target = json.loads(run_path.read_text())["assignments"][env["ASSIGNMENT_ID"]]["model"]
+    first = directory / (tag + "-launch.json")
+    message = message_file.read_text()
+    previous_tag, previous_progress = tag, None
+    for link in range(1, CONTINUE_MAX + 1):
+        receipt = json.loads((directory / (previous_tag + "-launch.json")).read_text())
+        handoff = Path(receipt.get("handoff_path") or "")
+        if (
+            receipt.get("status") != "HANDOFF"
+            or receipt.get("usage_status") != "known"
+            or receipt.get("remaining_processes")
+            or not receipt.get("handoff_path")
+            or not handoff.is_file()
+            or not handoff.read_text().strip()
+        ):
+            return code
+        head = subprocess.run(
+            ["git", "-C", env.get("REPO", str(DEFAULT_REPO)), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        progress = (head, hashlib.sha256(handoff.read_bytes()).hexdigest())
+        if progress == previous_progress:
+            print("CHAIN_STOP", previous_tag, "no progress since the previous link", flush=True)
+            return code
+        previous_progress = progress
+        next_tag = tag + "-c" + str(link)
+        allocation = env["ALLOCATION_ID"] + "-c" + str(link)
+        next_message = directory / (next_tag + "-message.md")
+        next_message.write_text(
+            message
+            + "\n\nContinue from the handoff at "
+            + str(handoff)
+            + ". Do not repeat verified steps.\n"
+        )
+        try:
+            code = supervisor(
+                directory,
+                next_tag,
+                target,
+                next_message,
+                {**env, "ASSIGNMENT_ID": allocation, "ALLOCATION_ID": allocation},
+            )
+        except (ValueError, KeyError, OSError) as error:
+            link_path = directory / (next_tag + "-launch.json")
+            if not link_path.exists():
+                print("CHAIN_STOP", next_tag, error, flush=True)
+                return code
+            record = json.loads(first.read_text())
+            persist(first, {**record, "chain": [*record.get("chain", []), str(link_path)]})
+            print("CHAIN_FAIL", next_tag, error, flush=True)
+            return 1
+        link_path = directory / (next_tag + "-launch.json")
+        persist(
+            link_path,
+            {
+                **json.loads(link_path.read_text()),
+                "continued_from": str(directory / (previous_tag + "-launch.json")),
+            },
+        )
+        record = json.loads(first.read_text())
+        persist(first, {**record, "chain": [*record.get("chain", []), str(link_path)]})
+        previous_tag = next_tag
+    return code
 
 
 def main():
@@ -458,7 +815,7 @@ def main():
                 "usage: codex-agent.sh [KEY=VALUE ...] <dir> <tag> <model|resume:THREAD> "
                 "<message-file>"
             )
-        return supervise(Path(args[0]), args[1], args[2], Path(args[3]), env)
+        return continue_builder(Path(args[0]), args[1], args[2], Path(args[3]), env)
     except (ValueError, KeyError, OSError) as error:
         print("FAIL", str(error), file=sys.stderr)
         return 1

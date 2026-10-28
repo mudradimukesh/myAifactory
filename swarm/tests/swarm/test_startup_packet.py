@@ -56,6 +56,33 @@ def test_packet_carries_ledger_and_evidence(art):
     assert "missing acceptance.md, ids.txt, test-map.json" in packet
 
 
+def test_non_object_candidate_suffix_is_not_a_candidate(art):
+    (art / "unit-difflint-candidate.json").write_text(json.dumps([{"code": "C901"}]))
+    (art / "unit-candidate.json").write_text(json.dumps({"attempt": 1, "status": "prepared"}))
+    (art / "questions.md").write_text("")
+    packet = render(art, "lead", "k1")
+    assert "- unit: candidate attempt 1" in packet
+    assert "unit-difflint" not in packet
+
+
+def test_malformed_candidate_keeps_valid_candidates_listed(art):
+    (art / "broken-candidate.json").write_text("{not json")
+    (art / "unit-candidate.json").write_text(json.dumps({"attempt": 1, "status": "prepared"}))
+    (art / "questions.md").write_text("")
+    packet = render(art, "lead", "k1")
+    assert "- broken: candidate attempt None None status unreadable" in packet
+    assert "- unit: candidate attempt 1" in packet
+
+
+def test_recent_acceptance_with_non_object_candidate_renders(art):
+    (art / "unit-difflint-candidate.json").write_text(json.dumps([{"code": "C901"}]))
+    (art / "unit-difflint-acceptance.md").write_text("acceptance")
+    (art / "unit-difflint-gate.json").write_text(json.dumps([]))
+    (art / "questions.md").write_text("")
+    packet = render(art, "lead", "k1")
+    assert "- unit-difflint: has acceptance.md, candidate.json, gate.json" in packet
+
+
 def test_old_unfinished_candidate_is_still_listed(art):
     import os
 

@@ -18,7 +18,7 @@ def evidence(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     listener.getsockname.return_value = ("127.0.0.1", 8765)
     listener.__enter__.return_value = listener
     monkeypatch.setattr(module.socket, "socket", Mock(return_value=listener))
-    monkeypatch.setattr(module.subprocess, "run", Mock())
+    monkeypatch.setattr(module.subprocess, "run", Mock(return_value=Mock(returncode=0, stderr="")))
     child = Mock(pid=12345)
     child.poll.return_value = None
     monkeypatch.setattr(

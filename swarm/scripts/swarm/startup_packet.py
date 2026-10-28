@@ -136,13 +136,18 @@ def processes():
 
 def evidence(art):
     # Unfinished candidates appear whatever their age; other features only when recent.
+    # Other JSON artifacts can share the suffix (a diff-lint findings list); only an
+    # object is a candidate record.
     now = time.time()
     features = []
     for path in sorted(art.glob("*-candidate.json")):
         try:
-            status = json.loads(path.read_text()).get("status")
+            record = json.loads(path.read_text())
         except ValueError:
-            status = "unreadable"
+            record = {"status": "unreadable"}
+        if not isinstance(record, dict):
+            continue
+        status = record.get("status")
         if status != "pushed" or now - path.stat().st_mtime < RECENT:
             features.append(path.name[: -len("-candidate.json")])
     features += sorted(
@@ -156,15 +161,22 @@ def evidence(art):
         missing = [name for name in EVIDENCE[:3] if name not in has]
         detail = ""
         candidate = art / f"{feature}-candidate.json"
-        if candidate.is_file():
-            c = json.loads(candidate.read_text())
+        try:
+            c = json.loads(candidate.read_text()) if candidate.is_file() else None
+        except ValueError:
+            c = {"status": "unreadable"}
+        if isinstance(c, dict):
             detail = (
                 f" candidate attempt {c.get('attempt')} {str(c.get('candidate_sha'))[:8]} "
                 f"status {c.get('status')}, worktree {c.get('worktree')};"
             )
         gate = art / f"{feature}-gate.json"
-        if gate.is_file():
-            g = json.loads(gate.read_text())
+        try:
+            g = json.loads(gate.read_text()) if gate.is_file() else None
+        except ValueError:
+            g = None
+            detail += " gate unreadable;"
+        if isinstance(g, dict):
             failed = [r.get("id") for r in g.get("gates", []) if r.get("exit_code")]
             detail += f" gate {str(g.get('candidate_sha'))[:8]} failed {failed or 'none'};"
         lines.append(

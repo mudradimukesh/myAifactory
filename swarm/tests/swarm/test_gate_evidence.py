@@ -43,12 +43,15 @@ def test_swarm_only_change_gets_python_gate_commands(
         }
     ]
     (tmp_path / "probe-test-map.json").write_text(json.dumps(mapping))
-    (tmp_path / "probe-s1-tests.json").write_text(json.dumps({"tests_commit": "tests"}))
+    (tmp_path / "probe-s1-tests.json").write_text(
+        json.dumps({"tests_commit": "tests", "predecessor": "pred"})
+    )
     (tmp_path / "probe-red.json").write_text(
         json.dumps(
             {
                 "passed": True,
                 "tests_commit": "tests",
+                "predecessor": "pred",
                 "test_map_sha256": module.digest(tmp_path / "probe-test-map.json"),
             }
         )

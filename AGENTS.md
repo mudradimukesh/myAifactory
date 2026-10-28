@@ -9,3 +9,5 @@ Keep reusable skills under `home/.agents/skills/`. Worker-loaded skills are sele
 Do not report local process fixtures as live Docker, subscription-worker, or application acceptance. Record remaining gaps in `docs/review-status.md`.
 
 Before starting or succeeding an orchestrator or lead, read `docs/orchestrator-lead-loop-lessons.md`.
+
+To act as the swarm monitor or to start or restart the pilot, follow `swarm/MONITOR.md`.

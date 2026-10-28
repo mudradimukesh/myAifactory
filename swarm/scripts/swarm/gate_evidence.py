@@ -11,6 +11,7 @@ import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TypedDict
 from uuid import uuid4
 
 from run_state import ProcessInfo
@@ -24,11 +25,23 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class Acceptance(TypedDict, total=False):
+    feature: str
+    product_ids: list[str]
+    views: dict[str, object]
+    required_artifacts: list[str]
+    final_artifacts: list[str]
+    journey_specs: list[str]
+    python_test_paths: list[str]
+    property_test_paths: list[str]
+    qualification_base_sha: str
+
+
 def output(command: Sequence[str], root: Path) -> str:
     return subprocess.check_output(command, cwd=root, text=True).strip()
 
 
-def retire_worktree(repo, root, run_path=None):
+def retire_worktree(repo: Path, root: Path, run_path: Path | None = None) -> str | None:
     """Remove a finished worktree; return None, or why it was kept.
 
     Ignored files (.venv, node_modules, caches) are disposable. Tracked edits,
@@ -50,7 +63,7 @@ def retire_worktree(repo, root, run_path=None):
         for key, row in state.get("reservations", {}).items():
             path = row.get("worktree")
             if path and not row.get("released") and Path(path).resolve().is_relative_to(inside):
-                return "reservation " + key + " is not released"
+                return "reservation " + str(key) + " is not released"
     files = subprocess.run(["lsof", "-n", "-Fn"], capture_output=True, text=True)
     if files.returncode or not files.stdout:
         return "process inspection failed (lsof exit " + str(files.returncode) + ")"
@@ -81,7 +94,7 @@ NODE = Path(
 def artifact_hashes(
     art: Path,
     tag: str,
-    spec: Mapping[str, Sequence[str]],
+    spec: Acceptance,
     fast: bool = False,
     final: bool = False,
 ) -> dict[str, str]:
@@ -130,12 +143,12 @@ def fingerprint(root: Path) -> dict[str, str]:
     }
 
 
-def acceptance(path: Path) -> dict[str, object]:
+def acceptance(path: Path) -> Acceptance:
     text = path.read_text()
     blocks = text.split("```json\n")
     if len(blocks) != 2:
         raise ValueError("Acceptance needs exactly one JSON metadata block")
-    metadata: dict[str, object] = json.loads(blocks[1].split("```", 1)[0])
+    metadata: Acceptance = json.loads(blocks[1].split("```", 1)[0])
     return metadata
 
 
@@ -190,6 +203,23 @@ def provision(root: Path, log: Path) -> dict[str, str]:
             stderr=subprocess.STDOUT,
         )
     return env
+
+
+def wait_ready(child: subprocess.Popen[bytes], url: str) -> None:
+    ready = False
+    for _ in range(100):
+        if child.poll() is not None:
+            raise ValueError("Isolated API exited before readiness")
+        try:
+            with urllib.request.urlopen(url, timeout=1) as response:
+                ready = response.status == 200
+        except OSError:
+            pass
+        if ready:
+            break
+        time.sleep(0.1)
+    if not ready:
+        raise ValueError("Isolated API did not become ready")
 
 
 @contextmanager
@@ -269,22 +299,7 @@ def runtime(root: Path, art: Path, tag: str, env: Mapping[str, str]) -> Iterator
             capture(child.pid, owned)
             receipt["owned_processes"] = owned
             api.close()
-            ready = False
-            for _ in range(100):
-                if child.poll() is not None:
-                    raise ValueError("Isolated API exited before readiness")
-                try:
-                    with urllib.request.urlopen(
-                        configured["INTERIOR_JWKS_URL"], timeout=1
-                    ) as response:
-                        ready = response.status == 200
-                except OSError:
-                    pass
-                if ready:
-                    break
-                time.sleep(0.1)
-            if not ready:
-                raise ValueError("Isolated API did not become ready")
+            wait_ready(child, configured["INTERIOR_JWKS_URL"])
             yield configured
     finally:
         api.close()

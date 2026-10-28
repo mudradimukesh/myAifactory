@@ -542,7 +542,10 @@ def record_run(state: RunState, data: RunRecord, role: str) -> None:
         if row is None:
             raise ValueError("Usage identity is not inventoried")
         if data.get("transcript_path"):
-            row["transcript_path"] = data["transcript_path"]
+            if row.get("role") != "lead" or not row.get("transcript_path"):
+                row["transcript_path"] = data["transcript_path"]
+            elif Path(row["transcript_path"]).resolve() != Path(data["transcript_path"]).resolve():
+                raise ValueError("Inventory transcript conflicts with the recorded one")
         if "complete" in data:
             row["complete"] = data["complete"]
         existing = [
@@ -646,6 +649,16 @@ def assign(state: RunState, data: RunRecord, role: str) -> None:
     assignments[key] = data
 
 
+def inherit_scopes(state: RunState, predecessor: str) -> None:
+    successor = (state.get("active_lead") or {}).get("model_session_id")
+    if not successor or predecessor not in state.get("lead_scopes", {}):
+        return
+    scopes = state["lead_scopes"].pop(predecessor)
+    state["lead_scopes"][successor] = sorted(
+        set(state["lead_scopes"].get(successor, [])) | set(scopes)
+    )
+
+
 def handoff(state: RunState, data: RunRecord, operation: str, path: Path) -> None:
     check_action(state, path, "launch:lead")
     if operation == "freeze-lead":
@@ -740,6 +753,8 @@ def handoff(state: RunState, data: RunRecord, operation: str, path: Path) -> Non
         if not same_identity(data["successor"], table.get(data["successor"]["pid"])):
             raise ValueError("Successor identity mismatch")
         state["active_lead"] = data["successor"]
+        if not concurrent and predecessor:
+            inherit_scopes(state, predecessor["model_session_id"])
         if concurrent and predecessor is not None and scopes is not None:
             state.setdefault("draining_leads", {})[session] = {
                 "lead": predecessor,
@@ -750,6 +765,7 @@ def handoff(state: RunState, data: RunRecord, operation: str, path: Path) -> Non
                 "status": "draining",
                 "gates": transfer.get("drain_gates", []),
             }
+        transcript = Path(str(data.get("transcript_path", "")))
         state.setdefault("inventory", {}).setdefault("sessions", []).append(
             {
                 "session_id": data["successor"]["model_session_id"],
@@ -757,6 +773,14 @@ def handoff(state: RunState, data: RunRecord, operation: str, path: Path) -> Non
                 "pid": data["successor"]["pid"],
                 "started_at": utc(),
                 "complete": False,
+                **(
+                    {"transcript_path": str(transcript)}
+                    if transcript.name == data["successor"]["model_session_id"] + ".jsonl"
+                    and transcript.is_absolute()
+                    and not transcript.is_symlink()
+                    and transcript.is_file()
+                    else {}
+                ),
             }
         )
         state["dispatch_frozen"] = False
@@ -886,6 +910,7 @@ def apply(state: RunState, role: str, operation: str, data: RunRecord, path: Pat
             {**drain, "retired_at": utc(), "receipt": data["receipt"]}
         )
         del state["draining_leads"][session]
+        inherit_scopes(state, session)
     elif operation == "adopt-bootstrap":
         for field in ("started_at", "lifecycle", "inventory", "ceilings", "deadlines", "blockers"):
             if field not in state:
@@ -1093,11 +1118,14 @@ def transact(path: Path, role: str, operation: str, data: RunRecord) -> RunState
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--run", type=Path, default=DEFAULT_RUN)
     parser.add_argument("--as", dest="role", choices=OPERATIONS, required=True)
     parser.add_argument("operation")
     parser.add_argument("--data", default="{}")
+    for option in ("--run", "--as", "--data"):
+        if sum(word == option or word.startswith(option + "=") for word in sys.argv[1:]) > 1:
+            parser.error(option + " may be given only once")
     args = parser.parse_args()
     try:
         data: RunRecord = json.loads(args.data)

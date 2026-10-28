@@ -1,4 +1,5 @@
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -6,7 +7,7 @@ def test_run_state_passes_strict_mypy() -> None:
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         [
-            str(root / ".venv/bin/python"),
+            sys.executable,
             "-m",
             "mypy",
             "--config-file",

@@ -3,7 +3,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from test_evidence_amendment_lineage import correction, digest
+from test_evidence_write import Fixture, git, writer
 
+pytest_plugins = ["test_evidence_amendment_lineage"]
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -29,12 +32,13 @@ def poc_gate(tmp_path, monkeypatch):
         ]
         (tmp_path / "u-test-map.json").write_text(json.dumps(mapping))
         (tmp_path / "u-ids.txt").write_text("A1\n")
-        (tmp_path / "u-s1-tests.json").write_text('{"tests_commit": "t"}')
+        (tmp_path / "u-s1-tests.json").write_text('{"tests_commit": "t", "predecessor": "base"}')
         (tmp_path / "u-red.json").write_text(
             json.dumps(
                 {
                     "passed": True,
                     "tests_commit": "t",
+                    "predecessor": "base",
                     "test_map_sha256": module.digest(tmp_path / "u-test-map.json"),
                 }
             )
@@ -383,8 +387,8 @@ def test_fast_gate_skips_provision_only_when_marker_matches(tmp_path, monkeypatc
         )
 
         class Probe(module.Gate):
-            def __init__(self, root, art, tag, base, candidate, fast=False):
-                self.art, self.tag, self.fast = art, tag, fast
+            def __init__(self, *args, fast=False):
+                self.art, self.tag, self.fast = args[1], args[2], fast
                 self.files, self.spec, self.env = [], {}, {}
 
             def execute(self):
@@ -533,8 +537,8 @@ def test_gate_writes_packet_and_fails_when_artifact_is_missing(tmp_path, monkeyp
         monkeypatch.setattr(module, "runtime", lambda *args: contextlib.nullcontext({}))
 
         class Probe(module.Gate):
-            def __init__(self, root, art, tag, base, candidate, fast=False):
-                self.art, self.tag, self.fast = art, tag, fast
+            def __init__(self, *args, fast=False):
+                self.art, self.tag, self.fast = args[1], args[2], fast
                 self.files, self.spec, self.env = [], {}, {}
 
             def execute(self):
@@ -727,3 +731,79 @@ def test_full_suite_gates_skip_swarm_and_phase2_tests():
     source = (ROOT / "scripts/swarm/unit_gate.py").read_text()
     assert unit_gate.PYTEST_IGNORE == ["--ignore=tests/phase2", "--ignore=tests/swarm"]
     assert source.count("*PYTEST_IGNORE") == 2
+
+
+def amendment_change(fixture: Fixture, change) -> None:
+    import hashlib
+    import json
+
+    path = fixture.art / "u-s1-tests.json"
+    record = json.loads(path.read_text())
+    amendment = record["lineage"]["amendments"][0]
+    change(amendment)
+    body = {k: v for k, v in amendment.items() if not k.startswith("owner_approval")}
+    approval = {
+        "owner": "u",
+        "amendment_sha256": hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest(),
+    }
+    (fixture.art / "u-approval.json").write_text(json.dumps(approval))
+    amendment["owner_approval_sha256"] = digest(fixture.art / "u-approval.json")
+    path.write_text(json.dumps(record))
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        (
+            lambda a: a["paths"]["tests/test_unit.py"].update(after_sha256="0" * 64),
+            "amendment paths differ",
+        ),
+        (lambda a: a.update(source_dependencies=["0" * 40]), "source dependency differs"),
+    ],
+    ids=["path-digest", "source-dependency"],
+)
+def test_lineage_correction_rejects_unsupported_relation(
+    lineage,
+    change,
+    reason,
+) -> None:
+    amendment_change(lineage, change)
+    old = lineage.snapshot()
+    code, error = correction(lineage)
+    assert code != 0, f"writer accepted {reason}"
+    assert f"Amendment lineage: {reason}" in error, error
+    assert lineage.snapshot() == old
+
+
+def test_lineage_correction_restores_prior_pair_and_archives_on_publication_failure(
+    lineage,
+    monkeypatch,
+) -> None:
+    import argparse
+    import os
+
+    old = lineage.snapshot()
+    module = writer(lineage, monkeypatch)
+    replace = os.replace
+
+    def fail_record(src, dst) -> None:
+        if Path(dst) == lineage.art / "u-s1-tests.json":
+            raise OSError("injected record publication failure")
+        replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_record)
+    args = argparse.Namespace(
+        tag="u",
+        tests=correction_head(lineage),
+        predecessor=lineage.predecessor,
+        red="u-red.json",
+        correction="Approved assertion-preserving amendment",
+        approval_sha256=digest(lineage.art / "u-approval.json"),
+    )
+    with pytest.raises(SystemExit, match="injected record publication failure"):
+        module.s1(args)
+    assert lineage.snapshot() == old, "failed publication changed the live pair or archives"
+
+
+def correction_head(fixture: Fixture) -> str:
+    return git(fixture.repo, "rev-parse", "HEAD")

@@ -1,5 +1,7 @@
 # Phase 1 pilot orchestrator and fixer
 
+User ruling October 21: follow `prompts/phase-1/roles.md`, "POC test cadence, user ruling October 21". POC and swarm tests are separate. Builder checks and integration acceptance run once in the light theme. Defer full regression, coverage, mutation and benchmarks to the final integrated candidate; postpone flake repetitions. The existing `pre` gate plus exact-candidate review authorizes integration with explicit policy deferrals. Only the `final` gate and `review_check.py --require-final` qualify release. This supersedes older full-pre, five-run, twenty-run and run-after-failure instructions below. Relevant functional failures remain failures; continue other eligible work.
+
 On orchestrator succession, end the previous orchestrator session once the successor starts, registers its thread and integer pane_id, and acknowledges the snapshot. Verify the predecessor's exact process identity before stopping it; preserve the successor, active lead and adopted jobs. Confirm exit, reconcile the predecessor's final token tail through run_state.py, and mark its inventory complete before successor dispatch. Never leave two active orchestrators. Preserve this rule in every handoff and use workspace-write with on-request approvals for successor launches.
 
 Start the successor with `scripts/swarm/orchestrator-spawn.sh <next-number>` after writing the handoff. The script refuses to start without `run.json` and the handoff. It launches the successor with a fixed session id and registers it. The successor's first action is to write its readiness receipt, `ART/logs/orchestrator-<n>-ready.json`, naming its session and the handoff hash given in its prompt. Only after a valid receipt does the script check the predecessor's exact identity (session record and start time) and that the predecessor has no child processes. It then closes the predecessor's pane and records final usage with `complete: true` once the predecessor has exited. Any failure leaves the predecessor running and is logged to `ART/logs/orchestrator-spawns.log`. The successor treats these steps as pending, reads the log tail with its next read, and does by template any step reported as not done. Never retype the spawn command by hand.
@@ -126,7 +128,7 @@ On a pause:
 ## Rules for the whole run
 
 - **Read small.** Use targeted reads first. Read a complete relevant file when diagnosis or required review needs it; avoid repeated history reads. After compaction, reconcile `run.json`, current notes and live jobs before acting.
-- **Leave the user's checkout alone.** Recheck its current status. Never stash, reset, clean or overwrite user changes, including untracked reports and this brief. Create `/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer-wt/p1-pilot-harness` on branch `p1-pilot-harness` from `main` for loop edits. On resume, verify and reuse the recorded worktree; never recreate it or reset its branch. Product edits use a separate builder worktree. Read untracked reference documents from the original checkout.
+- **Leave the user's checkout alone.** Recheck its current status. Never stash, reset, clean or overwrite user changes, including untracked reports and this brief. Do loop edits, repairs, merges and validation runs in the one shared orchestrator workspace `/Users/mukeshkumarmudradi/Documents/AI_Projects/github/FloorInteriorDesignAndRenderer-wt/orchestrator`, switching branches inside it. `orchestrator-spawn.sh` hands it to every successor and, if it is no longer a usable worktree, deletes it and re-adds it from `main`. Never create another worktree or `/tmp` checkout for orchestrator work. Product edits use a separate builder worktree. Read untracked reference documents from the original checkout.
 - **Updating `main`.** Run `git merge --ff-only p1-pilot-harness` from the main checkout. If git refuses because a dirty file would change, stop and ask. Never edit or move `prompts/phase-1/progress.md`.
 - **Commits.** One commit per fix, with the fix id in the subject. No co-author or agent attribution lines. Never edit `CHANGELOG.md` or generated files. Prose uses periods, commas and plain hyphens, never the long dash.
 - **Tests before fixes.** Every script fix gets a regression test under `tests/swarm/` that fails before the fix and passes after. Use fake children (stub `codex` or `claude` executables on `PATH`), never real model runs.
@@ -176,13 +178,15 @@ Totals are computed only over this inventory, between a fixed start time and a f
 Role subtotals are kept for diagnosis only.
 
 **Admission.** Every worker launch and reviewer dispatch first calls `run_state.py admit` with a stable allocation id and role allowance:
-- initial builder allocation 60,000 new tokens, shared across the tests turn and implementation resume
-- builder repair 40,000
-- reviewer dispatch 60,000 (the lead calls `admit --role reviewer` before dispatching `p1-pilot-reviewer`)
+- builder allocation 160,000 new tokens with a handoff at 145,000, shared across the tests turn and implementation resume
+- builder repair 160,000
+- reviewer dispatch 130,000 with a handoff at 115,000 (RULING575b; the lead calls `admit --role reviewer` before dispatching)
+
+Leads never write code, including swarm tooling, guards and tests. A change with no eligible builder path is a blocker for the user, not lead work. Opus builders use an assignment with `provider` `claude` and model `claude-opus-5-5`; `codex-agent.sh` runs them as sandboxed `claude -p` sessions under the same admission, budget, receipts and accounting as Codex builders.
 
 For each open allocation `i`, `remaining_i = max(0, allowance_i - observed_i)`, where `observed_i` is the sum of its run deltas so far. `committed = consumed + sum(remaining_i)`; `consumed` already includes those deltas, so nothing is counted twice. Admit only if `committed + new allowance` stays within every applicable ceiling. On release, `remaining_i` becomes 0 and the usage stays in `consumed`. Lead starts and rollovers check the same lifecycle, pause and applicable ceilings; their measured usage counts without a fixed worker allowance. Apply the overall ceiling throughout, preparation limits during preparation, and pilot limits during the pilot. Never reset the overall clock between stages.
 
-For the two-turn builder allocation, sum the disjoint run deltas and retain its remaining reservation between turns. Resuming consumes that reservation, not a second 60,000-token allowance. Admission is idempotent by allocation id and refuses concurrent use. Release unused reservations on launch failure. Record and release Claude reviewer allocations on completion too; record preparation test sessions and lead successors in the inventory. Fresh launches obtain a run id before a thread id exists, then attach the observed thread id without a second reservation.
+For the two-turn builder allocation, sum the disjoint run deltas and retain its remaining reservation between turns. Resuming consumes that reservation, not a second allowance. Admission is idempotent by allocation id and refuses concurrent use. Release unused reservations on launch failure. Record and release Claude reviewer allocations on completion too; record preparation test sessions and lead successors in the inventory. Fresh launches obtain a run id before a thread id exists, then attach the observed thread id without a second reservation.
 
 **A run over its allowance.**
 - `remaining_i` becomes 0 and the run continues. Record an incident.
@@ -213,7 +217,7 @@ Your overall clock starts now.
    - Postgres for the API tests
    - free disk space
 3. **Read the Codex weekly meter** and record it.
-4. **Record the repo state.** Note `git status --short` and `git log -1` without changing anything. Create the worktree.
+4. **Record the repo state.** Note `git status --short` and `git log -1` without changing anything. Use the shared orchestrator workspace.
 5. **Back up.** Run `rsync -a /tmp/factory-fp-0925/swarm/interior-p1/ ~/factory-backup/interior-p1/`, event logs included. Repeat after Stage 5. At the end, also copy the inventory's Codex rollouts and Claude transcripts into `~/factory-backup/inventory/`.
 6. **Read open work.** Read `prompts/phase-1/progress.md` lines matching `EXACT NEXT STEP` and its "Decisions" table only. Note unfinished units and open decisions; the pilot does not resume that plan.
 
@@ -356,16 +360,17 @@ Also require no `PAUSE`, an allowed lifecycle and no action-specific blocker. Ev
 
    | Gate | Disposition |
    |---|---|
-   | G1 frozen tests, G2 red then green, G3 acceptance ids, G4 lint and format, G6 strict types, G10 full suite in random order, G12 changed-line coverage at 90% | Retained |
+   | G1 frozen tests, G2 red then green, G3 acceptance ids, G4 lint and format, G6 strict types | Retained |
    | G5 complexity, G7 banned constructs, G8 file size | Retained. Write a minimal `diff_lint.py` for the G7 and G8 lists in `roles.md` |
    | G9 Hypothesis profile | Applicable when the acceptance specification requires property-tested invariants; missing `@given` tests then fail rather than make the gate inapplicable |
-   | G11 flake repeat, Python | Retained for the unit's test paths |
+   | G10 full regression, G12 coverage | Deferred during development; required once at final qualification |
+   | G11 flake repeat, Python | Deferred under the October 21 POC policy |
    | G14 web lint, G15 web types, G16 web unit tests | Apply when source, tests, configuration or dependencies affect the relevant check. Record each disposition; changing only configuration must not bypass validation |
-   | G17 e2e repeat | Always runs the selected journey spec with `--repeat-each=5 --retries=0 --workers=1`, whether the change is in `web/`, `src/api/` or `src/parse/` |
-   | G13 and G18 mutation | Apply to changed production modules in their respective language. With no such modules, record `not_applicable` and the diff evidence. Otherwise retained unless U8 is `yes`; record "waived by user, U8" for a waiver |
+   | G17 browser journeys | Reuse the single G2 light-theme functional run; benchmarks run only at final qualification |
+   | G13 and G18 mutation | Deferred during development. At final qualification, apply to cumulatively changed production modules in their respective language. With no such modules, record `not_applicable` and the diff evidence. Otherwise retained unless U8 is `yes`; record "waived by user, U8" for a waiver |
    | G19 reviewer JSON | Retained, after review |
 
-3. **`scripts/swarm/red_check.py`** proves G2 in an isolated checkout of the predecessor plus the new tests commit. Use pytest for Python tests and Playwright for journey tests, with the required test configuration present. Verify collection and the expected assertion failure; setup errors, zero tests and timeouts are not red evidence. Preservation tests pass on both revisions. G3 reads the corresponding runner's results and maps exact test cases to acceptance ids, including repeated Playwright projects.
+3. **`scripts/swarm/red_check.py`** proves G2 in an isolated checkout of the predecessor plus the new tests commit. Use pytest for Python tests and Playwright for journey tests, with the required test configuration present. Verify collection and the expected assertion failure; setup errors, zero tests and timeouts are not red evidence. Preservation tests pass on both revisions. G3 reads the corresponding runner's results and maps exact test cases to acceptance ids, including each required light-theme Playwright project.
 
 4. **`scripts/swarm/review_check.py --gate <gate.json> --candidate <candidate.json> --ids <ids.txt> --open-findings <json> --review <json> [--review <json>]`** (G19). It checks three things separately and returns `PASS` only when all hold.
 
@@ -392,7 +397,7 @@ Also require no `PAUSE`, an allowed lifecycle and no action-specific blocker. Ev
 
 5. **`scripts/swarm/prepare_candidate.sh <tag> <builder_branch>`** builds the integration candidate before review. It:
    1. records the current `main` SHA
-   2. creates a new `int/<tag>/<attempt>` branch in an isolated integration worktree and merges the exact builder SHA with `--no-ff`; never reset an existing branch. The `int/<tag>/<attempt>` branch preserves each earlier attempt; the script removes the superseded attempt's worktree, and `merge_unit.sh` removes the candidate worktree after a successful push. `red_check.py` and `unit_gate.py baseline` remove their temporary worktrees when they finish
+   2. creates a new `int/<tag>/<attempt>` branch in an isolated integration worktree and merges the exact builder SHA with `--no-ff`; never reset an existing branch. The `int/<tag>/<attempt>` branch preserves each earlier attempt until the unit merges; the script removes the superseded attempt's worktree. After a successful push, `merge_unit.sh` removes the candidate worktree, then deletes the builder branch and every `int/<tag>/<attempt>` branch whose content main already holds. It keeps a branch with changes main lacks or one checked out in a live worktree, records it as `worktree_cleanup: pending` and retries on the next run. `red_check.py` and `unit_gate.py baseline` remove their temporary worktrees when they finish
    3. writes `ART/<tag>-candidate.json` (candidate SHA, `main` SHA, builder SHA)
 
    The gate and the review both use this candidate SHA. Record the integration worktree path, tree hash, expected review modes and attempt number in the candidate receipt. Preserve these files by attempt before rebuilding.

@@ -36,6 +36,48 @@ new_lead_pid() {
   return 1
 }
 log() { print -r -- "$(date '+%FT%T') $*" >> "$LOG"; }
+guard_files() {
+  python3 -I - "$REPO/scripts/swarm" <<'PY'
+import ast, sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+todo, seen = ["fp-guard"], set()
+while todo:
+    name = todo.pop()
+    if name in seen:
+        continue
+    seen.add(name)
+    tree = ast.parse((src / (name + ".py")).read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            mods = [node.module]
+        else:
+            continue
+        for mod in mods:
+            top = mod.split(".")[0]
+            if top in sys.stdlib_module_names:
+                continue
+            if not (src / (top + ".py")).is_file():
+                sys.exit(name + ".py imports " + mod + " but " + str(src / (top + ".py")) + " is missing")
+            todo.append(top)
+for name in sorted(seen):
+    print(name + ".py")
+print("builder-settings.json")
+PY
+}
+install_bin() {
+  local files file tmp
+  files=$(guard_files) || return 1
+  mkdir -p "$BIN" || return 1
+  for file in ${(f)files}; do
+    [[ -f $BIN/$file ]] && continue
+    tmp=$(mktemp "$BIN/.$file.XXXXXX") || { print -r -- "cannot install $file into $BIN" >&2; return 1; }
+    cp "$REPO/scripts/swarm/$file" "$tmp" && mv "$tmp" "$BIN/$file" || { rm -f "$tmp"; print -r -- "cannot install $file into $BIN" >&2; return 1; }
+  done
+}
 
 case ${1:-} in
   --dry-run) launch_cmd; exit 0 ;;
@@ -83,9 +125,7 @@ case ${1:-} in
     trap 'rmdir "$LOCK" 2>/dev/null' EXIT
     today=$(grep -c "^$(date '+%F') rollover requested by " "$LOG" 2>/dev/null); today=${today:-0}
     (( today >= MAX_PER_DAY )) && { print "refused: $today lead spawns today (cap $MAX_PER_DAY)"; exit 3; }
-    for file in fp-guard.py builder-settings.json; do
-      [[ -f $BIN/$file ]] || cp "$REPO/scripts/swarm/$file" "$BIN/$file" || exit 1
-    done
+    install_bin || exit 1
     if [[ ! -f $BRIEF ]]; then
       mkdir -p "${BRIEF:h}" && cp "$REPO/scripts/swarm/lead-brief.md" "$BRIEF" || exit 1
     fi
