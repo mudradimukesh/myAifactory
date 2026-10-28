@@ -74,6 +74,7 @@ Builder and gate worktrees fill the disk. Remove a worktree only when its HEAD i
 - Message a lead with literal text, then a separate carriage return, each with an 8 second timeout because `wezterm cli` can hang:
   `( wezterm cli send-text --pane-id P --no-paste 'Monitor: ...' & p=$!; sleep 8; kill $p 2>/dev/null; true ); sleep 1; ( wezterm cli send-text --pane-id P --no-paste $'\r' & p=$!; sleep 8; kill $p 2>/dev/null; true )`
 - Lead handoff: when a lead's context passes 250,000 tokens, tell it to run `BIN/interior-lead.sh --handoff-start` with `LEAD_PROVIDER=claude LEAD_MODEL=claude-opus-5-5 LEAD_EFFORT=medium`, in the background.
+- Stalled handoff: when `dispatch_frozen` is true and the lead waits for a gate before `--handoff-start`, check `handoff.mode`. A concurrent handoff never waits for gates: `pilot_lead.py` only refuses ("Snapshot omits a drain-owned running gate") when a `handoff.drain_gates` pid is missing from `handoff/<token>.md`. Tell the lead to add that pid to the delta, keep it under 6 KB, and run `--handoff-start <token>` now.
 - Idle slots: when fewer than 8 builders run and nothing blocks dispatch, tell the lead to launch builders, reviews and restacks in parallel before more reading.
 - Ceilings: raise them with `run_state.py --as orchestrator set-ceilings` and tell the user. The user does not want work to stop on budget.
 - Blockers owned by the monitor: fix them, then `run_state.py --as orchestrator close-blocker --data '{"id":"...","reason":"..."}'`. Leads cannot write BIN, so tooling installs into BIN are monitor work.
